@@ -5,7 +5,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 
-# Вставляем токен напрямую (замени на новый после тестов!)
+# Вставь сюда свой НОВЫЙ токен (или получай через os.environ.get)
 BOT_TOKEN = "8855259798:AAEw-jiTxWh2k0n9WjjbG7tPX64S4g5WUXU"
 
 bot = Bot(token=BOT_TOKEN)
@@ -30,9 +30,17 @@ async def start_web_server():
     print(f"Health-check сервер запущен на порту {port}")
 
 # --- Логика Telegram-бота ---
-@dp.business_message(F.text == ".мут", F.reply_to_message)
+
+@dp.business_message(F.text.lower() == ".мут")
 async def mute_user(message: Message):
+    """Включает мут (Срабатывает только от владельца аккаунта)"""
     chat_id = message.chat.id
+    
+    # ПРОВЕРКА: Если команду отправил собеседник — бот её игнорирует.
+    # В личных бизнес-чатах chat.id — это ID собеседника.
+    if message.from_user.id == chat_id:
+        return
+        
     muted_chats.add(chat_id)
     
     markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -47,23 +55,37 @@ async def mute_user(message: Message):
 
 @dp.business_message()
 async def handle_messages(message: Message):
+    """Перехватывает сообщения и удаляет их, если собеседник в муте"""
     chat_id = message.chat.id
-    if chat_id in muted_chats:
-        # Удаляем сообщение собеседника
-        if message.from_user.id == chat_id:
-            try:
-                await message.delete()
-            except TelegramBadRequest as e:
-                print(f"Ошибка удаления: {e}")
+    
+    # Проверяем, в муте ли чат И кто написал сообщение
+    # Удаляем ТОЛЬКО если сообщение написал собеседник (его ID совпадает с chat_id)
+    if chat_id in muted_chats and message.from_user.id == chat_id:
+        try:
+            await message.delete()
+        except TelegramBadRequest as e:
+            print(f"Ошибка удаления: {e}")
 
 @dp.callback_query(F.data.startswith("unmute_"))
 async def unmute_user(call: CallbackQuery):
+    """Обрабатывает нажатие на кнопку 'Размутить'"""
     chat_id = int(call.data.split("_")[1])
+    
+    # ПРОВЕРКА КНОПКИ: Не даем собеседнику размутить самого себя
+    if call.from_user.id == chat_id:
+        # show_alert=True покажет всплывающее окно прямо по центру экрана
+        await call.answer("🚫 Вы не можете снять мут сами с себя!", show_alert=True)
+        return
+
+    # Если кнопку нажал ты (владелец), снимаем мут
     if chat_id in muted_chats:
         muted_chats.remove(chat_id)
         await call.message.edit_text("✅ **Мут снят.** Собеседник снова может писать.")
+        await call.answer("Мут успешно снят!")
     else:
-        await call.answer("Этот чат не в муте.", show_alert=True)
+        # Если случайно нажал на старую кнопку, когда мут уже снят
+        await call.message.edit_text("✅ **Собеседник уже может писать.**")
+        await call.answer("Этот чат уже не в муте.")
 
 async def main():
     await start_web_server()
