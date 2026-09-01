@@ -1,30 +1,40 @@
 import os
 import asyncio
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 
-# Получаем токен из переменных окружения
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-if not BOT_TOKEN:
-    raise ValueError("Не задан BOT_TOKEN в переменных окружения")
+# Вставляем токен напрямую (замени на новый после тестов!)
+BOT_TOKEN = "8852544876:AAFHuvVEvsZy7F7N3eKfBRDrd8N8f4fVeko"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Хранилище замученных чатов: {chat_id: True}
-# При перезапуске сервера (например, на бесплатном тарифе Render) этот список сбросится.
-muted_chats = {}
+# Хранилище ID замученных чатов
+muted_chats = set()
 
+# --- Веб-сервер для прохождения проверок Render ---
+async def dummy_handler(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", dummy_handler)
+    app.router.add_get("/healthz", dummy_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health-check сервер запущен на порту {port}")
+
+# --- Логика Telegram-бота ---
 @dp.business_message(F.text == ".мут", F.reply_to_message)
 async def mute_user(message: Message):
-    """Включает мут при ответе на сообщение собеседника командой .мут"""
     chat_id = message.chat.id
+    muted_chats.add(chat_id)
     
-    # Добавляем чат в список мута
-    muted_chats[chat_id] = True
-    
-    # Создаем inline-кнопку для размута
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Размутить", callback_data=f"unmute_{chat_id}")]
     ])
@@ -37,34 +47,27 @@ async def mute_user(message: Message):
 
 @dp.business_message()
 async def handle_messages(message: Message):
-    """Перехватывает все сообщения в бизнес-чатах"""
     chat_id = message.chat.id
-    
-    # Проверяем, находится ли этот диалог в муте
     if chat_id in muted_chats:
-        # Удаляем сообщение, если его отправил собеседник, а не владелец аккаунта
-        # В личных чатах ID собеседника совпадает с ID чата
+        # Удаляем сообщение собеседника
         if message.from_user.id == chat_id:
             try:
-                # В Aiogram 3.7+ метод message.delete() под капотом автоматически 
-                # использует нужный контекст Business API (deleteBusinessMessages)
                 await message.delete()
             except TelegramBadRequest as e:
-                print(f"Ошибка удаления (проверьте, выданы ли права на удаление): {e}")
+                print(f"Ошибка удаления: {e}")
 
 @dp.callback_query(F.data.startswith("unmute_"))
 async def unmute_user(call: CallbackQuery):
-    """Обрабатывает нажатие на кнопку 'Размутить'"""
     chat_id = int(call.data.split("_")[1])
-    
     if chat_id in muted_chats:
-        del muted_chats[chat_id]
+        muted_chats.remove(chat_id)
         await call.message.edit_text("✅ **Мут снят.** Собеседник снова может писать.")
     else:
         await call.answer("Этот чат не в муте.", show_alert=True)
 
 async def main():
-    print("Бот-секретарь (Business Mode) запущен...")
+    await start_web_server()
+    print("Бот-секретарь запущен...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
