@@ -6,7 +6,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from aiogram.exceptions import TelegramBadRequest
 
 # Вставляем токен напрямую (замени на новый после тестов!)
-BOT_TOKEN = "8852544876:AAFHuvVEvsZy7F7N3eKfBRDrd8N8f4fVeko"
+BOT_TOKEN = "8852544876:AAG-ADmDRQmW-ySwsW_JjHRKPF2tc4Wx7m8"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
