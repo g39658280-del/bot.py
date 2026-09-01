@@ -1,65 +1,71 @@
 import os
 import asyncio
-from pyrogram import Client, filters
-from pyrogram.enums import ChatType
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.exceptions import TelegramBadRequest
 
-# Получаем переменные окружения (для Render.com)
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
+# Получаем токен из переменных окружения
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise ValueError("Не задан BOT_TOKEN в переменных окружения")
 
-if not all([API_ID, API_HASH, SESSION_STRING]):
-    raise ValueError("Необходимо задать API_ID, API_HASH и SESSION_STRING в переменных окружения.")
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-app = Client(
-    "mute_userbot",
-    session_string=SESSION_STRING,
-    api_id=API_ID,
-    api_hash=API_HASH
-)
+# Хранилище замученных чатов: {chat_id: True}
+# При перезапуске сервера (например, на бесплатном тарифе Render) этот список сбросится.
+muted_chats = {}
 
-# Хранилище ID замученных пользователей (в памяти)
-# При перезапуске на Render список сбросится. Для постоянного хранения используйте БД (например, SQLite/Redis).
-muted_users = set()
-
-@app.on_message(filters.me & filters.command("мут", prefixes=".") & filters.reply & filters.private)
-async def mute_user(client, message):
-    """
-    Включает мут. Использование: ответить командой .мут на сообщение собеседника.
-    """
-    target_id = message.reply_to_message.from_user.id
-    muted_users.add(target_id)
+@dp.business_message(F.text == ".мут", F.reply_to_message)
+async def mute_user(message: Message):
+    """Включает мут при ответе на сообщение собеседника командой .мут"""
+    chat_id = message.chat.id
     
-    # Меняем текст нашей команды на информационное сообщение
-    await message.edit_text(
-        "🚫 **Собеседник переведен в мут.**\n"
-        "Все его новые сообщения будут автоматически удаляться.\n\n"
-        "Для отмены напишите `.размутить` в этом чате."
+    # Добавляем чат в список мута
+    muted_chats[chat_id] = True
+    
+    # Создаем inline-кнопку для размута
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Размутить", callback_data=f"unmute_{chat_id}")]
+    ])
+    
+    await message.answer(
+        "🚫 **Собеседник переведен в мут.**\nВсе его новые сообщения будут удаляться.", 
+        reply_markup=markup, 
+        parse_mode="Markdown"
     )
 
-@app.on_message(filters.me & filters.command("размутить", prefixes=".") & filters.private)
-async def unmute_user(client, message):
-    """
-    Выключает мут. Использование: отправить .размутить в чате с пользователем.
-    """
-    target_id = message.chat.id
-    if target_id in muted_users:
-        muted_users.remove(target_id)
-        await message.edit_text("✅ **Мут снят.** Собеседник снова может писать.")
-    else:
-        await message.edit_text("Этот собеседник не в муте.")
+@dp.business_message()
+async def handle_messages(message: Message):
+    """Перехватывает все сообщения в бизнес-чатах"""
+    chat_id = message.chat.id
+    
+    # Проверяем, находится ли этот диалог в муте
+    if chat_id in muted_chats:
+        # Удаляем сообщение, если его отправил собеседник, а не владелец аккаунта
+        # В личных чатах ID собеседника совпадает с ID чата
+        if message.from_user.id == chat_id:
+            try:
+                # В Aiogram 3.7+ метод message.delete() под капотом автоматически 
+                # использует нужный контекст Business API (deleteBusinessMessages)
+                await message.delete()
+            except TelegramBadRequest as e:
+                print(f"Ошибка удаления (проверьте, выданы ли права на удаление): {e}")
 
-@app.on_message(filters.private & ~filters.me)
-async def delete_muted(client, message):
-    """
-    Перехватывает и удаляет сообщения от замученных пользователей.
-    """
-    if message.from_user and message.from_user.id in muted_users:
-        try:
-            await message.delete()
-        except Exception as e:
-            print(f"Ошибка при удалении сообщения: {e}")
+@dp.callback_query(F.data.startswith("unmute_"))
+async def unmute_user(call: CallbackQuery):
+    """Обрабатывает нажатие на кнопку 'Размутить'"""
+    chat_id = int(call.data.split("_")[1])
+    
+    if chat_id in muted_chats:
+        del muted_chats[chat_id]
+        await call.message.edit_text("✅ **Мут снят.** Собеседник снова может писать.")
+    else:
+        await call.answer("Этот чат не в муте.", show_alert=True)
+
+async def main():
+    print("Бот-секретарь (Business Mode) запущен...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    print("Юзербот запущен...")
-    app.run()
+    asyncio.run(main())
