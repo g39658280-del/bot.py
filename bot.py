@@ -1,49 +1,65 @@
 import os
+import asyncio
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.enums import ChatType
 
-BOT_TOKEN = "8852544876:AAFHuvVEvsZy7F7N3eKfBRDrd8N8f4fVeko"
+# Получаем переменные окружения (для Render.com)
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
+
+if not all([API_ID, API_HASH, SESSION_STRING]):
+    raise ValueError("Необходимо задать API_ID, API_HASH и SESSION_STRING в переменных окружения.")
 
 app = Client(
-    "mut_bot",
-    bot_token=BOT_TOKEN,
-    api_id=6,
-    api_hash="eb06d4abfb49dc3eeb1aeb98ae0f581e"
+    "mute_userbot",
+    session_string=SESSION_STRING,
+    api_id=API_ID,
+    api_hash=API_HASH
 )
 
-muted_chats = set()
+# Хранилище ID замученных пользователей (в памяти)
+# При перезапуске на Render список сбросится. Для постоянного хранения используйте БД (например, SQLite/Redis).
+muted_users = set()
 
-@app.on_message(filters.command("мут") & filters.reply)
+@app.on_message(filters.me & filters.command("мут", prefixes=".") & filters.reply & filters.private)
 async def mute_user(client, message):
-    chat_id = message.chat.id
-    muted_chats.add(chat_id)
+    """
+    Включает мут. Использование: ответить командой .мут на сообщение собеседника.
+    """
+    target_id = message.reply_to_message.from_user.id
+    muted_users.add(target_id)
     
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔓 Размутить", callback_data="unmute")]
-    ])
-    
-    await message.reply("🔇 Режим мута включён! Все сообщения собеседника удаляются.", reply_markup=keyboard)
-    await message.reply_to_message.delete()
+    # Меняем текст нашей команды на информационное сообщение
+    await message.edit_text(
+        "🚫 **Собеседник переведен в мут.**\n"
+        "Все его новые сообщения будут автоматически удаляться.\n\n"
+        "Для отмены напишите `.размутить` в этом чате."
+    )
 
-@app.on_message(filters.text & ~filters.command("мут"))
-async def delete_incoming(client, message):
-    chat_id = message.chat.id
-    if chat_id in muted_chats:
+@app.on_message(filters.me & filters.command("размутить", prefixes=".") & filters.private)
+async def unmute_user(client, message):
+    """
+    Выключает мут. Использование: отправить .размутить в чате с пользователем.
+    """
+    target_id = message.chat.id
+    if target_id in muted_users:
+        muted_users.remove(target_id)
+        await message.edit_text("✅ **Мут снят.** Собеседник снова может писать.")
+    else:
+        await message.edit_text("Этот собеседник не в муте.")
+
+@app.on_message(filters.private & ~filters.me)
+async def delete_muted(client, message):
+    """
+    Перехватывает и удаляет сообщения от замученных пользователей.
+    """
+    if message.from_user and message.from_user.id in muted_users:
         try:
-            await client.delete_messages(chat_id, message.id)
-        except:
-            pass
+            await message.delete()
+        except Exception as e:
+            print(f"Ошибка при удалении сообщения: {e}")
 
-@app.on_callback_query()
-async def handle_unmute(client, callback):
-    if callback.data == "unmute":
-        chat_id = callback.message.chat.id
-        if chat_id in muted_chats:
-            muted_chats.remove(chat_id)
-            await callback.message.edit_text("🔊 Мут выключен! Собеседник снова может писать.")
-            await callback.answer("✅ Размут выполнен!")
-        else:
-            await callback.answer("⚠️ Мут уже выключен.", show_alert=True)
-
-print("🤖 Бот запущен! Пиши .мут в ответ на сообщение.")
-app.run()
+if __name__ == "__main__":
+    print("Юзербот запущен...")
+    app.run()
