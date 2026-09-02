@@ -1,65 +1,102 @@
 import os
 import asyncio
 from aiohttp import web
-from pyrogram import Client, filters, idle
+from contextlib import suppress
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.exceptions import TelegramBadRequest
 
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
+# 1. ВСТАВЬ СЮДА СВОЙ ТОКЕН ОТ @BotFather (в кавычках)
+BOT_TOKEN = "ТВОЙ_ТОКЕН_ЗДЕСЬ"
 
-# Хранилище мутов (очищается при перезагрузке Render)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Хранилище ID замученных чатов
 muted_chats = set()
-
-app = Client("mute_userbot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
 
 # --- Веб-сервер для прохождения проверок Render ---
 async def dummy_handler(request):
-    return web.Response(text="Userbot is running!")
+    return web.Response(text="Bot is running!")
 
 async def start_web_server():
-    server = web.Application()
-    server.router.add_get("/", dummy_handler)
-    runner = web.AppRunner(server)
+    app = web.Application()
+    app.router.add_get("/", dummy_handler)
+    app.router.add_get("/healthz", dummy_handler)
+    runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    print(f"Сервер запущен на порту {port}")
 
-# --- Логика Юзербота ---
-@app.on_message(filters.me & filters.command("мут", prefixes=".") & filters.private)
-async def mute_user(client, message):
+# --- Логика Telegram-бота ---
+
+@dp.business_message(F.text.lower() == ".мут")
+async def mute_user(message: Message):
     chat_id = message.chat.id
-    if chat_id in muted_chats:
-        await message.edit_text("⚠️ Собеседник уже находится в муте!")
+    
+    # Защита: команду можешь отправлять только ты (владелец аккаунта)
+    if message.from_user.id == chat_id:
         return
         
+    # Защита от двойного мута
+    if chat_id in muted_chats:
+        await message.answer("⚠️ Этот собеседник уже находится в муте!", parse_mode="Markdown")
+        return
+        
+    # Включаем мут
     muted_chats.add(chat_id)
-    await message.edit_text("🚫 **Мут включен.**\nВсе сообщения собеседника будут удаляться у обоих.\n\nДля отмены напиши в этот чат: `.размутить`")
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Размутить", callback_data=f"unmute_{chat_id}")]
+    ])
+    
+    await message.answer(
+        "🚫 **Собеседник переведен в мут.**\nВсе его новые сообщения будут удаляться.", 
+        reply_markup=markup, 
+        parse_mode="Markdown"
+    )
 
-@app.on_message(filters.me & filters.command("размутить", prefixes=".") & filters.private)
-async def unmute_user(client, message):
+@dp.business_message()
+async def handle_messages(message: Message):
     chat_id = message.chat.id
+    
+    # Удаляем сообщение, ЕСЛИ чат в муте И сообщение написал собеседник
+    if chat_id in muted_chats and message.from_user.id == chat_id:
+        try:
+            # Встроенный метод удаления. В бизнес-режиме он автоматически 
+            # передает нужный context_id серверам Telegram.
+            await message.delete()
+        except TelegramBadRequest as e:
+            # Если вылетит ошибка, значит боту не дали право can_delete_all_messages
+            print(f"ОШИБКА УДАЛЕНИЯ: {e}")
+
+@dp.callback_query(F.data.startswith("unmute_"))
+async def unmute_user(call: CallbackQuery):
+    chat_id = int(call.data.split("_")[1])
+    
+    # Защита: собеседник не может размутить сам себя
+    if call.from_user.id == chat_id:
+        with suppress(TelegramBadRequest):
+            await call.answer("🚫 Вы не можете снять мут сами с себя!", show_alert=True)
+        return
+
+    # Если кнопку нажал ты
     if chat_id in muted_chats:
         muted_chats.remove(chat_id)
-        await message.edit_text("✅ Мут снят.")
+        with suppress(TelegramBadRequest):
+            await call.message.edit_text("✅ Мут снят.")
+            await call.answer("Мут успешно снят!")
     else:
-        await message.edit_text("⚠️ Этот собеседник не в муте.")
-
-@app.on_message(filters.private & ~filters.me)
-async def delete_messages(client, message):
-    if message.chat and message.chat.id in muted_chats:
-        try:
-            # Юзербот удаляет сообщения принудительно для обоих (revoke=True)
-            await message.delete()
-        except Exception as e:
-            print(f"Ошибка удаления: {e}")
+        with suppress(TelegramBadRequest):
+            await call.message.edit_text("✅ Собеседник уже может писать.")
+            await call.answer("Этот чат уже не в муте.")
 
 async def main():
     await start_web_server()
-    await app.start()
-    print("Юзербот запущен...")
-    await idle()
-    await app.stop()
+    print("Бот-секретарь запущен...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
