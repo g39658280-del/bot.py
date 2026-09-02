@@ -10,6 +10,7 @@ from aiogram.exceptions import TelegramBadRequest
 from motor.motor_asyncio import AsyncIOMotorClient
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8855259798:AAEw-jiTxWh2k0n9WjjbG7tPX64S4g5WUXU")
+FALLBACK_ADMIN_ID = int(os.environ.get("ADMIN_ID", 0)) # Сюда можешь вписать свой айди циферками на всякий случай
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:xgHbZ5HMU2XDj6KZ@cluster0.6q3omrb.mongodb.net/?appName=Cluster0")
 
 bot = Bot(token=BOT_TOKEN)
@@ -19,7 +20,8 @@ try:
     client = AsyncIOMotorClient(MONGO_URI)
     db = client['telegram_multi_bot']
     messages_collection = db['messages']
-    connections_collection = db['connections'] # Хранит связку business_connection_id -> user_id владельца
+    connections_collection = db['connections']
+    users_collection = db['users'] # Коллекция для обычных /start
 except Exception as e:
     print(f"Ошибка подключения к MongoDB: {e}")
 
@@ -48,10 +50,8 @@ async def on_startup():
 
 dp.startup.register(on_startup)
 
-# --- УЛОВИМ ПОДКЛЮЧЕНИЕ БИЗНЕСА ---
 @dp.business_connection()
 async def on_business_connection(connection: BusinessConnection):
-    # Сохраняем связку: ID бизнес-подключения -> ID пользователя (владельца аккаунта)
     if connection.is_enabled:
         with suppress(Exception):
             await connections_collection.update_one(
@@ -63,22 +63,26 @@ async def on_business_connection(connection: BusinessConnection):
                 }},
                 upsert=True
             )
-        # Шлем владельцу приветствие в ЛС при подключении
         with suppress(Exception):
             await bot.send_message(
                 connection.user.id,
                 "🤖 Бот успешно привязан к твоему Telegram Business аккаунту! Теперь все логи будут приходить сюда."
             )
     else:
-        # Если отключил бизнес
         with suppress(Exception):
             await connections_collection.delete_one({"business_connection_id": connection.id})
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
+    # Сохраняем пользователя в базу по его личным сообщениям как страховочный вариант
+    with suppress(Exception):
+        await users_collection.update_one(
+            {"user_id": message.from_user.id},
+            {"$set": {"user_id": message.from_user.id}},
+            upsert=True
+        )
     await message.answer(
-        "Привет! Это общий бот-ассистент для Telegram Business.\n"
-        "Чтобы бот начал работать, подключи его в настройках Telegram: **Настройки ➔ Telegram Business ➔ Чат-боты** и выбери этого бота."
+        "Бот-ассистент успешно активирован! Убедись, что бот также подключен в настройках Telegram Business."
     )
 
 @dp.business_message(F.text.lower().startswith(".мут"))
@@ -220,7 +224,7 @@ async def anim_ku(message: Message):
         with suppress(Exception):
             await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=message.business_connection_id)
 
-# --- СОХРАНЕНИЕ СООБЩЕНИЙ СОБЕСЕДНИКОВ С ПРИВЯЗКОЙ К АККАУНТУ ---
+# --- СОХРАНЕНИЕ СООБЩЕНИЙ ---
 @dp.business_message()
 async def handle_messages(message: Message):
     chat_id = message.chat.id
@@ -248,7 +252,7 @@ async def handle_messages(message: Message):
                 message_ids=[message.message_id]
             )
 
-# --- ИЗМЕНЕНИЯ СООБЩЕНИЙ (ШЛЕМ ВЛАДЕЛЬЦУ ЭТОГО БИЗНЕСА) ---
+# --- ИЗМЕНЕНИЯ СООБЩЕНИЙ ---
 @dp.edited_business_message()
 async def catch_edits(message: Message):
     chat_id = message.chat.id
@@ -266,10 +270,17 @@ async def catch_edits(message: Message):
             
         old_text = old_msg['text'] if old_msg else "[Не успел сохранить]"
         
-        # Находим владельца конкретно этого business_connection_id в базе
+        # Ищем владельца через connections, а если не нашли — берем FALLBACK_ADMIN_ID или первого пользователя
+        owner_id = FALLBACK_ADMIN_ID
         owner_data = await connections_collection.find_one({"business_connection_id": message.business_connection_id})
         if owner_data:
             owner_id = owner_data["user_id"]
+        elif owner_id == 0:
+            first_u = await users_collection.find_one({})
+            if first_u:
+                owner_id = first_u["user_id"]
+
+        if owner_id:
             username_str = f"@{user.username}" if user.username else f"ID: {user.id}"
             with suppress(Exception):
                 await bot.send_message(
@@ -289,16 +300,20 @@ async def catch_edits(message: Message):
                 {"$set": {"text": new_text}}
             )
 
-# --- УДАЛЕНИЯ СООБЩЕНИЙ (ШЛЕМ ВЛАДЕЛЬЦУ ЭТОГО БИЗНЕСА) ---
+# --- УДАЛЕНИЯ СООБЩЕНИЙ ---
 @dp.deleted_business_messages()
 async def catch_deletions(deleted: BusinessMessagesDeleted):
     connection_id = deleted.business_connection_id
     chat_id = deleted.chat.id
     
+    owner_id = FALLBACK_ADMIN_ID
     owner_data = await connections_collection.find_one({"business_connection_id": connection_id})
-    if not owner_data:
-        return
-    owner_id = owner_data["user_id"]
+    if owner_data:
+        owner_id = owner_data["user_id"]
+    elif owner_id == 0:
+        first_u = await users_collection.find_one({})
+        if first_u:
+            owner_id = first_u["user_id"]
 
     for msg_id in deleted.message_ids:
         old_msg = None
@@ -309,7 +324,7 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                 "chat_id": chat_id
             })
             
-        if old_msg:
+        if old_msg and owner_id:
             uname = f"@{old_msg['username']}" if old_msg.get('username') and old_msg['username'] != "нет_юзернейма" else f"ID: {old_msg['user_id']}"
             with suppress(Exception):
                 await bot.send_message(
@@ -341,7 +356,7 @@ async def unmute_user(call: CallbackQuery):
 
 async def main():
     await start_web_server()
-    print("Мультиаккаунтный бот запущен...")
+    print("Мультиаккаунтный бот со страховкой запущен...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
