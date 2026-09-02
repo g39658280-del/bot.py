@@ -264,6 +264,14 @@ async def anim_droch(message: Message):
         "8====✊=D",
         "8===✊==D",
         "8==✊===D",
+        "8===✊==D",
+        "8====✊=D",
+        "8===✊==D",
+        "8==✊===D",
+        "8===✊==D",
+        "8====✊=D",
+        "8===✊==D",
+        "8==✊===D",
         "8======D💦"
     ]
 
@@ -279,7 +287,7 @@ async def anim_droch(message: Message):
         return
 
     for frame in frames[1:]:
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.15)
         with suppress(Exception):
             await bot.edit_message_text(
                 chat_id=message.chat.id,
