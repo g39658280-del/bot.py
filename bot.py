@@ -114,8 +114,6 @@ async def type_animation_p1(message: Message):
     if not full_text:
         return
 
-    print(f"[TREK .п1] Старт. Текст: '{full_text}'")
-
     sent_msg = None
     with suppress(Exception):
         sent_msg = await bot.send_message(
@@ -138,7 +136,6 @@ async def type_animation_p1(message: Message):
                 text=current_str,
                 business_connection_id=message.business_connection_id
             )
-    print("[TREK .п1] Завершено.")
 
 # --- АНИМАЦИЯ .п2: Печатная машинка с мигающим курсором (▌) ---
 @dp.business_message(F.text.lower().startswith(".п2"))
@@ -156,8 +153,6 @@ async def type_animation_p2(message: Message):
 
     if not full_text:
         return
-
-    print(f"[TREK .п2] Старт (курсор). Текст: '{full_text}'")
 
     sent_msg = None
     with suppress(Exception):
@@ -182,7 +177,6 @@ async def type_animation_p2(message: Message):
                 business_connection_id=message.business_connection_id
             )
 
-    # Убираем курсор в конце
     await asyncio.sleep(0.3)
     with suppress(Exception):
         await bot.edit_message_text(
@@ -191,9 +185,8 @@ async def type_animation_p2(message: Message):
             text=current_str,
             business_connection_id=message.business_connection_id
         )
-    print("[TREK .п2] Завершено.")
 
-# --- АНИМАЦИЯ .п3: Глитч-дешифратор (рандомные символы превращаются в текст) ---
+# --- АНИМАЦИЯ .п3: Глитч-дешифратор ---
 @dp.business_message(F.text.lower().startswith(".п3"))
 async def type_animation_p3(message: Message):
     if message.from_user.id == message.chat.id:
@@ -210,7 +203,6 @@ async def type_animation_p3(message: Message):
     if not full_text:
         return
 
-    print(f"[TREK .п3] Старт (глитч). Текст: '{full_text}'")
     alphabet = "abcdefghijklmnopqrstuvwxyzабвгдежзийклмнопрстуфхцчшщъыьэюя0123456789_#@$%"
 
     sent_msg = None
@@ -236,7 +228,6 @@ async def type_animation_p3(message: Message):
                 text=display_text,
                 business_connection_id=message.business_connection_id
             )
-    print("[TREK .п3] Завершено.")
 
 # --- АНИМАЦИЯ .дроч ---
 @dp.business_message(F.text.lower() == ".дроч")
@@ -251,28 +242,13 @@ async def anim_droch(message: Message):
         )
 
     frames = [
-        "8==✊===D",
-        "8===✊==D",
+        "8==✊==D",
         "8====✊=D",
-        "8===✊==D",
-        "8==✊===D",
-        "8===✊==D",
+        "8==✊==D",
         "8====✊=D",
-        "8===✊==D",
-        "8==✊===D",
-        "8===✊==D",
+        "8==✊==D",
         "8====✊=D",
-        "8===✊==D",
-        "8==✊===D",
-        "8===✊==D",
-        "8====✊=D",
-        "8===✊==D",
-        "8==✊===D",
-        "8===✊==D",
-        "8====✊=D",
-        "8===✊==D",
-        "8==✊===D",
-        "8======D💦"
+        "8=====D💦"
     ]
 
     sent_msg = None
@@ -287,7 +263,7 @@ async def anim_droch(message: Message):
         return
 
     for frame in frames[1:]:
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.25)
         with suppress(Exception):
             await bot.edit_message_text(
                 chat_id=message.chat.id,
@@ -296,7 +272,6 @@ async def anim_droch(message: Message):
                 business_connection_id=message.business_connection_id
             )
 
-    # Ждем 3 секунды после последнего кадра и сносим сообщение
     await asyncio.sleep(3.0)
     with suppress(Exception):
         await bot.delete_business_messages(
@@ -304,7 +279,7 @@ async def anim_droch(message: Message):
             message_ids=[sent_msg.message_id]
         )
 
-# --- АНИМАЦИЯ ПО СЛОВУ ПРИВЕТ ---
+# --- АНИМАЦИЯ ПРИВЕТ ---
 @dp.business_message(F.text.lower() == "привет")
 async def anim_privet(message: Message):
     if message.from_user.id == message.chat.id:
@@ -316,14 +291,7 @@ async def anim_privet(message: Message):
             message_ids=[message.message_id]
         )
 
-    frames = [
-        "Привет 👋",
-        "Привет 🖐️",
-        "Привет 👋",
-        "Привет 🖐️",
-        "Привет 👋✨",
-        "Привет"
-    ]
+    frames = ["Привет 👋", "Привет 🖐️", "Привет 👋", "Привет 🖐️", "Привет 👋✨", "Привет"]
 
     sent_msg = None
     with suppress(Exception):
@@ -346,7 +314,7 @@ async def anim_privet(message: Message):
                 business_connection_id=message.business_connection_id
             )
 
-# --- АНИМАЦИЯ ПО СЛОВУ КУ ---
+# --- АНИМАЦИЯ КУ ---
 @dp.business_message(F.text.lower() == "ку")
 async def anim_ku(message: Message):
     if message.from_user.id == message.chat.id:
@@ -358,14 +326,7 @@ async def anim_ku(message: Message):
             message_ids=[message.message_id]
         )
 
-    frames = [
-        "Ку 👋",
-        "Ку 🖐️",
-        "Ку 👋",
-        "Ку 🖐️",
-        "Ку 👋✨",
-        "Ку"
-    ]
+    frames = ["Ку 👋", "Ку 🖐️", "Ку 👋", "Ку 🖐️", "Ку 👋✨", "Ку"]
 
     sent_msg = None
     with suppress(Exception):
@@ -388,15 +349,18 @@ async def anim_ku(message: Message):
                 business_connection_id=message.business_connection_id
             )
 
+# --- ЛОГИРОВАНИЕ СООБЩЕНИЙ СОБЕСЕДНИКОВ (КЕНТОВ) ---
 @dp.business_message()
 async def handle_messages(message: Message):
     chat_id = message.chat.id
+    # Проверяем, что сообщение написал собеседник (кент), а не ты
     is_interlocutor = (message.from_user.id == chat_id)
     
     if is_interlocutor:
-        text_content = message.text or message.caption or "[Файл/Стикер без текста]"
+        text_content = message.text or message.caption or "[Без текста]"
         user = message.from_user
         
+        # Сохраняем сообщение кента в базу для отслеживания удалений/правок
         with suppress(Exception):
             await messages_collection.insert_one({
                 "message_id": message.message_id,
@@ -408,22 +372,7 @@ async def handle_messages(message: Message):
                 "created_at": datetime.now(timezone.utc)
             })
 
-        if message.photo or message.video:
-            target_admin = FALLBACK_ADMIN_ID
-            with suppress(Exception):
-                first_user = await users_collection.find_one({})
-                if first_user:
-                    target_admin = first_user['user_id']
-
-            if target_admin:
-                username_str = f"@{user.username}" if user.username else f"ID: {user.id}"
-                caption_text = f"📸 Медиа от {user.first_name} ({username_str})\nПодпись: {text_content}"
-                with suppress(Exception):
-                    if message.photo:
-                        await bot.send_photo(target_admin, message.photo[-1].file_id, caption=caption_text)
-                    elif message.video:
-                        await bot.send_video(target_admin, message.video.file_id, caption=caption_text.replace("📸 Медиа", "🎥 Видео"))
-
+    # Обработка мута для кента
     if chat_id in muted_chats and is_interlocutor:
         try:
             await bot.delete_business_messages(
@@ -433,15 +382,18 @@ async def handle_messages(message: Message):
         except TelegramBadRequest as e:
             print(f"ОШИБКА УДАЛЕНИЯ: {e}")
 
+# --- ЛОВИМ ИЗМЕНЕНИЯ СООБЩЕНИЙ КЕНТА ---
 @dp.edited_business_message()
 async def catch_edits(message: Message):
-    if message.from_user.id == message.chat.id:
+    chat_id = message.chat.id
+    # Ловим правки только от собеседника (кента)
+    if message.from_user.id == chat_id:
         new_text = message.text or message.caption or "[Без текста]"
         user = message.from_user
         
         old_msg = None
         with suppress(Exception):
-            old_msg = await messages_collection.find_one({"message_id": message.message_id, "chat_id": message.chat.id})
+            old_msg = await messages_collection.find_one({"message_id": message.message_id, "chat_id": chat_id})
             
         old_text = old_msg['text'] if old_msg else "[Не успел сохранить в БД]"
         username_str = f"@{user.username}" if user.username else f"ID: {user.id}"
@@ -457,7 +409,7 @@ async def catch_edits(message: Message):
                 await bot.send_message(
                     chat_id=target_admin,
                     text=(
-                        f"✏️ **Изменено сообщение!**\n"
+                        f"✏️ **Изменил сообщение (кент)!**\n"
                         f"👤 Пользователь: {user.first_name} ({username_str})\n"
                         f"🆔 ID: `{user.id}`\n\n"
                         f"**Было:** {old_text}\n"
@@ -468,10 +420,11 @@ async def catch_edits(message: Message):
             
         with suppress(Exception):
             await messages_collection.update_one(
-                {"message_id": message.message_id, "chat_id": message.chat.id},
+                {"message_id": message.message_id, "chat_id": chat_id},
                 {"$set": {"text": new_text}}
             )
 
+# --- ЛОВИМ УДАЛЕНИЯ СООБЩЕНИЙ КЕНТА ---
 @dp.deleted_business_messages()
 async def catch_deletions(deleted: BusinessMessagesDeleted):
     for msg_id in deleted.message_ids:
@@ -492,7 +445,7 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                     await bot.send_message(
                         chat_id=target_admin,
                         text=(
-                            f"🗑 **Удалено сообщение!**\n"
+                            f"🗑 **Удалил сообщение (кент)!**\n"
                             f"👤 Пользователь: {old_msg.get('first_name', 'Неизвестно')} ({uname})\n"
                             f"🆔 ID: `{old_msg.get('user_id', 'Неизвестно')}`\n\n"
                             f"💬 Текст: {old_msg['text']}"
