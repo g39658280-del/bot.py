@@ -98,32 +98,37 @@ async def mute_user(message: Message):
 # --- АНИМАЦИЯ ПЕЧАТНОЙ МАШИНКИ (.п текст) ---
 @dp.business_message(F.text.lower().startswith(".п"))
 async def type_animation(message: Message):
-    # Сразу сносим сообщение с командой .п (как .мут)
+    # Проверяем, что сообщение отправлено именно тобой (владельцем аккаунта)
+    if message.from_user.id != message.chat.id:
+        return
+
+    # Достаем текст после .п
+    full_text = message.text[2:].strip()
+    
+    # Сносим твое исходное сообщение с командой .п
     with suppress(Exception):
         await bot.delete_business_messages(
             business_connection_id=message.business_connection_id,
             message_ids=[message.message_id]
         )
 
-    # Достаем текст после .п
-    full_text = message.text[2:].strip()
-    
-    # Если написали просто .п без текста — просто удаляем и ничего не делаем
+    # Если написали просто .п без текста — просто выходим после удаления
     if not full_text:
         return
 
-    # Отправляем первое сообщение-заглушку
+    # Отправляем первое сообщение-заглушку через бизнес-соединение
     sent_msg = None
     with suppress(Exception):
         sent_msg = await bot.send_message(
             chat_id=message.chat.id,
-            text="▪️"
+            text="▪️",
+            business_connection_id=message.business_connection_id
         )
 
     if not sent_msg:
         return
 
-    # Плавная печать по буквам каждые 0.5 секунды
+    # Плавная печать по буквам каждые 0.5 секунды с редактированием
     current_str = ""
     for char in full_text:
         current_str += char
@@ -132,7 +137,8 @@ async def type_animation(message: Message):
             await bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=sent_msg.message_id,
-                text=current_str
+                text=current_str,
+                business_connection_id=message.business_connection_id
             )
 
 @dp.business_message()
