@@ -53,7 +53,7 @@ async def mute_user(message: Message):
     ])
     
     await message.answer(
-        "🚫 Собеседник переведен в мут.", 
+        "67 покойошечка", 
         reply_markup=markup, 
         parse_mode="Markdown"
     )
@@ -88,12 +88,12 @@ async def unmute_user(call: CallbackQuery):
     if chat_id in muted_chats:
         muted_chats.remove(chat_id)
         with suppress(TelegramBadRequest):
-            await call.message.edit_text("✅ **Мут снят.** Собеседник снова может писать.")
-            await call.answer("Мут успешно снят!")
+            await call.message.edit_text("твой госоподин размутил тибя")
+            await call.answer("снял наху")
     else:
         # Защита от спама по старой кнопке
         with suppress(TelegramBadRequest):
-            await call.message.edit_text("✅ **Собеседник уже может писать.**")
+            await call.message.edit_text("уже снял еблан")
             await call.answer("Этот чат уже не в муте.")
 
 async def main():
