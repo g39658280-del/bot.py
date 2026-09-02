@@ -10,23 +10,24 @@ from aiogram.exceptions import TelegramBadRequest
 from motor.motor_asyncio import AsyncIOMotorClient
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8855259798:AAEw-jiTxWh2k0n9WjjbG7tPX64S4g5WUXU")
-FALLBACK_ADMIN_ID = int(os.environ.get("ADMIN_ID", 0)) # Сюда можешь вписать свой айди циферками на всякий случай
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:xgHbZ5HMU2XDj6KZ@cluster0.6q3omrb.mongodb.net/?appName=Cluster0")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# --- База данных для мультиаккаунтности ---
 try:
     client = AsyncIOMotorClient(MONGO_URI)
     db = client['telegram_multi_bot']
     messages_collection = db['messages']
-    connections_collection = db['connections']
-    users_collection = db['users'] # Коллекция для обычных /start
+    connections_collection = db['connections'] # Связь бизнес-подключений и владельцев
+    users_collection = db['users']
 except Exception as e:
     print(f"Ошибка подключения к MongoDB: {e}")
 
 muted_chats = set()
 
+# --- Веб-сервер ---
 async def dummy_handler(request):
     return web.Response(text="Multi-bot is running!")
 
@@ -39,17 +40,17 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Health-check сервер запущен на порту {port}")
 
 async def on_startup():
     try:
         await messages_collection.create_index("created_at", expireAfterSeconds=172800)
-        print("Мультиаккаунтная база данных подключена!")
+        print("Бот и база данных запущены!")
     except Exception as e:
-        print(f"Внимание: ошибка БД: {e}")
+        pass
 
 dp.startup.register(on_startup)
 
+# --- ЛОВИМ ПОДКЛЮЧЕНИЯ (КЕНТЫ, ТЫ, КТО УГОДНО) ---
 @dp.business_connection()
 async def on_business_connection(connection: BusinessConnection):
     if connection.is_enabled:
@@ -66,7 +67,7 @@ async def on_business_connection(connection: BusinessConnection):
         with suppress(Exception):
             await bot.send_message(
                 connection.user.id,
-                "🤖 Бот успешно привязан к твоему Telegram Business аккаунту! Теперь все логи будут приходить сюда."
+                "🤖 Бот успешно привязан к твоему Telegram Business аккаунту!\nТеперь логи удаленных сообщений из твоих чатов будут приходить тебе сюда."
             )
     else:
         with suppress(Exception):
@@ -74,168 +75,182 @@ async def on_business_connection(connection: BusinessConnection):
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    # Сохраняем пользователя в базу по его личным сообщениям как страховочный вариант
     with suppress(Exception):
         await users_collection.update_one(
             {"user_id": message.from_user.id},
             {"$set": {"user_id": message.from_user.id}},
             upsert=True
         )
-    await message.answer(
-        "Бот-ассистент успешно активирован! Убедись, что бот также подключен в настройках Telegram Business."
-    )
+    await message.answer("Ассистент запущен. Убедись, что подключил бота в настройках Telegram Business!")
 
+# --- ЛОГИКА МУТА ---
 @dp.business_message(F.text.lower().startswith(".мут"))
 async def mute_user(message: Message):
     chat_id = message.chat.id
+    conn_id = message.business_connection_id
     
-    with suppress(Exception):
-        await bot.delete_business_messages(
-            business_connection_id=message.business_connection_id,
-            message_ids=[message.message_id]
-        )
-
+    # Игнорим, если .мут написал сам петух (собеседник)
     if message.from_user.id == chat_id:
         return
         
-    if chat_id in muted_chats:
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=conn_id,
+            message_ids=[message.message_id]
+        )
+
+    mute_key = f"{conn_id}_{chat_id}"
+    if mute_key in muted_chats:
         await message.answer("⚠️ уже в муте петух", parse_mode="Markdown")
         return
         
-    muted_chats.add(chat_id)
+    muted_chats.add(mute_key)
     
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Размутить", callback_data=f"unmute_{chat_id}")]
     ])
     
-    await message.answer(
-        "67 покойошечка", 
-        reply_markup=markup, 
-        parse_mode="Markdown"
-    )
+    await message.answer("67 покойошечка", reply_markup=markup, parse_mode="Markdown")
 
-# --- АНИМАЦИИ (.п1, .п2, .п3, .дроч, привет, ку) ---
-@dp.business_message(F.text.lower().startswith(".п1"))
-async def type_animation_p1(message: Message):
-    if message.from_user.id != message.chat.id:
+# --- УДЛИНЕННАЯ АНИМАЦИЯ .дроч ---
+@dp.business_message(F.text.lower().startswith(".дроч"))
+async def anim_droch(message: Message):
+    # Запускает только владелец
+    if message.from_user.id == message.chat.id:
         return
-    full_text = message.text[3:].strip()
+        
+    conn_id = message.business_connection_id
     with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
-    if not full_text:
-        return
-    sent_msg = await bot.send_message(chat_id=message.chat.id, text=full_text[0], business_connection_id=message.business_connection_id)
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    
+    frames = [
+        "8==✊==D",
+        "8==✊===D",
+        "8===✊==D",
+        "8====✊=D",
+        "8==✊==D",
+        "8===✊==D",
+        "8==✊===D",
+        "8===✊==D",
+        "8====✊=D",
+        "8==✊==D",
+        "8===✊==D",
+        "8==✊===D",
+        "8===✊==D",
+        "8====✊=D",
+        "8=====D💦",
+        "8===✊==D",
+        "8==✊===D",
+        "8======D💦"
+    ]
+
+    sent_msg = await bot.send_message(chat_id=message.chat.id, text=frames[0], business_connection_id=conn_id)
     if not sent_msg:
         return
+        
+    for frame in frames[1:]:
+        await asyncio.sleep(0.2)
+        with suppress(Exception):
+            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=conn_id)
+            
+    await asyncio.sleep(3.0)
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[sent_msg.message_id])
+
+# --- ОСТАЛЬНЫЕ АНИМАЦИИ ---
+@dp.business_message(F.text.lower().startswith(".п1"))
+async def type_animation_p1(message: Message):
+    if message.from_user.id == message.chat.id: return
+    full_text = message.text[3:].strip()
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text: return
+    sent_msg = await bot.send_message(chat_id=message.chat.id, text=full_text[0], business_connection_id=message.business_connection_id)
+    if not sent_msg: return
     current_str = full_text[0]
     for char in full_text[1:]:
         current_str += char
         await asyncio.sleep(0.27)
-        with suppress(Exception):
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
 
 @dp.business_message(F.text.lower().startswith(".п2"))
 async def type_animation_p2(message: Message):
-    if message.from_user.id != message.chat.id:
-        return
+    if message.from_user.id == message.chat.id: return
     full_text = message.text[3:].strip()
-    with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
-    if not full_text:
-        return
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text: return
     sent_msg = await bot.send_message(chat_id=message.chat.id, text=full_text[0] + "▌", business_connection_id=message.business_connection_id)
-    if not sent_msg:
-        return
+    if not sent_msg: return
     current_str = full_text[0]
     for char in full_text[1:]:
         current_str += char
         await asyncio.sleep(0.27)
-        with suppress(Exception):
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str + "▌", business_connection_id=message.business_connection_id)
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str + "▌", business_connection_id=message.business_connection_id)
     await asyncio.sleep(0.3)
-    with suppress(Exception):
-        await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
+    with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
 
 @dp.business_message(F.text.lower().startswith(".п3"))
 async def type_animation_p3(message: Message):
-    if message.from_user.id != message.chat.id:
-        return
+    if message.from_user.id == message.chat.id: return
     full_text = message.text[3:].strip()
-    with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
-    if not full_text:
-        return
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text: return
     alphabet = "abcdefghijklmnopqrstuvwxyzабвгдежзийклмнопрстуфхцчшщъыьэюя0123456789_#@$%"
     sent_msg = await bot.send_message(chat_id=message.chat.id, text="...", business_connection_id=message.business_connection_id)
-    if not sent_msg:
-        return
+    if not sent_msg: return
     for i in range(len(full_text) + 1):
         await asyncio.sleep(0.2)
         correct_part = full_text[:i]
         random_part = "".join(random.choice(alphabet) for _ in range(len(full_text) - i))
-        with suppress(Exception):
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=correct_part + random_part, business_connection_id=message.business_connection_id)
-
-@dp.business_message(F.text.lower().startswith(".дроч"))
-async def anim_droch(message: Message):
-    if message.from_user.id != message.chat.id:
-        return
-    with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
-    frames = ["8==✊==D", "8====✊=D", "8==✊==D", "8====✊=D", "8==✊==D", "8====✊=D", "8=====D💦"]
-    sent_msg = await bot.send_message(chat_id=message.chat.id, text=frames[0], business_connection_id=message.business_connection_id)
-    if not sent_msg:
-        return
-    for frame in frames[1:]:
-        await asyncio.sleep(0.25)
-        with suppress(Exception):
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=message.business_connection_id)
-    await asyncio.sleep(3.0)
-    with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[sent_msg.message_id])
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=correct_part + random_part, business_connection_id=message.business_connection_id)
 
 @dp.business_message(F.text.lower() == "привет")
 async def anim_privet(message: Message):
-    if message.from_user.id != message.chat.id:
-        return
-    with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if message.from_user.id == message.chat.id: return
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
     frames = ["Привет 👋", "Привет 🖐️", "Привет 👋", "Привет 🖐️", "Привет 👋✨", "Привет"]
     sent_msg = await bot.send_message(chat_id=message.chat.id, text=frames[0], business_connection_id=message.business_connection_id)
-    if not sent_msg:
-        return
+    if not sent_msg: return
     for frame in frames[1:]:
         await asyncio.sleep(0.4)
-        with suppress(Exception):
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=message.business_connection_id)
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=message.business_connection_id)
 
 @dp.business_message(F.text.lower() == "ку")
 async def anim_ku(message: Message):
-    if message.from_user.id != message.chat.id:
-        return
-    with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if message.from_user.id == message.chat.id: return
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
     frames = ["Ку 👋", "Ку 🖐️", "Ку 👋", "Ку 🖐️", "Ку 👋✨", "Ку"]
     sent_msg = await bot.send_message(chat_id=message.chat.id, text=frames[0], business_connection_id=message.business_connection_id)
-    if not sent_msg:
-        return
+    if not sent_msg: return
     for frame in frames[1:]:
         await asyncio.sleep(0.4)
-        with suppress(Exception):
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=message.business_connection_id)
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=message.business_connection_id)
 
-# --- СОХРАНЕНИЕ СООБЩЕНИЙ ---
+# --- СОХРАНЕНИЕ И МУТ СООБЩЕНИЙ ПЕТУХОВ ---
 @dp.business_message()
 async def handle_messages(message: Message):
     chat_id = message.chat.id
-    is_interlocutor = (message.from_user.id != chat_id)
+    conn_id = message.business_connection_id
+    
+    # ИСПРАВЛЕННАЯ ПРОВЕРКА: Собеседник - это когда его ID совпадает с ID чата
+    is_interlocutor = (message.from_user.id == chat_id)
     
     if is_interlocutor:
+        # 1. Мут
+        mute_key = f"{conn_id}_{chat_id}"
+        if mute_key in muted_chats:
+            with suppress(Exception):
+                await bot.delete_business_messages(
+                    business_connection_id=conn_id,
+                    message_ids=[message.message_id]
+                )
+            return # Удаляем и выходим, сохранять этот мусор не надо
+
+        # 2. Если не в муте — сохраняем для логов
         text_content = message.text or message.caption or "[Без текста]"
         user = message.from_user
         with suppress(Exception):
             await messages_collection.insert_one({
-                "business_connection_id": message.business_connection_id,
+                "business_connection_id": conn_id,
                 "message_id": message.message_id,
                 "chat_id": chat_id,
                 "user_id": user.id,
@@ -245,43 +260,33 @@ async def handle_messages(message: Message):
                 "created_at": datetime.now(timezone.utc)
             })
 
-    if chat_id in muted_chats and is_interlocutor:
-        with suppress(Exception):
-            await bot.delete_business_messages(
-                business_connection_id=message.business_connection_id,
-                message_ids=[message.message_id]
-            )
-
-# --- ИЗМЕНЕНИЯ СООБЩЕНИЙ ---
+# --- ИЗМЕНЕНИЯ СООБЩЕНИЙ СОБЕСЕДНИКА ---
 @dp.edited_business_message()
 async def catch_edits(message: Message):
     chat_id = message.chat.id
-    if message.from_user.id != chat_id:
+    conn_id = message.business_connection_id
+    
+    # Ловим только если изменил СОБЕСЕДНИК (а не кент/ты)
+    if message.from_user.id == chat_id:
         new_text = message.text or message.caption or "[Без текста]"
         user = message.from_user
         
         old_msg = None
         with suppress(Exception):
             old_msg = await messages_collection.find_one({
-                "business_connection_id": message.business_connection_id,
+                "business_connection_id": conn_id,
                 "message_id": message.message_id,
                 "chat_id": chat_id
             })
             
         old_text = old_msg['text'] if old_msg else "[Не успел сохранить]"
         
-        # Ищем владельца через connections, а если не нашли — берем FALLBACK_ADMIN_ID или первого пользователя
-        owner_id = FALLBACK_ADMIN_ID
-        owner_data = await connections_collection.find_one({"business_connection_id": message.business_connection_id})
+        # Находим, чье это бизнес-подключение (кому слать лог)
+        owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
         if owner_data:
             owner_id = owner_data["user_id"]
-        elif owner_id == 0:
-            first_u = await users_collection.find_one({})
-            if first_u:
-                owner_id = first_u["user_id"]
-
-        if owner_id:
             username_str = f"@{user.username}" if user.username else f"ID: {user.id}"
+            
             with suppress(Exception):
                 await bot.send_message(
                     chat_id=owner_id,
@@ -296,24 +301,22 @@ async def catch_edits(message: Message):
             
         with suppress(Exception):
             await messages_collection.update_one(
-                {"business_connection_id": message.business_connection_id, "message_id": message.message_id, "chat_id": chat_id},
+                {"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id},
                 {"$set": {"text": new_text}}
             )
 
-# --- УДАЛЕНИЯ СООБЩЕНИЙ ---
+# --- УДАЛЕНИЯ СООБЩЕНИЙ СОБЕСЕДНИКА ---
 @dp.deleted_business_messages()
 async def catch_deletions(deleted: BusinessMessagesDeleted):
     connection_id = deleted.business_connection_id
     chat_id = deleted.chat.id
     
-    owner_id = FALLBACK_ADMIN_ID
+    # Находим, чье это бизнес-подключение (кому слать лог)
     owner_data = await connections_collection.find_one({"business_connection_id": connection_id})
-    if owner_data:
-        owner_id = owner_data["user_id"]
-    elif owner_id == 0:
-        first_u = await users_collection.find_one({})
-        if first_u:
-            owner_id = first_u["user_id"]
+    if not owner_data:
+        return
+        
+    owner_id = owner_data["user_id"]
 
     for msg_id in deleted.message_ids:
         old_msg = None
@@ -324,7 +327,8 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                 "chat_id": chat_id
             })
             
-        if old_msg and owner_id:
+        # Отправляем лог владельцу, чье подключение сработало
+        if old_msg:
             uname = f"@{old_msg['username']}" if old_msg.get('username') and old_msg['username'] != "нет_юзернейма" else f"ID: {old_msg['user_id']}"
             with suppress(Exception):
                 await bot.send_message(
@@ -337,16 +341,23 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                     parse_mode="Markdown"
                 )
 
+# --- КНОПКА РАЗМУТИТЬ ---
 @dp.callback_query(F.data.startswith("unmute_"))
 async def unmute_user(call: CallbackQuery):
     chat_id = int(call.data.split("_")[1])
+    
+    # Если кнопку нажал сам собеседник — посылаем его
     if call.from_user.id == chat_id:
         with suppress(TelegramBadRequest):
             await call.answer("поной!", show_alert=True)
         return
 
-    if chat_id in muted_chats:
-        muted_chats.remove(chat_id)
+    # Берем ID бизнес-подключения из сообщения с кнопкой
+    conn_id = call.message.business_connection_id
+    mute_key = f"{conn_id}_{chat_id}"
+
+    if mute_key in muted_chats:
+        muted_chats.remove(mute_key)
         with suppress(TelegramBadRequest):
             await call.message.edit_text("твой господин размутил тебя")
             await call.answer("снял")
@@ -356,7 +367,6 @@ async def unmute_user(call: CallbackQuery):
 
 async def main():
     await start_web_server()
-    print("Мультиаккаунтный бот со страховкой запущен...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
