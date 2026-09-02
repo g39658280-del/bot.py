@@ -96,7 +96,7 @@ async def mute_user(message: Message):
         parse_mode="Markdown"
     )
 
-# --- АНИМАЦИЯ ПЕЧАТНОЙ МАШИНКИ (.п текст) С ТРЕКЕРОМ ШАГОВ ---
+# --- АНИМАЦИЯ ПЕЧАТНОЙ МАШИНКИ (.п текст) С ТРЕКЕРОМ В КОНСОЛИ ---
 @dp.business_message(F.text.lower().startswith(".п"))
 async def type_animation(message: Message):
     # Если сообщение написал клиент (а не ты), выходим
@@ -113,32 +113,11 @@ async def type_animation(message: Message):
             message_ids=[message.message_id]
         )
 
-    # Если написали просто .п без текста
+    # Если написали просто .п без текста — просто удаляем и ничего не пишем в чат
     if not full_text:
-        with suppress(Exception):
-            status_msg = await bot.send_message(
-                chat_id=message.chat.id,
-                text="⚙️ Режим анимации `.п`: **ВЫКЛЮЧЕН** (пустой ввод)",
-                business_connection_id=message.business_connection_id,
-                parse_mode="Markdown"
-            )
-            await asyncio.sleep(2)
-            await bot.delete_business_messages(
-                business_connection_id=message.business_connection_id,
-                message_ids=[status_msg.message_id]
-            )
         return
 
     print(f"[TREK] ШАГ 1: Получена команда .п. Текст: '{full_text}'. Запуск анимации...")
-    
-    status_indicator = None
-    with suppress(Exception):
-        status_indicator = await bot.send_message(
-            chat_id=message.chat.id,
-            text="🟢 Режим анимации `.п`: **ВКЛЮЧЕН** (печатаю...)",
-            business_connection_id=message.business_connection_id,
-            parse_mode="Markdown"
-        )
 
     sent_msg = None
     with suppress(Exception):
@@ -170,20 +149,6 @@ async def type_animation(message: Message):
             )
 
     print("[TREK] ШАГ 4: Анимация успешно завершена!")
-    if status_indicator:
-        with suppress(Exception):
-            await bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=status_indicator.message_id,
-                text="🔴 Режим анимации `.п`: **ВЫКЛЮЧЕН** (готово)",
-                business_connection_id=message.business_connection_id,
-                parse_mode="Markdown"
-            )
-            await asyncio.sleep(1.5)
-            await bot.delete_business_messages(
-                business_connection_id=message.business_connection_id,
-                message_ids=[status_indicator.message_id]
-            )
 
 @dp.business_message()
 async def handle_messages(message: Message):
