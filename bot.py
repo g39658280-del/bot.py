@@ -69,13 +69,14 @@ async def cmd_start(message: Message):
 async def mute_user(message: Message):
     chat_id = message.chat.id
     
-    # Сносим твое сообщение с командой .мут
+    # Сносим сообщение с командой .мут
     with suppress(Exception):
         await bot.delete_business_messages(
             business_connection_id=message.business_connection_id,
             message_ids=[message.message_id]
         )
 
+    # Если сообщение написал клиент, а не ты — игнорируем мут
     if message.from_user.id == chat_id:
         return
         
@@ -98,8 +99,8 @@ async def mute_user(message: Message):
 # --- АНИМАЦИЯ ПЕЧАТНОЙ МАШИНКИ (.п текст) С ТРЕКЕРОМ ШАГОВ ---
 @dp.business_message(F.text.lower().startswith(".п"))
 async def type_animation(message: Message):
-    # Проверяем, что сообщение отправлено именно тобой
-    if message.from_user.id != message.chat.id:
+    # Если сообщение написал клиент (а не ты), выходим
+    if message.from_user.id == message.chat.id:
         return
 
     # Достаем текст после .п
@@ -112,7 +113,7 @@ async def type_animation(message: Message):
             message_ids=[message.message_id]
         )
 
-    # Если написали просто .п без текста — переключаем статус режима анимации / выводим статус
+    # Если написали просто .п без текста
     if not full_text:
         with suppress(Exception):
             status_msg = await bot.send_message(
@@ -128,7 +129,6 @@ async def type_animation(message: Message):
             )
         return
 
-    # ШАГ 1: Информируем владельца в консоль и отправляем статус о включении режима сверху
     print(f"[TREK] ШАГ 1: Получена команда .п. Текст: '{full_text}'. Запуск анимации...")
     
     status_indicator = None
@@ -140,7 +140,6 @@ async def type_animation(message: Message):
             parse_mode="Markdown"
         )
 
-    # ШАГ 2: Отправляем начальное сообщение-заглушку для анимации
     sent_msg = None
     with suppress(Exception):
         sent_msg = await bot.send_message(
@@ -153,9 +152,8 @@ async def type_animation(message: Message):
         print("[TREK] ОШИБКА: Не удалось отправить стартовое сообщение заглушки!")
         return
 
-    print(f"[TREK] ШАГ 2: Заглушка отправлена (ID: {sent_msg.message_id}). Начинаю посимвольный вывод...")
+    print(f"[TREK] ШАГ 2: Заглушка отправлена (ID: {sent_msg.message_id}). Начинаю вывод...")
 
-    # ШАГ 3: Посимвольная печать (каждые 0.5 сек) с передачей business_connection_id для edit_message_text
     current_str = ""
     step_count = 0
     for char in full_text:
@@ -171,11 +169,9 @@ async def type_animation(message: Message):
                 business_connection_id=message.business_connection_id
             )
 
-    # ШАГ 4: Завершение анимации, удаление статус-индикатора сверху
     print("[TREK] ШАГ 4: Анимация успешно завершена!")
     if status_indicator:
         with suppress(Exception):
-            # Меняем статус на выключено перед удалением
             await bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=status_indicator.message_id,
@@ -198,7 +194,6 @@ async def handle_messages(message: Message):
         text_content = message.text or message.caption or "[Файл/Стикер без текста]"
         user = message.from_user
         
-        # Сохраняем в базу текст, ID сообщения и инфу о юзере
         with suppress(Exception):
             await messages_collection.insert_one({
                 "message_id": message.message_id,
@@ -210,7 +205,6 @@ async def handle_messages(message: Message):
                 "created_at": datetime.now(timezone.utc)
             })
 
-        # Перехват фото и видео
         if message.photo or message.video:
             target_admin = FALLBACK_ADMIN_ID
             with suppress(Exception):
@@ -227,7 +221,6 @@ async def handle_messages(message: Message):
                     elif message.video:
                         await bot.send_video(target_admin, message.video.file_id, caption=caption_text.replace("📸 Медиа", "🎥 Видео"))
 
-    # Логика мута
     if chat_id in muted_chats and is_interlocutor:
         try:
             await bot.delete_business_messages(
@@ -237,7 +230,6 @@ async def handle_messages(message: Message):
         except TelegramBadRequest as e:
             print(f"ОШИБКА УДАЛЕНИЯ: {e}")
 
-# ПЕРЕХВАТ ИЗМЕНЕННЫХ СООБЩЕНИЙ
 @dp.edited_business_message()
 async def catch_edits(message: Message):
     if message.from_user.id == message.chat.id:
@@ -277,7 +269,6 @@ async def catch_edits(message: Message):
                 {"$set": {"text": new_text}}
             )
 
-# ПЕРЕХВАТ УДАЛЕННЫХ СООБЩЕНИЙ
 @dp.deleted_business_messages()
 async def catch_deletions(deleted: BusinessMessagesDeleted):
     for msg_id in deleted.message_ids:
