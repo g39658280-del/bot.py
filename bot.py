@@ -65,10 +65,17 @@ async def cmd_start(message: Message):
         )
     await message.answer("Бот-секретарь успешно активирован! Логи удалений и измененных сообщений будут приходить сюда.")
 
-@dp.business_message(F.text.lower() == ".мут")
+@dp.business_message(F.text.lower().startswith(".мут"))
 async def mute_user(message: Message):
     chat_id = message.chat.id
     
+    # Сносим твое сообщение с командой .мут, чтобы не палиться
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=message.business_connection_id,
+            message_ids=[message.message_id]
+        )
+
     if message.from_user.id == chat_id:
         return
         
@@ -89,24 +96,25 @@ async def mute_user(message: Message):
     )
 
 # --- АНИМАЦИЯ ПЕЧАТНОЙ МАШИНКИ (.п текст) ---
-@dp.business_message(F.text.startswith(".п "))
+@dp.business_message(F.text.regexp(r"^\.п($|\s)"))
 async def type_animation(message: Message):
-    # Проверяем, что команду отправил ты (владелец аккаунта)
+    # Проверяем, что команду отправил ты
     if message.from_user.id != message.chat.id:
         return
 
-    full_text = message.text[3:].strip()
+    # Достаем текст после .п (поддерживает и .ппривет, и .п привет)
+    full_text = message.text[2:].strip()
     if not full_text:
         return
 
-    # Удаляем твое исходное сообщение с командой
+    # Удаляем твое сообщение с командой
     with suppress(Exception):
         await bot.delete_business_messages(
             business_connection_id=message.business_connection_id,
             message_ids=[message.message_id]
         )
 
-    # Отправляем первое пустое/начальное сообщение
+    # Отправляем первое сообщение через бизнес-метод
     sent_msg = None
     with suppress(Exception):
         sent_msg = await bot.send_message(
@@ -117,7 +125,7 @@ async def type_animation(message: Message):
     if not sent_msg:
         return
 
-    # По буквам дописываем текст каждые 0.5 секунды
+    # Плавная анимация по буквам (каждые 0.5 секунды)
     current_str = ""
     for char in full_text:
         current_str += char
@@ -150,7 +158,7 @@ async def handle_messages(message: Message):
                 "created_at": datetime.now(timezone.utc)
             })
 
-        # Перехват фото и видео (сохраняем копию до того как пропадет)
+        # Перехват фото и видео
         if message.photo or message.video:
             target_admin = FALLBACK_ADMIN_ID
             with suppress(Exception):
