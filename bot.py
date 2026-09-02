@@ -123,7 +123,7 @@ async def type_animation(message: Message):
     with suppress(Exception):
         sent_msg = await bot.send_message(
             chat_id=message.chat.id,
-            text="▪️",
+            text="ㅤ",
             business_connection_id=message.business_connection_id
         )
 
@@ -138,7 +138,7 @@ async def type_animation(message: Message):
     for char in full_text:
         current_str += char
         step_count += 1
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.25)
         print(f"[TREK] Шаг анимации #{step_count}: добавлена буква '{char}' -> Текст: '{current_str}'")
         with suppress(Exception):
             await bot.edit_message_text(
