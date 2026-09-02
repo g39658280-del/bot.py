@@ -30,7 +30,7 @@ async def start_web_server():
 async def mute_user(client, message):
     chat_id = message.chat.id
     if chat_id in muted_chats:
-        await message.edit_text("⚠️ **Собеседник уже находится в муте!**")
+        await message.edit_text("⚠️ Собеседник уже находится в муте!")
         return
         
     muted_chats.add(chat_id)
@@ -41,9 +41,9 @@ async def unmute_user(client, message):
     chat_id = message.chat.id
     if chat_id in muted_chats:
         muted_chats.remove(chat_id)
-        await message.edit_text("✅ **Мут снят.** Собеседник снова может писать.")
+        await message.edit_text("✅ Мут снят.")
     else:
-        await message.edit_text("⚠️ **Этот собеседник не в муте.**")
+        await message.edit_text("⚠️ Этот собеседник не в муте.")
 
 @app.on_message(filters.private & ~filters.me)
 async def delete_messages(client, message):
