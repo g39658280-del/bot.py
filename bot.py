@@ -6,8 +6,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 
-# Токен вставлен как пример. Если в настройках Render указана переменная BOT_TOKEN,
-# скрипт возьмет ее оттуда, а если нет — будет использовать этот токен по умолчанию.
+# Токен берется из настроек Render, либо используется дефолтный
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8855259798:AAEw-jiTxWh2k0n9WjjbG7tPX64S4g5WUXU")
 
 bot = Bot(token=BOT_TOKEN)
@@ -54,7 +53,7 @@ async def mute_user(message: Message):
     ])
     
     await message.answer(
-        "🚫 **Собеседник переведен в мут.**\nВсе его новые сообщения будут удаляться.", 
+        "🚫 Собеседник переведен в мут.", 
         reply_markup=markup, 
         parse_mode="Markdown"
     )
@@ -67,9 +66,9 @@ async def handle_messages(message: Message):
     if chat_id in muted_chats and message.from_user.id == chat_id:
         try:
             # ИСПОЛЬЗУЕМ СПЕЦИАЛЬНЫЙ БИЗНЕС-МЕТОД УДАЛЕНИЯ
+            # ВАЖНО: Мы больше не передаем сюда chat_id, чтобы не крашить код!
             await bot.delete_business_messages(
                 business_connection_id=message.business_connection_id,
-                chat_id=chat_id,
                 message_ids=[message.message_id]
             )
         except TelegramBadRequest as e:
