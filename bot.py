@@ -138,7 +138,7 @@ async def type_animation(message: Message):
     for char in full_text:
         current_str += char
         step_count += 1
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.27)
         print(f"[TREK] Шаг анимации #{step_count}: добавлена буква '{char}' -> Текст: '{current_str}'")
         with suppress(Exception):
             await bot.edit_message_text(
