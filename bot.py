@@ -119,23 +119,24 @@ async def type_animation(message: Message):
 
     print(f"[TREK] ШАГ 1: Получена команда .п. Текст: '{full_text}'. Запуск анимации...")
 
+    # Отправляем сразу первую букву вместо пустой заглушки
     sent_msg = None
     with suppress(Exception):
         sent_msg = await bot.send_message(
             chat_id=message.chat.id,
-            text="ㅤ",
+            text=full_text[0],
             business_connection_id=message.business_connection_id
         )
 
     if not sent_msg:
-        print("[TREK] ОШИБКА: Не удалось отправить стартовое сообщение заглушки!")
+        print("[TREK] ОШИБКА: Не удалось отправить первую букву!")
         return
 
-    print(f"[TREK] ШАГ 2: Заглушка отправлена (ID: {sent_msg.message_id}). Начинаю вывод...")
+    print(f"[TREK] ШАГ 2: Первая буква отправлена (ID: {sent_msg.message_id}). Начинаю вывод...")
 
-    current_str = ""
+    current_str = full_text[0]
     step_count = 0
-    for char in full_text:
+    for char in full_text[1:]:
         current_str += char
         step_count += 1
         await asyncio.sleep(0.27)
