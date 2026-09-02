@@ -88,6 +88,47 @@ async def mute_user(message: Message):
         parse_mode="Markdown"
     )
 
+# --- АНИМАЦИЯ ПЕЧАТНОЙ МАШИНКИ (.п текст) ---
+@dp.business_message(F.text.startswith(".п "))
+async def type_animation(message: Message):
+    # Проверяем, что команду отправил ты (владелец аккаунта)
+    if message.from_user.id != message.chat.id:
+        return
+
+    full_text = message.text[3:].strip()
+    if not full_text:
+        return
+
+    # Удаляем твое исходное сообщение с командой
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=message.business_connection_id,
+            message_ids=[message.message_id]
+        )
+
+    # Отправляем первое пустое/начальное сообщение
+    sent_msg = None
+    with suppress(Exception):
+        sent_msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text="▪️"
+        )
+
+    if not sent_msg:
+        return
+
+    # По буквам дописываем текст каждые 0.5 секунды
+    current_str = ""
+    for char in full_text:
+        current_str += char
+        await asyncio.sleep(0.5)
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=sent_msg.message_id,
+                text=current_str
+            )
+
 @dp.business_message()
 async def handle_messages(message: Message):
     chat_id = message.chat.id
