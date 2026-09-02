@@ -7,7 +7,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from aiogram.exceptions import TelegramBadRequest
 
 # 1. ВСТАВЬ СЮДА СВОЙ ТОКЕН ОТ @BotFather (в кавычках)
-BOT_TOKEN = "ТВОЙ_ТОКЕН_ЗДЕСЬ"
+BOT_TOKEN = "8855259798:AAEw-jiTxWh2k0n9WjjbG7tPX64S4g5WUXU"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
