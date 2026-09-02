@@ -238,6 +238,141 @@ async def type_animation_p3(message: Message):
             )
     print("[TREK .п3] Завершено.")
 
+# --- АНИМАЦИЯ .дроч ---
+@dp.business_message(F.text.lower() == ".дроч")
+async def anim_droch(message: Message):
+    if message.from_user.id == message.chat.id:
+        return
+
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=message.business_connection_id,
+            message_ids=[message.message_id]
+        )
+
+    frames = [
+        "8==✊==D",
+        "8====✊=D",
+        "8==✊==D",
+        "8====✊=D",
+        "8==✊==D",
+        "8====✊=D",
+        "8=====D💦"
+    ]
+
+    sent_msg = None
+    with suppress(Exception):
+        sent_msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text=frames[0],
+            business_connection_id=message.business_connection_id
+        )
+
+    if not sent_msg:
+        return
+
+    for frame in frames[1:]:
+        await asyncio.sleep(0.25)
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=sent_msg.message_id,
+                text=frame,
+                business_connection_id=message.business_connection_id
+            )
+
+    # Ждем 3 секунды после последнего кадра и сносим сообщение
+    await asyncio.sleep(3.0)
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=message.business_connection_id,
+            message_ids=[sent_msg.message_id]
+        )
+
+# --- АНИМАЦИЯ ПО СЛОВУ ПРИВЕТ ---
+@dp.business_message(F.text.lower() == "привет")
+async def anim_privet(message: Message):
+    if message.from_user.id == message.chat.id:
+        return
+
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=message.business_connection_id,
+            message_ids=[message.message_id]
+        )
+
+    frames = [
+        "Привет 👋",
+        "Привет 🖐️",
+        "Привет 👋",
+        "Привет 🖐️",
+        "Привет 👋✨",
+        "Привет"
+    ]
+
+    sent_msg = None
+    with suppress(Exception):
+        sent_msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text=frames[0],
+            business_connection_id=message.business_connection_id
+        )
+
+    if not sent_msg:
+        return
+
+    for frame in frames[1:]:
+        await asyncio.sleep(0.4)
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=sent_msg.message_id,
+                text=frame,
+                business_connection_id=message.business_connection_id
+            )
+
+# --- АНИМАЦИЯ ПО СЛОВУ КУ ---
+@dp.business_message(F.text.lower() == "ку")
+async def anim_ku(message: Message):
+    if message.from_user.id == message.chat.id:
+        return
+
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=message.business_connection_id,
+            message_ids=[message.message_id]
+        )
+
+    frames = [
+        "Ку 👋",
+        "Ку 🖐️",
+        "Ку 👋",
+        "Ку 🖐️",
+        "Ку 👋✨",
+        "Ку"
+    ]
+
+    sent_msg = None
+    with suppress(Exception):
+        sent_msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text=frames[0],
+            business_connection_id=message.business_connection_id
+        )
+
+    if not sent_msg:
+        return
+
+    for frame in frames[1:]:
+        await asyncio.sleep(0.4)
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=sent_msg.message_id,
+                text=frame,
+                business_connection_id=message.business_connection_id
+            )
+
 @dp.business_message()
 async def handle_messages(message: Message):
     chat_id = message.chat.id
