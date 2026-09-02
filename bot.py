@@ -42,7 +42,7 @@ async def mute_user(message: Message):
         
     # Защита от двойного мута
     if chat_id in muted_chats:
-        await message.answer("⚠️ **Этот собеседник уже находится в муте!**", parse_mode="Markdown")
+        await message.answer("⚠️ уже в муте петух", parse_mode="Markdown")
         return
         
     # Включаем мут
@@ -81,7 +81,7 @@ async def unmute_user(call: CallbackQuery):
     # Защита: собеседник не может размутить сам себя
     if call.from_user.id == chat_id:
         with suppress(TelegramBadRequest):
-            await call.answer("🚫 Вы не можете снять мут сами с себя!", show_alert=True)
+            await call.answer("поной!", show_alert=True)
         return
 
     # Если кнопку нажал ты (владелец)
