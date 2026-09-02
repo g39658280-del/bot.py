@@ -1,5 +1,6 @@
 import os
 import asyncio
+import random
 from datetime import datetime, timezone
 from aiohttp import web
 from contextlib import suppress
@@ -96,30 +97,25 @@ async def mute_user(message: Message):
         parse_mode="Markdown"
     )
 
-# --- АНИМАЦИЯ ПЕЧАТНОЙ МАШИНКИ (.п текст) С ТРЕКЕРОМ В КОНСОЛИ ---
-@dp.business_message(F.text.lower().startswith(".п"))
-async def type_animation(message: Message):
-    # Если сообщение написал клиент (а не ты), выходим
+# --- АНИМАЦИЯ .п1: Стандартная посимвольная печать (0.27 сек) ---
+@dp.business_message(F.text.lower().startswith(".п1"))
+async def type_animation_p1(message: Message):
     if message.from_user.id == message.chat.id:
         return
 
-    # Достаем текст после .п
-    full_text = message.text[2:].strip()
+    full_text = message.text[3:].strip()
     
-    # Сносим твое исходное сообщение с командой .п
     with suppress(Exception):
         await bot.delete_business_messages(
             business_connection_id=message.business_connection_id,
             message_ids=[message.message_id]
         )
 
-    # Если написали просто .п без текста — просто удаляем и ничего не пишем в чат
     if not full_text:
         return
 
-    print(f"[TREK] ШАГ 1: Получена команда .п. Текст: '{full_text}'. Запуск анимации...")
+    print(f"[TREK .п1] Старт. Текст: '{full_text}'")
 
-    # Отправляем сразу первую букву вместо пустой заглушки
     sent_msg = None
     with suppress(Exception):
         sent_msg = await bot.send_message(
@@ -129,18 +125,12 @@ async def type_animation(message: Message):
         )
 
     if not sent_msg:
-        print("[TREK] ОШИБКА: Не удалось отправить первую букву!")
         return
 
-    print(f"[TREK] ШАГ 2: Первая буква отправлена (ID: {sent_msg.message_id}). Начинаю вывод...")
-
     current_str = full_text[0]
-    step_count = 0
     for char in full_text[1:]:
         current_str += char
-        step_count += 1
         await asyncio.sleep(0.27)
-        print(f"[TREK] Шаг анимации #{step_count}: добавлена буква '{char}' -> Текст: '{current_str}'")
         with suppress(Exception):
             await bot.edit_message_text(
                 chat_id=message.chat.id,
@@ -148,8 +138,105 @@ async def type_animation(message: Message):
                 text=current_str,
                 business_connection_id=message.business_connection_id
             )
+    print("[TREK .п1] Завершено.")
 
-    print("[TREK] ШАГ 4: Анимация успешно завершена!")
+# --- АНИМАЦИЯ .п2: Печатная машинка с мигающим курсором (▌) ---
+@dp.business_message(F.text.lower().startswith(".п2"))
+async def type_animation_p2(message: Message):
+    if message.from_user.id == message.chat.id:
+        return
+
+    full_text = message.text[3:].strip()
+    
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=message.business_connection_id,
+            message_ids=[message.message_id]
+        )
+
+    if not full_text:
+        return
+
+    print(f"[TREK .п2] Старт (курсор). Текст: '{full_text}'")
+
+    sent_msg = None
+    with suppress(Exception):
+        sent_msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text=full_text[0] + "▌",
+            business_connection_id=message.business_connection_id
+        )
+
+    if not sent_msg:
+        return
+
+    current_str = full_text[0]
+    for char in full_text[1:]:
+        current_str += char
+        await asyncio.sleep(0.27)
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=sent_msg.message_id,
+                text=current_str + "▌",
+                business_connection_id=message.business_connection_id
+            )
+
+    # Убираем курсор в конце
+    await asyncio.sleep(0.3)
+    with suppress(Exception):
+        await bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=sent_msg.message_id,
+            text=current_str,
+            business_connection_id=message.business_connection_id
+        )
+    print("[TREK .п2] Завершено.")
+
+# --- АНИМАЦИЯ .п3: Глитч-дешифратор (рандомные символы превращаются в текст) ---
+@dp.business_message(F.text.lower().startswith(".п3"))
+async def type_animation_p3(message: Message):
+    if message.from_user.id == message.chat.id:
+        return
+
+    full_text = message.text[3:].strip()
+    
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=message.business_connection_id,
+            message_ids=[message.message_id]
+        )
+
+    if not full_text:
+        return
+
+    print(f"[TREK .п3] Старт (глитч). Текст: '{full_text}'")
+    alphabet = "abcdefghijklmnopqrstuvwxyzабвгдежзийклмнопрстуфхцчшщъыьэюя0123456789_#@$%"
+
+    sent_msg = None
+    with suppress(Exception):
+        sent_msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text="...",
+            business_connection_id=message.business_connection_id
+        )
+
+    if not sent_msg:
+        return
+
+    for i in range(len(full_text) + 1):
+        await asyncio.sleep(0.2)
+        correct_part = full_text[:i]
+        random_part = "".join(random.choice(alphabet) for _ in range(len(full_text) - i))
+        display_text = correct_part + random_part
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=sent_msg.message_id,
+                text=display_text,
+                business_connection_id=message.business_connection_id
+            )
+    print("[TREK .п3] Завершено.")
 
 @dp.business_message()
 async def handle_messages(message: Message):
