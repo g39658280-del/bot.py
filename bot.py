@@ -52,9 +52,8 @@ async def ensure_connection(conn_id: str, user_id: int, first_name: str):
         pass
 
 def check_auto_afk(start_h: int, end_h: int) -> bool:
-    """Проверяет, попадает ли текущее время (МСК) в интервал АФК"""
     now = datetime.now(timezone.utc)
-    local_hour = (now.hour + 3) % 24 # МСК время (UTC+3)
+    local_hour = (now.hour + 3) % 24
     if start_h < end_h:
         return start_h <= local_hour < end_h
     else:
@@ -77,7 +76,7 @@ async def on_startup():
 dp.startup.register(on_startup)
 
 # ==========================================
-# ПОЛЬЗОВАТЕЛЬСКОЕ МЕНЮ (АВТООТВЕТЧИК И НАСТРОЙКИ)
+# ПОЛЬЗОВАТЕЛЬСКОЕ МЕНЮ 
 # ==========================================
 async def get_user_main_kb(user_id: int):
     user_data = await users_collection.find_one({"user_id": user_id}) or {}
@@ -95,7 +94,6 @@ async def get_afk_settings_kb(user_id: int):
     auto_afk = user_data.get("auto_afk", False)
     start_h = user_data.get("afk_start", 23)
     end_h = user_data.get("afk_end", 7)
-    
     auto_status = "ВКЛ" if auto_afk else "ВЫКЛ"
     
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -110,7 +108,6 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     with suppress(Exception): 
         await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"user_id": message.from_user.id}}, upsert=True)
-    
     kb = await get_user_main_kb(message.from_user.id)
     await message.answer("👋 **Твой личный бот-секретарь.**\nУправляй статусом и настройками ниже:", reply_markup=kb, parse_mode="Markdown")
 
@@ -219,42 +216,50 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
     action = call.data.replace("admin_", "")
     builder = InlineKeyboardBuilder()
 
-    if action == "stats":
-        users_count = await connections_collection.count_documents({})
-        msgs_count = await messages_collection.count_documents({})
-        logs_count = await history_collection.count_documents({})
-        builder.button(text="🔙 Назад", callback_data="admin_main")
-        await call.message.edit_text(f"📊 **Статистика:**\nБизнесов: {users_count}\nСообщений: {msgs_count}\nЛогов: {logs_count}", reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-    elif action == "mutes":
-        if not muted_chats:
+    try:
+        if action == "stats":
+            users_count = await connections_collection.count_documents({})
+            msgs_count = await messages_collection.count_documents({})
+            logs_count = await history_collection.count_documents({})
             builder.button(text="🔙 Назад", callback_data="admin_main")
-            await call.message.edit_text("Активных мутов сейчас нет.", reply_markup=builder.as_markup())
-            return
-        for mute in list(muted_chats):
-            conn, chat = mute.split("_")
-            builder.button(text=f"Снять мут: {chat}", callback_data=f"forceunmute_{mute}")
-        builder.button(text="🔙 Назад", callback_data="admin_main")
-        builder.adjust(1)
-        await call.message.edit_text("🔇 **Активные муты:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
+            await call.message.edit_text(f"📊 **Статистика:**\nБизнесов: {users_count}\nСообщений: {msgs_count}\nЛогов: {logs_count}", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-    elif action == "users":
-        users = await connections_collection.find({}).to_list(length=100)
-        if not users:
+        elif action == "mutes":
+            if not muted_chats:
+                builder.button(text="🔙 Назад", callback_data="admin_main")
+                await call.message.edit_text("Активных мутов сейчас нет.", reply_markup=builder.as_markup())
+                return
+            for mute in list(muted_chats):
+                # ИСПРАВЛЕНИЕ ТУТ: rsplit берет только последнее подчеркивание
+                conn, chat = mute.rsplit("_", 1)
+                builder.button(text=f"Снять мут: {chat}", callback_data=f"forceunmute_{mute}")
             builder.button(text="🔙 Назад", callback_data="admin_main")
-            await call.message.edit_text("Никого нет.", reply_markup=builder.as_markup())
-            return
-        for u in users:
-            name, uid = u.get('first_name', 'Без имени'), u.get('user_id')
-            builder.button(text=f"👤 {name} ({uid})", callback_data=f"userlog_{uid}")
-        builder.button(text="🔙 Назад", callback_data="admin_main")
-        builder.adjust(1)
-        await call.message.edit_text("👥 **Выбери пользователя:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
+            builder.adjust(1)
+            await call.message.edit_text("🔇 **Активные муты:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-    elif action == "broadcast":
-        builder.button(text="🔙 Отмена", callback_data="admin_main")
-        await call.message.edit_text("Напиши сообщение для рассылки:", reply_markup=builder.as_markup())
-        await state.set_state(AdminStates.waiting_for_broadcast)
+        elif action == "users":
+            users = await connections_collection.find({}).to_list(length=100)
+            if not users:
+                builder.button(text="🔙 Назад", callback_data="admin_main")
+                await call.message.edit_text("Никого нет.", reply_markup=builder.as_markup())
+                return
+            for u in users:
+                name, uid = u.get('first_name', 'Без имени'), u.get('user_id')
+                builder.button(text=f"👤 {name} ({uid})", callback_data=f"userlog_{uid}")
+            builder.button(text="🔙 Назад", callback_data="admin_main")
+            builder.adjust(1)
+            await call.message.edit_text("👥 **Выбери пользователя:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+        elif action == "broadcast":
+            builder.button(text="🔙 Отмена", callback_data="admin_main")
+            await call.message.edit_text("Напиши сообщение для рассылки:", reply_markup=builder.as_markup())
+            await state.set_state(AdminStates.waiting_for_broadcast)
+            
+    except Exception as e:
+        print(f"Ошибка в меню админки: {e}")
+        
+    with suppress(Exception):
+        await call.answer()
 
 @dp.callback_query(F.data.startswith("userlog_"))
 async def view_user_logs(call: CallbackQuery):
@@ -279,9 +284,10 @@ async def force_unmute(call: CallbackQuery):
     builder.button(text="🔙 К мутам", callback_data="admin_mutes")
     if mute_key in muted_chats:
         muted_chats.remove(mute_key)
-        await call.message.edit_text(f"✅ Мут {mute_key} снят.", reply_markup=builder.as_markup())
+        await call.message.edit_text(f"✅ Мут снят.", reply_markup=builder.as_markup())
     else:
         await call.message.edit_text("Мут уже снят.", reply_markup=builder.as_markup())
+    with suppress(Exception): await call.answer()
 
 @dp.message(AdminStates.waiting_for_broadcast)
 async def process_broadcast(message: Message, state: FSMContext):
@@ -351,8 +357,6 @@ async def type_animation_p1(message: Message):
 async def handle_voice(message: Message):
     chat_id = message.chat.id
     conn_id = message.business_connection_id
-    
-    # Только от собеседника
     if message.from_user.id == chat_id:
         mute_key = f"{conn_id}_{chat_id}"
         if mute_key in muted_chats:
@@ -363,9 +367,7 @@ async def handle_voice(message: Message):
         if owner_data:
             owner_id = owner_data["user_id"]
             safe_name = html.escape(message.from_user.first_name)
-            
             log_text = f"🎤 <b>Голосовое сообщение от {safe_name}</b>\n\n<i>[Тут будет текст, когда мы прикрутим API]</i>"
-            
             with suppress(Exception):
                 await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
 
@@ -374,7 +376,6 @@ async def handle_voice(message: Message):
 async def handle_messages(message: Message):
     chat_id = message.chat.id
     conn_id = message.business_connection_id
-    
     if message.from_user.id != chat_id:
         await ensure_connection(conn_id, message.from_user.id, message.from_user.first_name)
         return
@@ -384,7 +385,6 @@ async def handle_messages(message: Message):
         owner_id = owner_data["user_id"]
         owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
         
-        # Проверяем, активен ли АФК (вручную ИЛИ по расписанию)
         manual_afk = owner_settings.get("is_afk", False)
         auto_afk = owner_settings.get("auto_afk", False)
         in_schedule = False
@@ -397,8 +397,7 @@ async def handle_messages(message: Message):
         if manual_afk or in_schedule:
             now = datetime.now().timestamp()
             last_sent = afk_cooldowns.get((owner_id, chat_id), 0)
-            
-            if now - last_sent > 300: # Спамит не чаще раза в 5 минут
+            if now - last_sent > 300: 
                 afk_text = owner_settings.get("afk_text", "Владелец сейчас занят и ответит позже. 💤")
                 with suppress(Exception):
                     await bot.send_message(chat_id=chat_id, text=afk_text, business_connection_id=conn_id)
