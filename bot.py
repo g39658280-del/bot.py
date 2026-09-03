@@ -20,13 +20,14 @@ SUPERADMIN_ID = 6548121776  # Твой ID
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# База данных
+# --- БАЗА ДАННЫХ ---
 try:
     client = AsyncIOMotorClient(MONGO_URI)
     db = client['telegram_multi_bot']
     messages_collection = db['messages']
     connections_collection = db['connections']
     users_collection = db['users']
+    history_collection = db['history'] # Новая коллекция для логов
 except Exception as e:
     print(f"Ошибка БД: {e}")
 
@@ -65,71 +66,127 @@ async def on_startup():
 
 dp.startup.register(on_startup)
 
-# --- АДМИН ПАНЕЛЬ ---
-@dp.message(F.text == "/admin")
-async def cmd_admin(message: Message):
-    if message.from_user.id != SUPERADMIN_ID: return
-    
-    markup = InlineKeyboardMarkup(inline_keyboard=[
+# --- ГЕНЕРАТОР ГЛАВНОГО МЕНЮ АДМИНКИ ---
+def get_admin_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="👥 Пользователи и Логи", callback_data="admin_users")],
         [InlineKeyboardButton(text="🔇 Активные муты", callback_data="admin_mutes")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")]
     ])
-    await message.answer("👑 **Панель управления ботом:**", reply_markup=markup, parse_mode="Markdown")
+
+# --- АДМИН ПАНЕЛЬ ---
+@dp.message(F.text == "/admin")
+async def cmd_admin(message: Message):
+    if message.from_user.id != SUPERADMIN_ID: return
+    await message.answer("👑 **Панель управления ботом:**", reply_markup=get_admin_main_kb(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "admin_main")
+async def back_to_main(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != SUPERADMIN_ID: return
+    await state.clear()
+    await call.message.edit_text("👑 **Панель управления ботом:**", reply_markup=get_admin_main_kb(), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("admin_"))
 async def admin_callbacks(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != SUPERADMIN_ID: return
-    action = call.data.split("_")[1]
+    action = call.data.replace("admin_", "")
 
     if action == "stats":
         users_count = await connections_collection.count_documents({})
         msgs_count = await messages_collection.count_documents({})
-        await call.message.edit_text(f"📊 **Статистика:**\nПодключено бизнесов: {users_count}\nСообщений в базе: {msgs_count}", parse_mode="Markdown")
-
-    elif action == "mutes":
-        if not muted_chats:
-            await call.message.edit_text("Активных мутов сейчас нет.")
-            return
+        logs_count = await history_collection.count_documents({})
         
         builder = InlineKeyboardBuilder()
+        builder.button(text="🔙 Назад", callback_data="admin_main")
+        
+        await call.message.edit_text(
+            f"📊 **Статистика:**\nПодключено бизнесов: {users_count}\nСообщений в кэше: {msgs_count}\nСобытий в истории: {logs_count}", 
+            reply_markup=builder.as_markup(), parse_mode="Markdown"
+        )
+
+    elif action == "mutes":
+        builder = InlineKeyboardBuilder()
+        if not muted_chats:
+            builder.button(text="🔙 Назад", callback_data="admin_main")
+            await call.message.edit_text("Активных мутов сейчас нет.", reply_markup=builder.as_markup())
+            return
+        
         for mute in list(muted_chats):
             conn, chat = mute.split("_")
             builder.button(text=f"Снять мут: {chat}", callback_data=f"forceunmute_{mute}")
+        builder.button(text="🔙 Назад", callback_data="admin_main")
         builder.adjust(1)
         await call.message.edit_text("🔇 **Список активных мутов:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
     elif action == "users":
         users = await connections_collection.find({}).to_list(length=100)
-        text = "👥 **Подключенные кенты:**\n"
+        builder = InlineKeyboardBuilder()
+        
+        if not users:
+            builder.button(text="🔙 Назад", callback_data="admin_main")
+            await call.message.edit_text("Пока никто не подключил бота.", reply_markup=builder.as_markup())
+            return
+            
         for u in users:
-            text += f"- {u.get('first_name')} (ID: `{u.get('user_id')}`)\n"
-        text += "\n*(В следующих версиях сюда прикрутим детальные кнопки по каждому)*"
-        await call.message.edit_text(text, parse_mode="Markdown")
+            name = u.get('first_name', 'Без имени')
+            uid = u.get('user_id')
+            builder.button(text=f"👤 {name} ({uid})", callback_data=f"userlog_{uid}")
+            
+        builder.button(text="🔙 Назад", callback_data="admin_main")
+        builder.adjust(1)
+        await call.message.edit_text("👥 **Выбери пользователя для просмотра логов:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
     elif action == "broadcast":
-        await call.message.edit_text("Напиши сообщение для рассылки всем кентам (или отправь 'отмена'):")
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🔙 Отмена", callback_data="admin_main")
+        await call.message.edit_text("Напиши сообщение для рассылки всем кентам:", reply_markup=builder.as_markup())
         await state.set_state(AdminStates.waiting_for_broadcast)
+
+# --- ПРОСМОТР ЛОГОВ КОНКРЕТНОГО ЮЗЕРА ---
+@dp.callback_query(F.data.startswith("userlog_"))
+async def view_user_logs(call: CallbackQuery):
+    if call.from_user.id != SUPERADMIN_ID: return
+    target_id = int(call.data.replace("userlog_", ""))
+    
+    # Достаем последние 5 событий из базы
+    logs = await history_collection.find({"owner_id": target_id}).sort("ts", -1).limit(5).to_list(length=5)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 К списку кентов", callback_data="admin_users")
+    
+    if not logs:
+        await call.message.edit_text("У этого пользователя пока нет зафиксированных удалений или правок.", reply_markup=builder.as_markup())
+        return
+
+    text = f"🗂 **Последние 5 событий кента (ID `{target_id}`):**\n\n"
+    for log in logs:
+        text += f"▪️ {log['text']}\n"
+        text += "〰️〰️〰️〰️〰️〰️〰️\n"
+        
+    # Защита от переполнения сообщения
+    if len(text) > 4000:
+        text = text[:4000] + "...\n(Лог слишком длинный)"
+
+    await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("forceunmute_"))
 async def force_unmute(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID: return
     mute_key = call.data.replace("forceunmute_", "")
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 К мутам", callback_data="admin_mutes")
+    
     if mute_key in muted_chats:
         muted_chats.remove(mute_key)
         await call.answer("Мут принудительно снят!", show_alert=True)
-        await call.message.edit_text(f"✅ Мут {mute_key} снят админом.")
+        await call.message.edit_text(f"✅ Мут {mute_key} снят админом.", reply_markup=builder.as_markup())
     else:
-        await call.answer("Этот мут уже не активен.")
+        await call.message.edit_text("Этот мут уже не активен.", reply_markup=builder.as_markup())
 
 @dp.message(AdminStates.waiting_for_broadcast)
 async def process_broadcast(message: Message, state: FSMContext):
-    if message.text.lower() == 'отмена':
-        await message.answer("Рассылка отменена.")
-        await state.clear()
-        return
-        
     users = await connections_collection.find({}).to_list(length=100)
     count = 0
     for u in users:
@@ -137,7 +194,7 @@ async def process_broadcast(message: Message, state: FSMContext):
             await bot.send_message(u['user_id'], f"📢 **Сообщение от создателя:**\n\n{message.text}", parse_mode="Markdown")
             count += 1
             
-    await message.answer(f"✅ Успешно отправлено {count} пользователям.")
+    await message.answer(f"✅ Успешно отправлено {count} пользователям.", reply_markup=get_admin_main_kb())
     await state.clear()
 
 # --- ОСНОВНАЯ ЛОГИКА ---
@@ -214,9 +271,26 @@ async def catch_edits(message: Message):
     old_text = old_msg['text'] if old_msg else "[Не успел сохранить]"
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data: return
-    safe_name, safe_old, safe_new = html.escape(message.from_user.first_name), html.escape(old_text), html.escape(new_text)
+    
+    safe_name = html.escape(message.from_user.first_name)
+    safe_old = html.escape(old_text)
+    safe_new = html.escape(new_text)
+    owner_id = owner_data["user_id"]
+    
+    log_text = f"✏️ <b>Изменение от {safe_name}</b>\n<b>Было:</b> {safe_old}\n<b>Стало:</b> {safe_new}"
+    
+    # 1. Отправляем кенту
     with suppress(Exception):
-        await bot.send_message(chat_id=owner_data["user_id"], text=f"✏️ <b>Собеседник изменил сообщение!</b>\n👤 От: {safe_name}\n\n<b>Было:</b> {safe_old}\n<b>Стало:</b> {safe_new}", parse_mode="HTML")
+        await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
+        
+    # 2. Сохраняем в историю для админки
+    with suppress(Exception):
+        await history_collection.insert_one({
+            "owner_id": owner_id, 
+            "text": log_text, 
+            "ts": datetime.now(timezone.utc)
+        })
+        
     with suppress(Exception): await messages_collection.update_one({"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id}, {"$set": {"text": new_text}})
 
 @dp.deleted_business_messages()
@@ -224,13 +298,28 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
     conn_id = deleted.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data: return
+    owner_id = owner_data["user_id"]
+    
     for msg_id in deleted.message_ids:
         old_msg = None
         with suppress(Exception): old_msg = await messages_collection.find_one({"business_connection_id": conn_id, "message_id": msg_id, "chat_id": deleted.chat.id})
         if old_msg:
-            safe_name, safe_text = html.escape(old_msg.get('first_name', 'Неизвестно')), html.escape(old_msg['text'])
+            safe_name = html.escape(old_msg.get('first_name', 'Неизвестно'))
+            safe_text = html.escape(old_msg['text'])
+            
+            log_text = f"🗑 <b>Удаление от {safe_name}</b>\n💬 Текст: {safe_text}"
+            
+            # 1. Отправляем кенту
             with suppress(Exception):
-                await bot.send_message(chat_id=owner_data["user_id"], text=f"🗑 <b>Собеседник удалил сообщение!</b>\n👤 От: {safe_name}\n\n💬 Текст: {safe_text}", parse_mode="HTML")
+                await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
+                
+            # 2. Сохраняем в историю для админки
+            with suppress(Exception):
+                await history_collection.insert_one({
+                    "owner_id": owner_id, 
+                    "text": log_text, 
+                    "ts": datetime.now(timezone.utc)
+                })
 
 @dp.callback_query(F.data.startswith("unmute_"))
 async def unmute_user(call: CallbackQuery):
@@ -238,12 +327,10 @@ async def unmute_user(call: CallbackQuery):
     conn_id = call.message.business_connection_id
     mute_key = f"{conn_id}_{chat_id}"
 
-    # Если нажал сам собеседник, а не ты
     if call.from_user.id == chat_id and call.from_user.id != SUPERADMIN_ID:
         with suppress(TelegramBadRequest): await call.answer("поной!", show_alert=True)
         return
 
-    # Если нажал кент (владелец чата) ИЛИ ты (Глобальный админ)
     if mute_key in muted_chats or call.from_user.id == SUPERADMIN_ID:
         if mute_key in muted_chats: muted_chats.remove(mute_key)
         with suppress(TelegramBadRequest):
