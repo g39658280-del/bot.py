@@ -2,7 +2,10 @@ import os
 import asyncio
 import random
 import html
+import io
+import json
 from datetime import datetime, timezone
+import aiohttp
 from aiohttp import web
 from contextlib import suppress
 from aiogram import Bot, Dispatcher, F
@@ -13,6 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+# Токен берется из настроек Render.
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8855259798:AAEw-jiTxWh2k0n9WjjbG7tPX64S4g5WUXU")
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:xgHbZ5HMU2XDj6KZ@cluster0.6q3omrb.mongodb.net/?appName=Cluster0")
 SUPERADMIN_ID = 6548121776
@@ -48,7 +52,7 @@ async def ensure_connection(conn_id: str, user_id: int, first_name: str):
             {"$set": {"business_connection_id": conn_id, "user_id": user_id, "first_name": first_name or "Без имени"}},
             upsert=True
         )
-    except Exception as e:
+    except Exception:
         pass
 
 def check_auto_afk(start_h: int, end_h: int) -> bool:
@@ -86,6 +90,7 @@ async def get_user_main_kb(user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💤 Автоответчик: {status_text}", callback_data="toggle_afk")],
         [InlineKeyboardButton(text="⚙️ Настройки автоответчика", callback_data="afk_settings")],
+        [InlineKeyboardButton(text="🔇 Управление мутами", callback_data="user_mutes")],
         [InlineKeyboardButton(text="📖 Доступные команды", callback_data="user_cmds")]
     ])
 
@@ -116,6 +121,41 @@ async def user_main_handler(call: CallbackQuery, state: FSMContext):
     await state.clear()
     kb = await get_user_main_kb(call.from_user.id)
     await call.message.edit_text("🏠 **Главное меню:**", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "user_mutes")
+async def user_mutes_handler(call: CallbackQuery):
+    user_conns = await connections_collection.find({"user_id": call.from_user.id}).to_list(length=None)
+    conn_ids = [c["business_connection_id"] for c in user_conns]
+    
+    builder = InlineKeyboardBuilder()
+    has_mutes = False
+    
+    for mute in list(muted_chats):
+        try:
+            conn, chat = mute.rsplit("_", 1)
+            if conn in conn_ids:
+                has_mutes = True
+                builder.button(text=f"Снять мут: {chat}", callback_data=f"u_unmute_{mute}")
+        except Exception:
+            continue
+            
+    builder.button(text="🔙 Назад", callback_data="user_main")
+    builder.adjust(1)
+    
+    if not has_mutes:
+        await call.message.edit_text("У тебя сейчас нет активных мутов.", reply_markup=builder.as_markup(), parse_mode="Markdown")
+    else:
+        await call.message.edit_text("🔇 **Твои активные муты:**\nНажми на кнопку, чтобы снять мут с собеседника.", reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("u_unmute_"))
+async def user_unmute_callback(call: CallbackQuery):
+    mute_key = call.data.replace("u_unmute_", "")
+    if mute_key in muted_chats:
+        muted_chats.remove(mute_key)
+        await call.answer("✅ Мут успешно снят!", show_alert=True)
+    else:
+        await call.answer("Мут уже был снят.", show_alert=True)
+    await user_mutes_handler(call)
 
 @dp.callback_query(F.data == "toggle_afk")
 async def toggle_afk_handler(call: CallbackQuery):
@@ -181,7 +221,7 @@ async def show_cmds(call: CallbackQuery):
     text = (
         "📖 **Список команд (писать в чатах):**\n\n"
         "🚫 `.мут` — удаляет сообщения собеседника\n"
-        "🎭 `.п1`, `.п2`, `.п3`, `.дроч` — анимации печати\n"
+        "🎭 `.п1`, `.п2`, `.п3` — анимации печати\n"
         "👋 `привет`, `ку` — анимация приветствия"
     )
     builder = InlineKeyboardBuilder()
@@ -230,7 +270,6 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
                 await call.message.edit_text("Активных мутов сейчас нет.", reply_markup=builder.as_markup())
                 return
             for mute in list(muted_chats):
-                # ИСПРАВЛЕНИЕ ТУТ: rsplit берет только последнее подчеркивание
                 conn, chat = mute.rsplit("_", 1)
                 builder.button(text=f"Снять мут: {chat}", callback_data=f"forceunmute_{mute}")
             builder.button(text="🔙 Назад", callback_data="admin_main")
@@ -321,14 +360,14 @@ async def mute_user(message: Message):
         if mute_key in muted_chats: return
         muted_chats.add(mute_key)
         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute_{chat_id}")]])
-        await bot.send_message(chat_id=message.chat.id, text="67 покойошечка", reply_markup=markup, business_connection_id=conn_id)
+        await bot.send_message(chat_id=message.chat.id, text="мут выдан", reply_markup=markup, business_connection_id=conn_id)
 
 @dp.business_message(F.text.lower().startswith(".дроч"))
 async def anim_droch(message: Message):
     if message.from_user.id == message.chat.id: return
     conn_id = message.business_connection_id
     with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
-    frames = ["8==✊==D", "8==✊===D", "8===✊==D", "8====✊=D", "8==✊==D", "8===✊==D", "8==✊===D", "8===✊==D", "8====✊=D", "8==✊==D", "8===✊==D", "8==✊===D", "8===✊==D", "8====✊=D", "8=====D💦", "8===✊==D", "8==✊===D", "8======D💦"]
+    frames = ["8==✊===D", "8==✊===D", "8===✊==D", "8====✊=D", "8==✊===D", "8===✊==D", "8==✊===D", "8===✊==D", "8====✊=D", "8==✊===D", "8===✊==D", "8==✊===D", "8===✊==D", "8====✊=D", "8=====D💦", "8===✊==D", "8==✊===D", "8======D💦"]
     sent_msg = None
     with suppress(Exception): sent_msg = await bot.send_message(chat_id=message.chat.id, text=frames[0], business_connection_id=conn_id)
     if not sent_msg: return
@@ -352,7 +391,7 @@ async def type_animation_p1(message: Message):
         await asyncio.sleep(0.27)
         with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
 
-# --- ПЕРЕХВАТ ГОЛОСОВЫХ СООБЩЕНИЙ ---
+# --- ПЕРЕХВАТ И РАСШИФРОВКА ГОЛОСОВЫХ ЧЕРЕЗ HUGGING FACE ---
 @dp.business_message(F.voice)
 async def handle_voice(message: Message):
     chat_id = message.chat.id
@@ -367,7 +406,46 @@ async def handle_voice(message: Message):
         if owner_data:
             owner_id = owner_data["user_id"]
             safe_name = html.escape(message.from_user.first_name)
-            log_text = f"🎤 <b>Голосовое сообщение от {safe_name}</b>\n\n<i>[Тут будет текст, когда мы прикрутим API]</i>"
+            
+            hf_token = os.environ.get("HF_TOKEN")
+            transcribed_text = "<i>[Добавь HF_TOKEN в Render, чтобы включить расшифровку]</i>"
+            
+            if hf_token:
+                try:
+                    # 1. Загружаем аудио из Telegram
+                    file_id = message.voice.file_id
+                    file_info = await bot.get_file(file_id)
+                    voice_io = io.BytesIO()
+                    await bot.download_file(file_info.file_path, voice_io)
+                    voice_data = voice_io.getvalue()
+                    
+                    # 2. Шлем в Hugging Face (Whisper Large V3 Turbo)
+                    api_url = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
+                    headers = {"Authorization": f"Bearer {hf_token}"}
+                    
+                    async with aiohttp.ClientSession() as session:
+                        # Делаем до 3 попыток, если нейросеть спала и просыпается
+                        for _ in range(3):
+                            async with session.post(api_url, headers=headers, data=voice_data) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    transcribed_text = data.get('text', '').strip()
+                                    break
+                                elif resp.status == 503:
+                                    await asyncio.sleep(4) # Ждем, пока модель подгрузится
+                                else:
+                                    transcribed_text = f"<i>[Ошибка нейросети: {resp.status}]</i>"
+                                    break
+                        else:
+                            if transcribed_text == "<i>[Добавь HF_TOKEN в Render, чтобы включить расшифровку]</i>":
+                                transcribed_text = "<i>[Нейросеть не успела загрузиться, попробуй позже]</i>"
+
+                except Exception as e:
+                    print(f"Ошибка расшифровки HF: {e}")
+                    transcribed_text = "<i>[Ошибка при обработке аудио]</i>"
+            
+            log_text = f"🎤 <b>Голосовое сообщение от {safe_name}</b>\n\n📝 <b>Текст:</b> {html.escape(transcribed_text)}"
+            
             with suppress(Exception):
                 await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
 
@@ -464,12 +542,12 @@ async def unmute_user(call: CallbackQuery):
     mute_key = f"{conn_id}_{chat_id}"
 
     if call.from_user.id == chat_id and call.from_user.id != SUPERADMIN_ID:
-        with suppress(TelegramBadRequest): await call.answer("поной!", show_alert=True)
+        with suppress(TelegramBadRequest): await call.answer("вы не можете снять мут", show_alert=True)
         return
     if mute_key in muted_chats or call.from_user.id == SUPERADMIN_ID:
         if mute_key in muted_chats: muted_chats.remove(mute_key)
         with suppress(TelegramBadRequest):
-            await call.message.edit_text("твой господин размутил тебя")
+            await call.message.edit_text("мут снят")
             await call.answer("снял")
     else:
         with suppress(TelegramBadRequest): await call.message.edit_text("уже снял")
