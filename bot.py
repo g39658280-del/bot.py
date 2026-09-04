@@ -1,4 +1,4 @@
-import os
+\import os
 import asyncio
 import random
 import html
@@ -412,39 +412,41 @@ async def handle_voice(message: Message):
             
             if hf_token:
                 try:
-                    # 1. Загружаем аудио из Telegram
                     file_id = message.voice.file_id
                     file_info = await bot.get_file(file_id)
                     voice_io = io.BytesIO()
                     await bot.download_file(file_info.file_path, voice_io)
                     voice_data = voice_io.getvalue()
                     
-                    # 2. Шлем в Hugging Face (Whisper Large V3 Turbo)
-                    api_url = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
-                    headers = {"Authorization": f"Bearer {hf_token}"}
+                    # Используем более надежную модель и добавляем заголовок Content-Type
+                    api_url = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
+                    headers = {
+                        "Authorization": f"Bearer {hf_token}",
+                        "Content-Type": "audio/ogg"
+                    }
                     
                     async with aiohttp.ClientSession() as session:
-                        # Делаем до 3 попыток, если нейросеть спала и просыпается
-                        for _ in range(3):
+                        for i in range(4): # Делаем 4 попытки, если модель еще загружается
                             async with session.post(api_url, headers=headers, data=voice_data) as resp:
                                 if resp.status == 200:
                                     data = await resp.json()
                                     transcribed_text = data.get('text', '').strip()
                                     break
                                 elif resp.status == 503:
-                                    await asyncio.sleep(4) # Ждем, пока модель подгрузится
+                                    await asyncio.sleep(5)
                                 else:
-                                    transcribed_text = f"<i>[Ошибка нейросети: {resp.status}]</i>"
+                                    err_msg = await resp.text()
+                                    transcribed_text = f"<i>[Ошибка HF {resp.status}: {html.escape(err_msg)}]</i>"
                                     break
                         else:
-                            if transcribed_text == "<i>[Добавь HF_TOKEN в Render, чтобы включить расшифровку]</i>":
+                            if "Ошибка HF" not in transcribed_text and "Добавь" not in transcribed_text:
                                 transcribed_text = "<i>[Нейросеть не успела загрузиться, попробуй позже]</i>"
 
                 except Exception as e:
-                    print(f"Ошибка расшифровки HF: {e}")
-                    transcribed_text = "<i>[Ошибка при обработке аудио]</i>"
+                    print(f"Ошибка расшифровки: {e}")
+                    transcribed_text = f"<i>[Системная ошибка: {html.escape(str(e))}]</i>"
             
-            log_text = f"🎤 <b>Голосовое сообщение от {safe_name}</b>\n\n📝 <b>Текст:</b> {html.escape(transcribed_text)}"
+            log_text = f"🎤 <b>Голосовое сообщение от {safe_name}</b>\n\n📝 <b>Текст:</b> {transcribed_text}"
             
             with suppress(Exception):
                 await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
