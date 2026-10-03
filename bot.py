@@ -20,7 +20,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from simpleeval import simple_eval, InvalidExpression
+from simpleeval import simple_eval
 
 # ==========================================
 # КОНФИГ И БД
@@ -29,7 +29,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8855259798:AAEw-jiTxWh2k0n9WjjbG7tPX64S
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:xgHbZ5HMU2XDj6KZ@cluster0.6q3omrb.mongodb.net/?appName=Cluster0")
 SUPERADMIN_ID = 6548121776
 
-# === ТВОЙ КЛЮЧ TONAPI (Получи на tonconsole.com бесплатно) ===
+# ВСТАВЬ СЮДА КЛЮЧ TONAPI (tonconsole.com)
 TONAPI_KEY = os.environ.get("TONAPI_KEY", "СЮДА_ВСТАВЬ_КЛЮЧ_TONAPI")
 
 bot = Bot(token=BOT_TOKEN)
@@ -55,39 +55,18 @@ EXCHANGE_CACHE = {}
 STARS_USD_RATE = 0.015
 
 CURRENCY_ALIASES = {
-    "usd": "USD", "доллар": "USD", "доллары": "USD", "долларов": "USD", "доллара": "USD",
-    "бакс": "USD", "баксы": "USD", "баксов": "USD", "бакса": "USD",
-    "бачей": "USD", "бач": "USD", "баксик": "USD", "баксиков": "USD",
-    "зеленый": "USD", "зелёный": "USD", "зеленых": "USD", "зелёных": "USD",
-    "юсд": "USD", "усд": "USD", "$": "USD",
-    "rub": "RUB", "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "рубля": "RUB",
-    "руб": "RUB", "рубас": "RUB", "рубасов": "RUB", "рубаса": "RUB",
-    "деревянный": "RUB", "деревянных": "RUB", "₽": "RUB", "р": "RUB", "р.": "RUB",
+    "usd": "USD", "доллар": "USD", "доллары": "USD", "долларов": "USD", "доллара": "USD", "бакс": "USD", "баксы": "USD", "баксов": "USD", "бакса": "USD", "бачей": "USD", "бач": "USD", "баксик": "USD", "баксиков": "USD", "зеленый": "USD", "зелёный": "USD", "зеленых": "USD", "зелёных": "USD", "юсд": "USD", "усд": "USD", "$": "USD",
+    "rub": "RUB", "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "рубля": "RUB", "руб": "RUB", "рубас": "RUB", "рубасов": "RUB", "рубаса": "RUB", "деревянный": "RUB", "деревянных": "RUB", "₽": "RUB", "р": "RUB", "р.": "RUB",
     "eur": "EUR", "евро": "EUR", "еврик": "EUR", "евриков": "EUR", "евра": "EUR", "€": "EUR",
-    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "юаня": "CNY",
-    "yuan": "CNY", "женьминьби": "CNY", "жэньминьби": "CNY", "¥": "CNY",
-    "btc": "BTC", "биткоин": "BTC", "биткоины": "BTC", "биткоинов": "BTC", "биткоина": "BTC",
-    "биток": "BTC", "битки": "BTC", "битков": "BTC", "битка": "BTC",
-    "биткойн": "BTC", "биткойнов": "BTC", "₿": "BTC",
-    "ton": "TON", "gram": "TON", "gramm": "TON",
-    "грам": "TON", "граммы": "TON", "граммов": "TON", "грамма": "TON",
-    "тонов": "TON", "тона": "TON", "тон": "TON", "тоны": "TON",
-    "тоник": "TON", "тоника": "TON", "тоников": "TON",
-    "stars": "STARS", "star": "STARS",
-    "звезд": "STARS", "звёзд": "STARS", "звезда": "STARS", "звёзда": "STARS",
-    "звезды": "STARS", "звёзды": "STARS",
-    "звёздочек": "STARS", "звездочек": "STARS", "звёздочки": "STARS",
-    "⭐": "STARS", "🌟": "STARS",
-    "eth": "ETH", "эфир": "ETH", "эфириум": "ETH", "эфира": "ETH", "эфиров": "ETH",
-    "эфирка": "ETH", "эфирки": "ETH", "эфирок": "ETH", "Ξ": "ETH",
-    "usdt": "USDT", "тетер": "USDT", "тетеры": "USDT", "тетеров": "USDT", "тетера": "USDT",
-    "тезер": "USDT", "тезеры": "USDT", "тезеров": "USDT",
-    "юста": "USDT", "юсдт": "USDT", "усдт": "USDT",
+    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "юаня": "CNY", "yuan": "CNY", "женьминьби": "CNY", "жэньминьби": "CNY", "¥": "CNY",
+    "btc": "BTC", "биткоин": "BTC", "биткоины": "BTC", "биткоинов": "BTC", "биткоина": "BTC", "биток": "BTC", "битки": "BTC", "битков": "BTC", "битка": "BTC", "биткойн": "BTC", "биткойнов": "BTC", "₿": "BTC",
+    "ton": "TON", "gram": "TON", "gramm": "TON", "грам": "TON", "граммы": "TON", "граммов": "TON", "грамма": "TON", "тонов": "TON", "тона": "TON", "тон": "TON", "тоны": "TON", "тоник": "TON", "тоника": "TON", "тоников": "TON",
+    "stars": "STARS", "star": "STARS", "звезд": "STARS", "звёзд": "STARS", "звезда": "STARS", "звёзда": "STARS", "звезды": "STARS", "звёзды": "STARS", "звёздочек": "STARS", "звездочек": "STARS", "звёздочки": "STARS", "⭐": "STARS", "🌟": "STARS",
+    "eth": "ETH", "эфир": "ETH", "эфириум": "ETH", "эфира": "ETH", "эфиров": "ETH", "эфирка": "ETH", "эфирки": "ETH", "эфирок": "ETH", "Ξ": "ETH",
+    "usdt": "USDT", "тетер": "USDT", "тетеры": "USDT", "тетеров": "USDT", "тетера": "USDT", "тезер": "USDT", "тезеры": "USDT", "тезеров": "USDT", "юста": "USDT", "юсдт": "USDT", "усдт": "USDT",
     "kzt": "KZT", "тенге": "KZT", "теньге": "KZT", "₸": "KZT", "тг": "KZT", "тг.": "KZT",
-    "uah": "UAH", "гривна": "UAH", "гривны": "UAH", "гривен": "UAH", "гривне": "UAH",
-    "гривня": "UAH", "₴": "UAH", "грн": "UAH", "грн.": "UAH",
-    "gbp": "GBP", "фунт": "GBP", "фунты": "GBP", "фунтов": "GBP", "фунта": "GBP",
-    "стерлинг": "GBP", "стерлингов": "GBP", "£": "GBP",
+    "uah": "UAH", "гривна": "UAH", "гривны": "UAH", "гривен": "UAH", "гривне": "UAH", "гривня": "UAH", "₴": "UAH", "грн": "UAH", "грн.": "UAH",
+    "gbp": "GBP", "фунт": "GBP", "фунты": "GBP", "фунтов": "GBP", "фунта": "GBP", "стерлинг": "GBP", "стерлингов": "GBP", "£": "GBP",
     "jpy": "JPY", "иена": "JPY", "иены": "JPY", "иен": "JPY", "йена": "JPY", "йены": "JPY",
 }
 
@@ -102,27 +81,55 @@ AUTO_MATH_PATTERN = rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})
 AUTO_MATH_CURRENCY_PATTERN = rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$"
 
 WORD_NUMBERS = {
-    "ноль": 0, "один": 1, "одна": 1, "два": 2, "две": 2, "три": 3, "четыре": 4,
-    "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10,
-    "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14,
-    "пятнадцать": 15, "шестнадцать": 16, "семнадцать": 17, "восемнадцать": 18,
-    "девятнадцать": 19, "двадцать": 20, "тридцать": 30, "сорок": 40,
-    "пятьдесят": 50, "шестьдесят": 60, "семьдесят": 70, "восемьдесят": 80,
-    "девяносто": 90, "сто": 100, "двести": 200, "триста": 300,
-    "четыреста": 400, "пятьсот": 500, "шестьсот": 600, "семьсот": 700,
-    "восемьсот": 800, "девятьсот": 900, "тысяча": 1000
+    "ноль": 0, "один": 1, "одна": 1, "два": 2, "две": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10,
+    "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14, "пятнадцать": 15, "шестнадцать": 16, "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19, "двадцать": 20, "тридцать": 30, "сорок": 40,
+    "пятьдесят": 50, "шестьдесят": 60, "семьдесят": 70, "восемьдесят": 80, "девяносто": 90, "сто": 100, "двести": 200, "триста": 300, "четыреста": 400, "пятьсот": 500, "шестьсот": 600, "семьсот": 700, "восемьсот": 800, "девятьсот": 900, "тысяча": 1000
 }
 
 OPERATORS = {
     "умножить на": "*", "разделить на": "/", "поделить на": "/", "в степени": "**",
     "плюс": "+", "сложить": "+", "минус": "-", "вычесть": "-",
-    "умножить": "*", "х": "*", "разделить": "/", "делить": "/", "поделить": "/",
-    "степень": "**",
+    "умножить": "*", "х": "*", "разделить": "/", "делить": "/", "поделить": "/", "степень": "**",
 }
 
 # ==========================================
-# НОВЫЙ БЛОК: NFT ПАРСИНГ И ЦЕНЫ
+# НОВЫЙ БЛОК: NFT АВТО-ПАРСИНГ
 # ==========================================
+
+async def resolve_link_to_address(session: aiohttp.ClientSession, text: str) -> str:
+    """Умный поиск TON-адреса NFT из любого текста или ссылки"""
+    # 1. Прямой TON-адрес
+    ton_match = re.search(r"([EU]Q[a-zA-Z0-9_-]{46})", text)
+    if ton_match:
+        return ton_match.group(1)
+
+    # 2. Ссылка Getgems
+    gg_match = re.search(r"getgems\.io/collection/[^/]+/([a-zA-Z0-9_-]+)", text)
+    if gg_match:
+        return gg_match.group(1)
+
+    # 3. Ссылка Телеграм (t.me/nft/LootBag-10251)
+    tg_match = re.search(r"t\.me/nft/([a-zA-Z0-9_-]+)", text)
+    if tg_match:
+        slug = tg_match.group(1).replace("-", " ") # Превращаем в "LootBag 10251"
+        url = "https://api.getgems.io/graphql"
+        query = """
+        query Search($query: String!) {
+          alphaNftItemSearch(query: $query, first: 1) {
+            edges { node { address } }
+          }
+        }
+        """
+        try:
+            async with session.post(url, json={"query": query, "variables": {"query": slug}}) as resp:
+                data = await resp.json()
+                edges = data.get("data", {}).get("alphaNftItemSearch", {}).get("edges", [])
+                if edges:
+                    return edges[0]["node"]["address"]
+        except Exception:
+            pass
+
+    return None
 
 async def get_live_ton_price() -> float:
     url = "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd"
@@ -162,7 +169,7 @@ async def get_getgems_floor(collection_address: str, model_name: str) -> float:
 async def get_real_nft_data(nft_address: str) -> dict:
     headers = {"Authorization": f"Bearer {TONAPI_KEY}"}
     nft_url = f"https://tonapi.io/v2/nfts/{nft_address}"
-    events_url = f"https://tonapi.io/v2/events?account_id={nft_address}&limit=10"
+    events_url = f"https://tonapi.io/v2/events?account_id={nft_address}&limit=20"
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -183,7 +190,7 @@ async def get_real_nft_data(nft_address: str) -> dict:
             elif t_type == "Pattern": pat_name = attr.get("value")
 
         collection_address = nft_raw.get("collection", {}).get("address", "")
-        floor_price_ton = await get_getgems_floor(collection_address, model_name) if collection_address else 0.0
+        floor_price_ton = await get_getgems_floor(collection_address, model_name) if collection_address and model_name != "Unknown" else 0.0
 
         sales_history = []
         for event in events_raw.get("events", []):
@@ -232,15 +239,21 @@ def format_nft_card(data: dict, ton_usd_price: float) -> str:
     avg_ton = data.get("avg_ton", 0.0)
     last_sale_ton = data.get("last_sale_ton", 0.0)
     
-    lines = [
-        f"🛍 <b>{model} ({collection}) #{item_id}</b>",
-        f"Фон: {bg_emoji} <b>{bg_name}</b>, Узор: {pat_emoji} <b>{pat_name}</b>\n",
+    # Сборка текста
+    lines = [f"🛍 <b>{model} ({collection}) #{item_id}</b>"]
+    
+    # Добавляем атрибуты только если они нестандартные (чтобы обычные NFT тоже красиво выводились)
+    if bg_name != "Classic" or pat_name != "Standard":
+        lines.append(f"Фон: {bg_emoji} <b>{bg_name}</b>, Узор: {pat_emoji} <b>{pat_name}</b>")
+    
+    lines.extend([
+        "",
         f"<b>Floor:</b> {floor_ton:.1f} 💎  ≈ {floor_ton * ton_usd_price:.1f} $",
         f"<b>AVG:</b> {avg_ton:.1f} 💎  ≈ {avg_ton * ton_usd_price:.1f} $",
         f"<b>Последняя продажа:</b> {last_sale_ton:.1f} 💎  ≈ {last_sale_ton * ton_usd_price:.1f} $\n",
         "<b>История продаж модели:</b>",
         "<blockquote>"
-    ]
+    ])
     
     sales_history = data.get("sales_history", [])
     if sales_history:
@@ -392,7 +405,7 @@ async def on_startup():
 dp.startup.register(on_startup)
 
 # ==========================================
-# МЕНЮ & АДМИНКА (Без изменений)
+# МЕНЮ & АДМИНКА
 # ==========================================
 async def get_user_main_kb(user_id: int):
     user_data = await users_collection.find_one({"user_id": user_id}) or {}
@@ -546,7 +559,7 @@ async def show_cmds(call: CallbackQuery):
         "💣 `.[число] [текст]` — спам сообщением\n"
         "🎭 `.п1`, `.п2`, `.п3` — анимации печати\n"
         "🧮 **Математика/Валюта:** `5+3`, `5 баксов`\n"
-        "🖼 **NFT:** `.nft <адрес>` — узнать цену предмета\n"
+        "🖼 **NFT:** бот автоматически ловит ссылки t.me/nft/...\n"
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="user_main")
@@ -563,9 +576,42 @@ async def on_business_connection(connection: BusinessConnection):
 
 @dp.business_message(ReplyHasMedia())
 async def auto_save_replied_media(message: Message):
-    if message.from_user.id == message.chat.id: return
-    # (Код авто-сохранения медиа остался без изменений, сокращен для вместительности)
-    pass 
+    if message.from_user.id == message.chat.id:
+        return
+    reply = message.reply_to_message
+    if not reply:
+        return
+
+    file_id, media_kind, filename = None, None, "saved"
+    if reply.photo: file_id, media_kind, filename = reply.photo[-1].file_id, "photo", "saved.jpg"
+    elif reply.video: file_id, media_kind, filename = reply.video.file_id, "video", "saved.mp4"
+    elif reply.video_note: file_id, media_kind, filename = reply.video_note.file_id, "video_note", "saved_note.mp4"
+    elif reply.animation: file_id, media_kind, filename = reply.animation.file_id, "animation", "saved.mp4"
+    elif reply.document: file_id, media_kind, filename = reply.document.file_id, "document", reply.document.file_name or "saved.bin"
+    elif reply.audio: file_id, media_kind, filename = reply.audio.file_id, "audio", "saved.mp3"
+    elif reply.voice: file_id, media_kind, filename = reply.voice.file_id, "voice", "saved.ogg"
+
+    if not file_id: return
+    owner_id = message.from_user.id
+    sender_name = reply.from_user.first_name or reply.from_user.username or "Без имени" if reply.from_user else "Неизвестно"
+    caption, header = reply.caption or "", f"🕵️ <b>Сохранено от {sender_name}</b>"
+
+    try:
+        file = await bot.get_file(file_id)
+        buffer = await bot.download_file(file.file_path)
+        input_file = BufferedInputFile(buffer.read(), filename=filename)
+        if media_kind == "photo": await bot.send_photo(chat_id=owner_id, photo=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
+        elif media_kind == "video": await bot.send_video(chat_id=owner_id, video=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
+        elif media_kind == "video_note": await bot.send_video_note(chat_id=owner_id, video_note=input_file); await bot.send_message(chat_id=owner_id, text=header, parse_mode="HTML")
+        elif media_kind == "animation": await bot.send_animation(chat_id=owner_id, animation=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
+        elif media_kind == "document": await bot.send_document(chat_id=owner_id, document=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
+        elif media_kind == "audio": await bot.send_audio(chat_id=owner_id, audio=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
+        elif media_kind == "voice": await bot.send_voice(chat_id=owner_id, voice=input_file); await bot.send_message(chat_id=owner_id, text=header, parse_mode="HTML")
+    except Exception as e:
+        with suppress(Exception): await bot.send_message(chat_id=owner_id, text=f"❌ Не удалось сохранить: <code>{e}</code>", parse_mode="HTML")
+        return
+
+    with suppress(Exception): await history_collection.insert_one({"owner_id": owner_id, "text": f"🕵️ Авто-сейв медиа от {sender_name} ({media_kind})", "ts": datetime.now(timezone.utc)})
 
 @dp.business_message(F.text.lower().startswith(".мут"))
 async def mute_user(message: Message):
@@ -592,79 +638,137 @@ async def spam_command(message: Message):
         await asyncio.sleep(0.2)
 
 # ==========================================
-# НОВАЯ ФИШКА: ОБРАБОТЧИК ССЫЛОК И КОМАНД NFT
+# НОВАЯ ФИШКА: АВТО-ПАРСЕР ССЫЛОК
 # ==========================================
-NFT_LINK_PATTERN = r"(t\.me/nft/[a-zA-Z0-9_-]+|getgems\.io/collection/[\w-]+/[\w-]+)"
+NFT_LINK_PATTERN = r"(t\.me/nft/[a-zA-Z0-9_-]+|getgems\.io/collection/[\w-]+/[\w-]+|[EU]Q[a-zA-Z0-9_-]{46})"
 
 @dp.business_message(F.text.regexp(NFT_LINK_PATTERN))
 @dp.message(F.text.regexp(NFT_LINK_PATTERN))
-async def catch_nft_link(message: Message):
-    """Ловит ссылки на NFT и предлагает узнать цену"""
-    # Если это бизнес-чат, и пишу не я (не владелец), не спамим кнопками
-    if getattr(message, 'business_connection_id', None) and message.from_user.id == message.chat.id:
-        return
-        
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔍 Узнать цену NFT", callback_data="prompt_nft_address")
-    
+async def process_nft_link_auto(message: Message):
     conn_id = getattr(message, 'business_connection_id', None)
+    
+    # Не перехватываем свои же сообщения в личке или бизнес-чате (чтобы не лупить парсер на свои рассылки)
+    if conn_id and message.from_user.id == message.chat.id:
+        return
+
+    loading_msg = None
     with suppress(Exception):
-        await bot.send_message(
-            chat_id=message.chat.id, 
-            text="Вы скинули ссылку на NFT. Хотите узнать его стоимость и историю продаж?", 
-            reply_markup=builder.as_markup(),
+        loading_msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text="🔍 Заметил NFT ссылку. Ищу данные...",
             business_connection_id=conn_id
         )
 
-@dp.callback_query(F.data == "prompt_nft_address")
-async def ask_for_nft_address(call: CallbackQuery):
-    await call.answer()
-    await call.message.edit_text("Для точной оценки мне нужен **TON-адрес** смарт-контракта этого NFT.\n\nСкопируй адрес и отправь мне команду:\n`.nft <адрес>`", parse_mode="Markdown")
+    async with aiohttp.ClientSession() as session:
+        # 1. Сам находит адрес (Парсит ссылку и делает запрос к GetGems GraphQL, если нужно)
+        nft_address = await resolve_link_to_address(session, message.text)
+        
+        if not nft_address:
+            if loading_msg:
+                with suppress(Exception):
+                    await bot.delete_message(chat_id=message.chat.id, message_id=loading_msg.message_id, business_connection_id=conn_id)
+            return
 
-@dp.business_message(F.text.lower().startswith(".nft "))
-@dp.message(F.text.lower().startswith(".nft "))
-async def check_nft_command(message: Message):
-    """Обрабатывает команду .nft <адрес>"""
-    conn_id = getattr(message, 'business_connection_id', None)
-    
-    # Удаляем саму команду, если это бизнес-чат
-    if conn_id and message.from_user.id != message.chat.id:
-        with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
-    
-    nft_address = message.text[5:].strip()
-    if not nft_address: return
-    
-    loading_msg = await bot.send_message(chat_id=message.chat.id, text="⏳ Собираю данные с блокчейна...", business_connection_id=conn_id)
-    
-    # Получаем данные
-    ton_price = await get_live_ton_price()
-    nft_data = await get_real_nft_data(nft_address)
-    
-    # Форматируем и отправляем
-    result_text = format_nft_card(nft_data, ton_price)
-    
-    with suppress(Exception):
-        await bot.edit_message_text(chat_id=message.chat.id, message_id=loading_msg.message_id, text=result_text, parse_mode="HTML", business_connection_id=conn_id)
+        # 2. Вытягивает инфу и цены
+        ton_price = await get_live_ton_price()
+        nft_data = await get_real_nft_data(nft_address)
+        
+        # 3. Собирает карточку
+        result_text = format_nft_card(nft_data, ton_price)
 
+        if loading_msg:
+            with suppress(Exception):
+                await bot.edit_message_text(
+                    chat_id=message.chat.id, 
+                    message_id=loading_msg.message_id, 
+                    text=result_text, 
+                    parse_mode="HTML", 
+                    business_connection_id=conn_id
+                )
 
-# (Математика, Автоответчик, Логгер удалений остались стандартными, чтобы не забивать лимит текста ответа)
+# ==========================================
+# ОСТАЛЬНЫЕ ХЭНДЛЕРЫ
+# ==========================================
 @dp.business_message(F.text.regexp(AUTO_MATH_CURRENCY_PATTERN) | F.text.regexp(AUTO_MATH_PATTERN))
 async def auto_math_and_currency(message: Message):
-    # Твой код конвертера... (без изменений)
-    pass
+    if message.from_user.id == message.chat.id: return
+    if message.text.lstrip().startswith("."): return
+    match_curr = re.match(AUTO_MATH_CURRENCY_PATTERN, message.text)
+    if match_curr:
+        math_expr, tail = match_curr.group(1).strip(), match_curr.group(2).lower()
+        code = CURRENCY_ALIASES.get(tail)
+        if not code: return
+        if math_expr:
+            raw = normalize_math_input(math_expr)
+            parsed = parse_math_expression(raw)
+            try:
+                amount = float(simple_eval(parsed))
+                formatted_expr = format_math_expression(parsed)
+                await send_currency_conversion(message, amount, code, original_expr=formatted_expr if len(parsed.split()) > 1 else None)
+            except Exception: return
+    else:
+        raw = normalize_math_input(message.text)
+        parsed = parse_math_expression(raw)
+        if not parsed or len(parsed.split()) < 3: return
+        try:
+            result = simple_eval(parsed)
+            if isinstance(result, float):
+                result = int(result) if round(result, 4).is_integer() else round(result, 4)
+        except Exception: return
+        formatted = format_math_expression(parsed)
+        with suppress(Exception):
+            await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+            await bot.send_message(chat_id=message.chat.id, text=f"{formatted} = {result}", business_connection_id=message.business_connection_id)
 
 @dp.business_message()
 async def handle_messages(message: Message):
-    # Твой код автоответчика и логирования... (без изменений)
-    pass
+    chat_id = message.chat.id
+    conn_id = message.business_connection_id
+    if message.from_user.id != chat_id:
+        await ensure_connection(conn_id, message.from_user.id, message.from_user.first_name)
+        return
+        
+    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    if owner_data:
+        owner_id = owner_data["user_id"]
+        owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
+        manual_afk = owner_settings.get("is_afk", False)
+        in_schedule = check_auto_afk(owner_settings.get("afk_start", 23), owner_settings.get("afk_end", 7)) if owner_settings.get("auto_afk", False) else False
+        
+        if manual_afk or in_schedule:
+            now = datetime.now().timestamp()
+            last_sent = afk_cooldowns.get((owner_id, chat_id), 0)
+            if now - last_sent > 300: 
+                afk_text = owner_settings.get("afk_text", "Владелец сейчас занят и ответит позже. 💤")
+                with suppress(Exception): await bot.send_message(chat_id=chat_id, text=afk_text, business_connection_id=conn_id)
+                afk_cooldowns[(owner_id, chat_id)] = now
+
+    mute_key = f"{conn_id}_{chat_id}"
+    if mute_key in muted_chats:
+        with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+        return
+        
+    with suppress(Exception):
+        await messages_collection.insert_one({
+            "business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id, "user_id": message.from_user.id,
+            "username": message.from_user.username or "нет_юзернейма", "first_name": message.from_user.first_name or "Без имени",
+            "text": message.text or message.caption or "[Без текста]", "created_at": datetime.now(timezone.utc)
+        })
 
 @dp.callback_query(F.data.startswith("unmute_"))
 async def unmute_user(call: CallbackQuery):
     chat_id = int(call.data.split("_")[1])
     conn_id = call.message.business_connection_id
     mute_key = f"{conn_id}_{chat_id}"
-    if mute_key in muted_chats: muted_chats.remove(mute_key)
-    with suppress(Exception): await call.message.edit_text("мут снят")
+
+    if call.from_user.id == chat_id and call.from_user.id != SUPERADMIN_ID:
+        with suppress(TelegramBadRequest): await call.answer("вы не можете снять мут", show_alert=True)
+        return
+    if mute_key in muted_chats or call.from_user.id == SUPERADMIN_ID:
+        if mute_key in muted_chats: muted_chats.remove(mute_key)
+        with suppress(TelegramBadRequest): await call.message.edit_text("мут снят"); await call.answer("снял")
+    else:
+        with suppress(TelegramBadRequest): await call.message.edit_text("уже снял")
 
 async def main():
     await start_web_server()
