@@ -54,7 +54,7 @@ CURRENCY_ALIASES = {
     "юсд": "USD", "усд": "USD", "$": "USD",
     "rub": "RUB", "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "рубля": "RUB",
     "руб": "RUB", "рубас": "RUB", "рубасов": "RUB", "рубаса": "RUB",
-    "деревянный": "RUB", "деревянных": "RUB", "₽": "RUB",
+    "деревянный": "RUB", "деревянных": "RUB", "₽": "RUB", "р": "RUB", "р.": "RUB",
     "eur": "EUR", "евро": "EUR", "еврик": "EUR", "евриков": "EUR", "евра": "EUR", "€": "EUR",
     "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "юаня": "CNY",
     "yuan": "CNY", "женьминьби": "CNY", "жэньминьби": "CNY", "¥": "CNY",
@@ -75,9 +75,9 @@ CURRENCY_ALIASES = {
     "usdt": "USDT", "тетер": "USDT", "тетеры": "USDT", "тетеров": "USDT", "тетера": "USDT",
     "тезер": "USDT", "тезеры": "USDT", "тезеров": "USDT",
     "юста": "USDT", "юсдт": "USDT", "усдт": "USDT",
-    "kzt": "KZT", "тенге": "KZT", "теньге": "KZT", "₸": "KZT",
+    "kzt": "KZT", "тенге": "KZT", "теньге": "KZT", "₸": "KZT", "тг": "KZT", "тг.": "KZT",
     "uah": "UAH", "гривна": "UAH", "гривны": "UAH", "гривен": "UAH", "гривне": "UAH",
-    "гривня": "UAH", "₴": "UAH",
+    "гривня": "UAH", "₴": "UAH", "грн": "UAH", "грн.": "UAH",
     "gbp": "GBP", "фунт": "GBP", "фунты": "GBP", "фунтов": "GBP", "фунта": "GBP",
     "стерлинг": "GBP", "стерлингов": "GBP", "£": "GBP",
     "jpy": "JPY", "иена": "JPY", "иены": "JPY", "иен": "JPY", "йена": "JPY", "йены": "JPY",
@@ -137,10 +137,13 @@ def format_math_expression(expr: str) -> str:
     return re.sub(r"\s+", " ", expr).strip()
 
 async def fetch_json(url: str):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                return await resp.json()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+    except Exception:
+        pass
     return None
 
 # ФОНОВОЕ ОБНОВЛЕНИЕ КУРСОВ КАЖДЫЕ 5 МИНУТ
@@ -154,11 +157,18 @@ async def force_update_all_rates():
                 if rates.get(cur):
                     EXCHANGE_CACHE[cur] = 1.0 / rates[cur]
 
-        # Крипта (через Binance API для скорости)
+        # Крипта (Перешли на MEXC, так как Binance блокирует сервера из США/Render)
         for sym, code in [("BTCUSDT", "BTC"), ("ETHUSDT", "ETH"), ("TONUSDT", "TON")]:
-            data = await fetch_json(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}")
+            data = await fetch_json(f"https://api.mexc.com/api/v3/ticker/price?symbol={sym}")
             if data and "price" in data:
                 EXCHANGE_CACHE[code] = 1.0 / float(data["price"])
+            else:
+                # Резервный канал через CoinGecko если MEXC лежит
+                cg_id = {"BTC": "bitcoin", "ETH": "ethereum", "TON": "the-open-network"}.get(code)
+                if cg_id:
+                    cg_data = await fetch_json(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd")
+                    if cg_data and cg_id in cg_data:
+                        EXCHANGE_CACHE[code] = 1.0 / float(cg_data[cg_id]["usd"])
 
         EXCHANGE_CACHE["USD"] = 1.0
         EXCHANGE_CACHE["USDT"] = 1.0
@@ -237,14 +247,12 @@ async def on_startup():
     # Запускаем фоновое обновление валют
     asyncio.create_task(update_rates_loop())
     
-    # Настройка видимости команд:
+    # Настройка видимости команд (админка только у суперадмина)
     with suppress(Exception):
-        # Базовое меню для всех (только /start)
         await bot.set_my_commands(
             [BotCommand(command="start", description="🏠 Главное меню")],
             scope=BotCommandScopeDefault()
         )
-        # Эксклюзивное меню только для суперадмина
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="🏠 Главное меню"),
@@ -414,8 +422,8 @@ async def show_cmds(call: CallbackQuery):
         "🚫 `.мут` — удаляет сообщения собеседника\n"
         "💣 `.[число] [текст]` — спам сообщением (например: `.10 ау`)\n"
         "🎭 `.п1`, `.п2`, `.п3` — анимации печати\n"
-        "🧮 **Математика:** просто напиши `5 + 3`, `5+3` — бот сам посчитает и покажет `5 + 3 = 8`\n"
-        "💱 **Авто-курс:** `5 баксов`, `1000 рублей`, `2 евро` — бот конвертирует по свежему курсу\n"
+        "🧮 **Математика:** просто напиши `5 + 3`, `5+3` — бот посчитает\n"
+        "💱 **Авто-курс:** `5 баксов`, `1000 р`, `2 евро` — конвертация по курсу\n"
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="user_main")
@@ -496,7 +504,7 @@ async def view_user_logs(call: CallbackQuery):
         await call.message.edit_text("Логов пока нет.", reply_markup=builder.as_markup())
         return
     text = f"🗂 **Последние 5 событий (ID `{target_id}`):**\n\n"
-    for log in logs: text += f"▪️ {log['text']}\n〰️〰️〰️〰️〰️️〰️〰️\n"
+    for log in logs: text += f"▪️ {log['text']}\n〰️〰️〰️〰️〰〰️〰️\n"
     if len(text) > 4000: text = text[:4000] + "..."
     await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
 
@@ -642,35 +650,42 @@ async def handle_messages(message: Message):
     if message.from_user.id != chat_id:
         await ensure_connection(conn_id, message.from_user.id, message.from_user.first_name)
         return
+        
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if owner_data:
         owner_id = owner_data["user_id"]
         owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
+        
         manual_afk = owner_settings.get("is_afk", False)
         auto_afk = owner_settings.get("auto_afk", False)
         in_schedule = False
+        
         if auto_afk:
             s_hour = owner_settings.get("afk_start", 23)
             e_hour = owner_settings.get("afk_end", 7)
             in_schedule = check_auto_afk(s_hour, e_hour)
+            
         if manual_afk or in_schedule:
             now = datetime.now().timestamp()
             last_sent = afk_cooldowns.get((owner_id, chat_id), 0)
-            if now - last_sent > 300:
+            if now - last_sent > 300: 
                 afk_text = owner_settings.get("afk_text", "Владелец сейчас занят и ответит позже. 💤")
-                with suppress(Exception): await bot.send_message(chat_id=chat_id, text=afk_text, business_connection_id=conn_id)
+                with suppress(Exception):
+                    await bot.send_message(chat_id=chat_id, text=afk_text, business_connection_id=conn_id)
                 afk_cooldowns[(owner_id, chat_id)] = now
 
     mute_key = f"{conn_id}_{chat_id}"
     if mute_key in muted_chats:
         with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
         return
-
+        
     with suppress(Exception):
         await messages_collection.insert_one({
-            "business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id,
-            "user_id": message.from_user.id, "username": message.from_user.username or "нет_юзернейма",
-            "first_name": message.from_user.first_name or "Без имени", "text": message.text or message.caption or "[Без текста]",
+            "business_connection_id": conn_id, "message_id": message.message_id,
+            "chat_id": chat_id, "user_id": message.from_user.id,
+            "username": message.from_user.username or "нет_юзернейма",
+            "first_name": message.from_user.first_name or "Без имени",
+            "text": message.text or message.caption or "[Без текста]",
             "created_at": datetime.now(timezone.utc)
         })
 
@@ -685,11 +700,13 @@ async def catch_edits(message: Message):
     old_text = old_msg['text'] if old_msg else "[Не успел сохранить]"
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data: return
+    
     safe_name = html.escape(message.from_user.first_name)
     safe_old = html.escape(old_text)
     safe_new = html.escape(new_text)
     owner_id = owner_data["user_id"]
     log_text = f"✏️ <b>Изменение от {safe_name}</b>\n<b>Было:</b> {safe_old}\n<b>Стало:</b> {safe_new}"
+    
     with suppress(Exception): await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
     with suppress(Exception): await history_collection.insert_one({"owner_id": owner_id, "text": log_text, "ts": datetime.now(timezone.utc)})
     with suppress(Exception): await messages_collection.update_one({"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id}, {"$set": {"text": new_text}})
@@ -700,6 +717,7 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data: return
     owner_id = owner_data["user_id"]
+    
     for msg_id in deleted.message_ids:
         old_msg = None
         with suppress(Exception): old_msg = await messages_collection.find_one({"business_connection_id": conn_id, "message_id": msg_id, "chat_id": deleted.chat.id})
@@ -715,6 +733,7 @@ async def unmute_user(call: CallbackQuery):
     chat_id = int(call.data.split("_")[1])
     conn_id = call.message.business_connection_id
     mute_key = f"{conn_id}_{chat_id}"
+
     if call.from_user.id == chat_id and call.from_user.id != SUPERADMIN_ID:
         with suppress(TelegramBadRequest): await call.answer("вы не можете снять мут", show_alert=True)
         return
