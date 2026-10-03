@@ -11,10 +11,9 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, BusinessMessagesDeleted, BusinessConnection,
-    BufferedInputFile, BotCommand, MenuButtonCommands
+    BotCommand, MenuButtonCommands, BotCommandScopeDefault, BotCommandScopeChat
 )
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import BaseFilter
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -45,7 +44,6 @@ afk_cooldowns = {}
 # КУРСЫ ВАЛЮТ
 # ==========================================
 EXCHANGE_CACHE = {}
-CACHE_TTL = 300
 STARS_USD_RATE = 0.015
 
 CURRENCY_ALIASES = {
@@ -85,25 +83,16 @@ CURRENCY_ALIASES = {
     "jpy": "JPY", "иена": "JPY", "иены": "JPY", "иен": "JPY", "йена": "JPY", "йены": "JPY",
 }
 
-ALL_CURRENCIES = [
-    "RUB", "USD", "EUR", "CNY", "UAH", "KZT", "GBP", "JPY",
-    "BTC", "ETH", "USDT", "TON", "STARS"
-]
-
-# ---- РЕГУЛЯРКИ ----
+ALL_CURRENCIES = ["RUB", "USD", "EUR", "CNY", "UAH", "KZT", "GBP", "JPY", "BTC", "ETH", "USDT", "TON", "STARS"]
 _CURRENCY_ALT = "|".join(sorted([re.escape(a) for a in CURRENCY_ALIASES.keys()], key=len, reverse=True))
 AUTO_CURRENCY_PATTERN = rf"(?i)^\s*(\d+[.,]?\d*)\s{{0,3}}({_CURRENCY_ALT})\s*$"
 
-# .м + 0-3 пробелов + выражение
-MATH_PREFIX_PATTERN = r"^\.м\s{0,3}(\S.*)$"
-
-# Авто-математика: число (0-3 проб) оператор (0-3 проб) число ... (повтор)
+# Авто-математика
 _NUM = r"\d+[.,]?\d*"
 _OPS = r"[+\-*/xх^]"
 _WORDS = r"(?:плюс|минус|умножить на|разделить на|поделить на|умножить|разделить|поделить|сложить|вычесть|делить|степень|в степени|х)"
 AUTO_MATH_PATTERN = rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})+\s*$"
 
-# ---- СЛОВАРИ КАЛЬКУЛЯТОРА ----
 WORD_NUMBERS = {
     "ноль": 0, "один": 1, "одна": 1, "два": 2, "две": 2, "три": 3, "четыре": 4,
     "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10,
@@ -123,7 +112,6 @@ OPERATORS = {
     "степень": "**",
 }
 
-
 def parse_math_expression(text: str) -> str:
     text = text.lower().strip()
     for word, op in sorted(OPERATORS.items(), key=lambda x: -len(x[0])):
@@ -138,14 +126,15 @@ def parse_math_expression(text: str) -> str:
             result.append(word)
     text = " ".join(result)
     text = re.sub(r"[^\d+\-*/().\s]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
+    return re.sub(r"\s+", " ", text).strip()
 
 def normalize_math_input(text: str) -> str:
-    """Сжимает множественные пробелы до одного — чтобы 5 +   5 → 5 + 5."""
     return re.sub(r"\s{1,}", " ", text.strip())
 
+def format_math_expression(expr: str) -> str:
+    expr = re.sub(r"\s+", " ", expr).strip()
+    expr = re.sub(r"\s*(\*\*|[+\-*/])\s*", r" \1 ", expr)
+    return re.sub(r"\s+", " ", expr).strip()
 
 async def fetch_json(url: str):
     async with aiohttp.ClientSession() as session:
@@ -154,63 +143,42 @@ async def fetch_json(url: str):
                 return await resp.json()
     return None
 
+# ФОНОВОЕ ОБНОВЛЕНИЕ КУРСОВ КАЖДЫЕ 5 МИНУТ
+async def force_update_all_rates():
+    try:
+        # Фиат
+        fiat_data = await fetch_json("https://open.er-api.com/v6/latest/USD")
+        if fiat_data and "rates" in fiat_data:
+            rates = fiat_data["rates"]
+            for cur in ["RUB", "EUR", "CNY", "UAH", "KZT", "GBP", "JPY"]:
+                if rates.get(cur):
+                    EXCHANGE_CACHE[cur] = 1.0 / rates[cur]
 
-async def get_crypto_price_usd(coin_id: str):
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-    data = await fetch_json(url)
-    if data and coin_id in data:
-        return data[coin_id].get("usd")
-    return None
+        # Крипта (через Binance API для скорости)
+        for sym, code in [("BTCUSDT", "BTC"), ("ETHUSDT", "ETH"), ("TONUSDT", "TON")]:
+            data = await fetch_json(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}")
+            if data and "price" in data:
+                EXCHANGE_CACHE[code] = 1.0 / float(data["price"])
 
+        EXCHANGE_CACHE["USD"] = 1.0
+        EXCHANGE_CACHE["USDT"] = 1.0
+        EXCHANGE_CACHE["STARS"] = STARS_USD_RATE
+    except Exception as e:
+        print(f"Ошибка обновления курсов: {e}")
 
-async def get_fiat_rate_usd_to(target: str):
-    url = "https://open.er-api.com/v6/latest/USD"
-    data = await fetch_json(url)
-    if data and "rates" in data:
-        return data["rates"].get(target)
-    return None
-
-
-async def get_rate_to_usd(currency: str):
-    now = datetime.now(timezone.utc).timestamp()
-    cache_key = f"rate_{currency}_to_usd"
-    if cache_key in EXCHANGE_CACHE:
-        rate, ts = EXCHANGE_CACHE[cache_key]
-        if now - ts < CACHE_TTL:
-            return rate
-    rate = None
-    if currency == "USD":
-        rate = 1.0
-    elif currency == "STARS":
-        rate = STARS_USD_RATE
-    elif currency == "BTC":
-        p = await get_crypto_price_usd("bitcoin")
-        rate = 1.0 / p if p else None
-    elif currency == "TON":
-        p = await get_crypto_price_usd("the-open-network")
-        rate = 1.0 / p if p else None
-    elif currency == "ETH":
-        p = await get_crypto_price_usd("ethereum")
-        rate = 1.0 / p if p else None
-    elif currency == "USDT":
-        rate = 1.0
-    else:
-        fiat_rate = await get_fiat_rate_usd_to(currency)
-        rate = 1.0 / fiat_rate if fiat_rate else None
-    if rate is not None:
-        EXCHANGE_CACHE[cache_key] = (rate, now)
-    return rate
-
+async def update_rates_loop():
+    while True:
+        await force_update_all_rates()
+        await asyncio.sleep(300) # Ждем 5 минут
 
 async def convert_currency(amount: float, from_cur: str, to_cur: str):
     if from_cur == to_cur:
         return amount
-    r_from = await get_rate_to_usd(from_cur)
-    r_to = await get_rate_to_usd(to_cur)
+    r_from = EXCHANGE_CACHE.get(from_cur)
+    r_to = EXCHANGE_CACHE.get(to_cur)
     if r_from is None or r_to is None:
         return None
     return (amount * r_from) / r_to
-
 
 async def send_currency_conversion(message: Message, amount: float, from_cur: str):
     owner_id = message.from_user.id
@@ -218,76 +186,41 @@ async def send_currency_conversion(message: Message, amount: float, from_cur: st
     display_currencies = owner_settings.get("display_currencies", ["RUB", "STARS", "TON"])
     lines = [f"💱 <b>{amount} {from_cur}</b>:\n"]
     for target in display_currencies:
-        if target == from_cur:
-            continue
+        if target == from_cur: continue
         result = await convert_currency(amount, from_cur, target)
-        if result is None:
-            continue
-        if target in ("BTC", "ETH", "TON"):
-            formatted = f"{result:.6f}".rstrip("0").rstrip(".")
-        elif target == "STARS":
-            formatted = f"{result:.0f}"
-        else:
-            formatted = f"{result:.2f}"
-        emoji = {
-            "RUB": "🇷🇺", "USD": "🇺🇸", "EUR": "🇪🇺", "CNY": "🇨🇳",
-            "UAH": "🇺🇦", "KZT": "🇰🇿", "GBP": "🇬🇧", "JPY": "🇯🇵",
-            "BTC": "₿", "ETH": "Ξ", "USDT": "💵", "TON": "💎", "STARS": "⭐",
-        }.get(target, "•")
+        if result is None: continue
+        if target in ("BTC", "ETH", "TON"): formatted = f"{result:.6f}".rstrip("0").rstrip(".")
+        elif target == "STARS": formatted = f"{result:.0f}"
+        else: formatted = f"{result:.2f}"
+        
+        emoji = {"RUB": "🇷🇺", "USD": "🇺🇸", "EUR": "🇪🇺", "CNY": "🇨🇳", "UAH": "🇺🇦", "KZT": "🇰🇿", "GBP": "🇬🇧", "JPY": "🇯🇵", "BTC": "₿", "ETH": "Ξ", "USDT": "💵", "TON": "💎", "STARS": "⭐"}.get(target, "•")
         lines.append(f"{emoji} <b>{formatted}</b> {target}")
     with suppress(Exception):
         await message.reply("\n".join(lines), parse_mode="HTML")
 
-
-# ==========================================
-# ФИЛЬТР: ответ на медиа
-# ==========================================
-class ReplyHasMedia(BaseFilter):
-    async def __call__(self, message: Message) -> bool:
-        r = message.reply_to_message
-        if not r:
-            return False
-        return bool(r.photo or r.video or r.video_note or r.animation
-                    or r.document or r.audio or r.voice)
-
-
-# ==========================================
-# FSM
-# ==========================================
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
-
 
 class UserStates(StatesGroup):
     waiting_for_afk_text = State()
     waiting_for_afk_time = State()
 
-
 async def ensure_connection(conn_id: str, user_id: int, first_name: str):
-    try:
+    with suppress(Exception):
         await connections_collection.update_one(
             {"business_connection_id": conn_id},
             {"$set": {"business_connection_id": conn_id, "user_id": user_id, "first_name": first_name or "Без имени"}},
             upsert=True
         )
-    except Exception:
-        pass
-
 
 def check_auto_afk(start_h: int, end_h: int) -> bool:
     now = datetime.now(timezone.utc)
     local_hour = (now.hour + 3) % 24
-    if start_h < end_h:
-        return start_h <= local_hour < end_h
+    if start_h < end_h: return start_h <= local_hour < end_h
     return local_hour >= start_h or local_hour < end_h
 
-
-# ==========================================
-# ВЕБ-СЕРВЕР
-# ==========================================
 async def dummy_handler(request):
     return web.Response(text="Multi-bot is running!")
-
 
 async def start_web_server():
     app = web.Application()
@@ -298,25 +231,33 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-
 async def on_startup():
-    try:
-        await messages_collection.create_index("created_at", expireAfterSeconds=172800)
-    except Exception:
-        pass
+    with suppress(Exception): await messages_collection.create_index("created_at", expireAfterSeconds=172800)
+    
+    # Запускаем фоновое обновление валют
+    asyncio.create_task(update_rates_loop())
+    
+    # Настройка видимости команд:
     with suppress(Exception):
-        await bot.set_my_commands([
-            BotCommand(command="start", description="🏠 Главное меню"),
-            BotCommand(command="admin", description="👑 Админ-панель"),
-        ])
+        # Базовое меню для всех (только /start)
+        await bot.set_my_commands(
+            [BotCommand(command="start", description="🏠 Главное меню")],
+            scope=BotCommandScopeDefault()
+        )
+        # Эксклюзивное меню только для суперадмина
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="🏠 Главное меню"),
+                BotCommand(command="admin", description="👑 Админ-панель")
+            ],
+            scope=BotCommandScopeChat(chat_id=SUPERADMIN_ID)
+        )
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-
 
 dp.startup.register(on_startup)
 
-
 # ==========================================
-# ПОЛЬЗОВАТЕЛЬСКОЕ МЕНЮ
+# МЕНЮ
 # ==========================================
 async def get_user_main_kb(user_id: int):
     user_data = await users_collection.find_one({"user_id": user_id}) or {}
@@ -329,7 +270,6 @@ async def get_user_main_kb(user_id: int):
         [InlineKeyboardButton(text="🔇 Управление мутами", callback_data="user_mutes")],
         [InlineKeyboardButton(text="📖 Доступные команды", callback_data="user_cmds")]
     ])
-
 
 async def get_afk_settings_kb(user_id: int):
     user_data = await users_collection.find_one({"user_id": user_id}) or {}
@@ -344,26 +284,19 @@ async def get_afk_settings_kb(user_id: int):
         [InlineKeyboardButton(text="🔙 Назад", callback_data="user_main")]
     ])
 
-
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     with suppress(Exception):
-        await users_collection.update_one(
-            {"user_id": message.from_user.id},
-            {"$set": {"user_id": message.from_user.id}},
-            upsert=True
-        )
+        await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"user_id": message.from_user.id}}, upsert=True)
     kb = await get_user_main_kb(message.from_user.id)
     await message.answer("👋 **Твой личный бот-секретарь.**\nУправляй статусом и настройками ниже:", reply_markup=kb, parse_mode="Markdown")
-
 
 @dp.callback_query(F.data == "user_main")
 async def user_main_handler(call: CallbackQuery, state: FSMContext):
     await state.clear()
     kb = await get_user_main_kb(call.from_user.id)
     await call.message.edit_text("🏠 **Главное меню:**", reply_markup=kb, parse_mode="Markdown")
-
 
 @dp.callback_query(F.data == "user_mutes")
 async def user_mutes_handler(call: CallbackQuery):
@@ -377,15 +310,11 @@ async def user_mutes_handler(call: CallbackQuery):
             if conn in conn_ids:
                 has_mutes = True
                 builder.button(text=f"Снять мут: {chat}", callback_data=f"u_unmute_{mute}")
-        except Exception:
-            continue
+        except Exception: continue
     builder.button(text="🔙 Назад", callback_data="user_main")
     builder.adjust(1)
-    if not has_mutes:
-        await call.message.edit_text("У тебя сейчас нет активных мутов.", reply_markup=builder.as_markup(), parse_mode="Markdown")
-    else:
-        await call.message.edit_text("🔇 **Твои активные муты:**\nНажми на кнопку, чтобы снять мут с собеседника.", reply_markup=builder.as_markup(), parse_mode="Markdown")
-
+    if not has_mutes: await call.message.edit_text("У тебя сейчас нет активных мутов.", reply_markup=builder.as_markup(), parse_mode="Markdown")
+    else: await call.message.edit_text("🔇 **Твои активные муты:**\nНажми на кнопку, чтобы снять мут с собеседника.", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("u_unmute_"))
 async def user_unmute_callback(call: CallbackQuery):
@@ -393,10 +322,8 @@ async def user_unmute_callback(call: CallbackQuery):
     if mute_key in muted_chats:
         muted_chats.remove(mute_key)
         await call.answer("✅ Мут успешно снят!", show_alert=True)
-    else:
-        await call.answer("Мут уже был снят.", show_alert=True)
+    else: await call.answer("Мут уже был снят.", show_alert=True)
     await user_mutes_handler(call)
-
 
 @dp.callback_query(F.data == "toggle_afk")
 async def toggle_afk_handler(call: CallbackQuery):
@@ -406,12 +333,10 @@ async def toggle_afk_handler(call: CallbackQuery):
     kb = await get_user_main_kb(call.from_user.id)
     await call.message.edit_text("🏠 **Главное меню:**", reply_markup=kb, parse_mode="Markdown")
 
-
 @dp.callback_query(F.data == "afk_settings")
 async def afk_settings_handler(call: CallbackQuery):
     kb = await get_afk_settings_kb(call.from_user.id)
     await call.message.edit_text("⚙️ **Настройки автоответчика:**", reply_markup=kb, parse_mode="Markdown")
-
 
 @dp.callback_query(F.data == "toggle_auto_afk")
 async def toggle_auto_afk(call: CallbackQuery):
@@ -420,7 +345,6 @@ async def toggle_auto_afk(call: CallbackQuery):
     await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"auto_afk": new_status}}, upsert=True)
     kb = await get_afk_settings_kb(call.from_user.id)
     await call.message.edit_text("⚙️ **Настройки автоответчика:**", reply_markup=kb, parse_mode="Markdown")
-
 
 @dp.callback_query(F.data == "afk_set_text")
 async def afk_set_text(call: CallbackQuery, state: FSMContext):
@@ -431,7 +355,6 @@ async def afk_set_text(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(f"Текущий текст:\n_{current}_\n\nОтправь новый текст автоответчика:", reply_markup=builder.as_markup(), parse_mode="Markdown")
     await state.set_state(UserStates.waiting_for_afk_text)
 
-
 @dp.message(UserStates.waiting_for_afk_text)
 async def save_afk_text(message: Message, state: FSMContext):
     await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"afk_text": message.text}})
@@ -439,14 +362,12 @@ async def save_afk_text(message: Message, state: FSMContext):
     await message.answer("✅ Текст сохранен!", reply_markup=kb)
     await state.clear()
 
-
 @dp.callback_query(F.data == "afk_set_time")
 async def afk_set_time(call: CallbackQuery, state: FSMContext):
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Отмена", callback_data="afk_settings")
     await call.message.edit_text("Отправь время включения и выключения в часах через пробел или дефис.\nПример: `23 7` (с 23:00 до 07:00)", reply_markup=builder.as_markup(), parse_mode="Markdown")
     await state.set_state(UserStates.waiting_for_afk_time)
-
 
 @dp.message(UserStates.waiting_for_afk_time)
 async def save_afk_time(message: Message, state: FSMContext):
@@ -458,11 +379,8 @@ async def save_afk_time(message: Message, state: FSMContext):
             kb = await get_afk_settings_kb(message.from_user.id)
             await message.answer("✅ Время сохранено!", reply_markup=kb)
             await state.clear()
-        else:
-            await message.answer("⚠️️ Ошибка: часы должны быть от 0 до 23. Попробуй еще раз:")
-    except:
-        await message.answer("⚠️ Неверный формат. Напиши просто две цифры, например: `23 7`")
-
+        else: await message.answer("⚠ Ошибка: часы должны быть от 0 до 23. Попробуй еще раз:")
+    except: await message.answer("⚠️ Неверный формат. Напиши просто две цифры, например: `23 7`")
 
 @dp.callback_query(F.data == "currency_settings")
 async def currency_settings_handler(call: CallbackQuery):
@@ -475,12 +393,7 @@ async def currency_settings_handler(call: CallbackQuery):
         builder.button(text=f"{check} {cur}", callback_data=f"cur_toggle_{cur}")
     builder.button(text="🔙 Назад", callback_data="user_main")
     builder.adjust(2)
-    await call.message.edit_text(
-        "💱 <b>Выбери валюты для отображения</b>\nНажми, чтобы включить/выключить:",
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
-    )
-
+    await call.message.edit_text("💱 <b>Выбери валюты для отображения</b>\nНажми, чтобы включить/выключить:", reply_markup=builder.as_markup(), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("cur_toggle_"))
 async def currency_toggle_handler(call: CallbackQuery):
@@ -488,15 +401,11 @@ async def currency_toggle_handler(call: CallbackQuery):
     owner_id = call.from_user.id
     owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
     display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON"])
-    if cur in display:
-        display.remove(cur)
-    else:
-        display.append(cur)
+    if cur in display: display.remove(cur)
+    else: display.append(cur)
     await users_collection.update_one({"user_id": owner_id}, {"$set": {"display_currencies": display}}, upsert=True)
     await currency_settings_handler(call)
-    with suppress(Exception):
-        await call.answer()
-
+    with suppress(Exception): await call.answer()
 
 @dp.callback_query(F.data == "user_cmds")
 async def show_cmds(call: CallbackQuery):
@@ -505,20 +414,15 @@ async def show_cmds(call: CallbackQuery):
         "🚫 `.мут` — удаляет сообщения собеседника\n"
         "💣 `.[число] [текст]` — спам сообщением (например: `.10 ау`)\n"
         "🎭 `.п1`, `.п2`, `.п3` — анимации печати\n"
-        "🧮 **Математика:** просто напиши `5 + 5` или `5+5` или `5 плюс 5`\n"
-        "   ↳ работает и с `.м`: `.м 5+5`, `.м  5 +   5`, `.м5+5`\n"
-        "💱 **Авто-курс:** просто напиши `5 баксов`, `1000 рублей`, `2 евро`\n"
-        "   ↳ можно `5баксов`, `5 баксов`, `5   баксов` (до 3 пробелов)\n"
-        "   ↳ валюты: RUB, USD, EUR, CNY, UAH, KZT, GBP, JPY, BTC, ETH, USDT, TON, STARS\n"
-        "🕵️ **Авто-сейв медиа** — свайпни влево одноразовое медиа и ответь **любым текстом**.\n"
+        "🧮 **Математика:** просто напиши `5 + 3`, `5+3` — бот сам посчитает и покажет `5 + 3 = 8`\n"
+        "💱 **Авто-курс:** `5 баксов`, `1000 рублей`, `2 евро` — бот конвертирует по свежему курсу\n"
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="user_main")
     await call.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
 
-
 # ==========================================
-# АДМИН ПАНЕЛЬ
+# АДМИН
 # ==========================================
 def get_admin_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -528,26 +432,20 @@ def get_admin_main_kb():
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")]
     ])
 
-
 @dp.message(F.text == "/admin")
 async def cmd_admin(message: Message):
-    if message.from_user.id != SUPERADMIN_ID:
-        return
+    if message.from_user.id != SUPERADMIN_ID: return
     await message.answer("👑 **Панель управления ботом:**", reply_markup=get_admin_main_kb(), parse_mode="Markdown")
-
 
 @dp.callback_query(F.data == "admin_main")
 async def back_to_main_admin(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != SUPERADMIN_ID:
-        return
+    if call.from_user.id != SUPERADMIN_ID: return
     await state.clear()
     await call.message.edit_text("👑 **Панель управления ботом:**", reply_markup=get_admin_main_kb(), parse_mode="Markdown")
 
-
 @dp.callback_query(F.data.startswith("admin_"))
 async def admin_callbacks(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != SUPERADMIN_ID:
-        return
+    if call.from_user.id != SUPERADMIN_ID: return
     action = call.data.replace("admin_", "")
     builder = InlineKeyboardBuilder()
     try:
@@ -584,46 +482,35 @@ async def admin_callbacks(call: CallbackQuery, state: FSMContext):
             builder.button(text="🔙 Отмена", callback_data="admin_main")
             await call.message.edit_text("Напиши сообщение для рассылки:", reply_markup=builder.as_markup())
             await state.set_state(AdminStates.waiting_for_broadcast)
-    except Exception as e:
-        print(f"Ошибка в меню админки: {e}")
-    with suppress(Exception):
-        await call.answer()
-
+    except Exception as e: print(f"Ошибка в меню админки: {e}")
+    with suppress(Exception): await call.answer()
 
 @dp.callback_query(F.data.startswith("userlog_"))
 async def view_user_logs(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID:
-        return
+    if call.from_user.id != SUPERADMIN_ID: return
     target_id = int(call.data.replace("userlog_", ""))
     logs = await history_collection.find({"owner_id": target_id}).sort("ts", -1).limit(5).to_list(length=5)
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 К списку кентов", callback_data="admin_users")
+    builder.button(text="🔙 К списку", callback_data="admin_users")
     if not logs:
         await call.message.edit_text("Логов пока нет.", reply_markup=builder.as_markup())
         return
     text = f"🗂 **Последние 5 событий (ID `{target_id}`):**\n\n"
-    for log in logs:
-        text += f"▪️ {log['text']}\n〰️〰️〰️〰️〰️〰️〰️\n"
-    if len(text) > 4000:
-        text = text[:4000] + "..."
+    for log in logs: text += f"▪️ {log['text']}\n〰️〰️〰️〰️〰️️〰️〰️\n"
+    if len(text) > 4000: text = text[:4000] + "..."
     await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
-
 
 @dp.callback_query(F.data.startswith("forceunmute_"))
 async def force_unmute(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID:
-        return
+    if call.from_user.id != SUPERADMIN_ID: return
     mute_key = call.data.replace("forceunmute_", "")
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 К мутам", callback_data="admin_mutes")
     if mute_key in muted_chats:
         muted_chats.remove(mute_key)
         await call.message.edit_text("✅ Мут снят.", reply_markup=builder.as_markup())
-    else:
-        await call.message.edit_text("Мут уже снят.", reply_markup=builder.as_markup())
-    with suppress(Exception):
-        await call.answer()
-
+    else: await call.message.edit_text("Мут уже снят.", reply_markup=builder.as_markup())
+    with suppress(Exception): await call.answer()
 
 @dp.message(AdminStates.waiting_for_broadcast)
 async def process_broadcast(message: Message, state: FSMContext):
@@ -636,7 +523,6 @@ async def process_broadcast(message: Message, state: FSMContext):
     await message.answer(f"✅ Отправлено {count} пользователям.", reply_markup=get_admin_main_kb())
     await state.clear()
 
-
 # ==========================================
 # БИЗНЕС-ЛОГИКА
 # ==========================================
@@ -645,256 +531,110 @@ async def on_business_connection(connection: BusinessConnection):
     if connection.is_enabled:
         await ensure_connection(connection.id, connection.user.id, connection.user.first_name)
     else:
-        with suppress(Exception):
-            await connections_collection.delete_one({"business_connection_id": connection.id})
+        with suppress(Exception): await connections_collection.delete_one({"business_connection_id": connection.id})
 
-
-# --- 1. АВТО-СЕЙВ МЕДИА (самый высокий приоритет) ---
-@dp.business_message(ReplyHasMedia())
-async def auto_save_replied_media(message: Message):
-    if message.from_user.id == message.chat.id:
-        return
-    reply = message.reply_to_message
-    if not reply:
-        return
-
-    file_id = None
-    media_kind = None
-    filename = "saved"
-
-    if reply.photo:
-        file_id, media_kind = reply.photo[-1].file_id, "photo"
-        filename = "saved.jpg"
-    elif reply.video:
-        file_id, media_kind = reply.video.file_id, "video"
-        filename = "saved.mp4"
-    elif reply.video_note:
-        file_id, media_kind = reply.video_note.file_id, "video_note"
-        filename = "saved_note.mp4"
-    elif reply.animation:
-        file_id, media_kind = reply.animation.file_id, "animation"
-        filename = "saved.mp4"
-    elif reply.document:
-        file_id, media_kind = reply.document.file_id, "document"
-        filename = reply.document.file_name or "saved.bin"
-    elif reply.audio:
-        file_id, media_kind = reply.audio.file_id, "audio"
-        filename = "saved.mp3"
-    elif reply.voice:
-        file_id, media_kind = reply.voice.file_id, "voice"
-        filename = "saved.ogg"
-
-    if not file_id:
-        return
-
-    owner_id = message.from_user.id
-    sender_name = "Неизвестно"
-    if reply.from_user:
-        sender_name = reply.from_user.first_name or reply.from_user.username or "Без имени"
-    caption = reply.caption or ""
-    header = f"🕵️ <b>Сохранено от {sender_name}</b>"
-
-    try:
-        file = await bot.get_file(file_id)
-        buffer = await bot.download_file(file.file_path)
-        input_file = BufferedInputFile(buffer.read(), filename=filename)
-
-        if media_kind == "photo":
-            await bot.send_photo(chat_id=owner_id, photo=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
-        elif media_kind == "video":
-            await bot.send_video(chat_id=owner_id, video=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
-        elif media_kind == "video_note":
-            await bot.send_video_note(chat_id=owner_id, video_note=input_file)
-            await bot.send_message(chat_id=owner_id, text=header, parse_mode="HTML")
-        elif media_kind == "animation":
-            await bot.send_animation(chat_id=owner_id, animation=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
-        elif media_kind == "document":
-            await bot.send_document(chat_id=owner_id, document=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
-        elif media_kind == "audio":
-            await bot.send_audio(chat_id=owner_id, audio=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
-        elif media_kind == "voice":
-            await bot.send_voice(chat_id=owner_id, voice=input_file)
-            await bot.send_message(chat_id=owner_id, text=header, parse_mode="HTML")
-    except Exception as e:
-        with suppress(Exception):
-            await bot.send_message(chat_id=owner_id, text=f"❌ Не удалось сохранить: <code>{e}</code>", parse_mode="HTML")
-        return
-
-    log_text = f"🕵️ Авто-сейв медиа от {sender_name} ({media_kind})"
-    with suppress(Exception):
-        await history_collection.insert_one({"owner_id": owner_id, "text": log_text, "ts": datetime.now(timezone.utc)})
-
-
-# --- 2. МУТ (регистрируем ДО .м, чтобы ".мут" не перехватился как математика) ---
 @dp.business_message(F.text.lower().startswith(".мут"))
 async def mute_user(message: Message):
     chat_id = message.chat.id
     conn_id = message.business_connection_id
     if message.from_user.id != chat_id:
         await ensure_connection(conn_id, message.from_user.id, message.from_user.first_name)
-        with suppress(Exception):
-            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+        with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
         mute_key = f"{conn_id}_{chat_id}"
-        if mute_key in muted_chats:
-            return
+        if mute_key in muted_chats: return
         muted_chats.add(mute_key)
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Размутить", callback_data=f"unmute_{chat_id}")
-        ]])
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute_{chat_id}")]])
         await bot.send_message(chat_id=message.chat.id, text="мут выдан", reply_markup=markup, business_connection_id=conn_id)
 
-
-# --- 3. СПАМ ---
 @dp.business_message(F.text.regexp(r"^\.(\d+)\s+"))
 async def spam_command(message: Message):
-    if message.from_user.id == message.chat.id:
-        return
+    if message.from_user.id == message.chat.id: return
     conn_id = message.business_connection_id
     match = re.match(r"^\.(\d+)\s+(.*)", message.text, re.DOTALL)
-    if not match:
-        return
+    if not match: return
     count = int(match.group(1))
     spam_text = match.group(2)
-    if count > 50:
-        count = 50
-    with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    if count > 50: count = 50
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
     for _ in range(count):
-        with suppress(Exception):
-            await bot.send_message(chat_id=message.chat.id, text=spam_text, business_connection_id=conn_id)
+        with suppress(Exception): await bot.send_message(chat_id=message.chat.id, text=spam_text, business_connection_id=conn_id)
         await asyncio.sleep(0.2)
 
-
-# --- 4. АНИМАЦИИ ---
 @dp.business_message(F.text.lower().startswith(".п1"))
 async def type_animation_p1(message: Message):
-    if message.from_user.id == message.chat.id:
-        return
+    if message.from_user.id == message.chat.id: return
     full_text = message.text[3:].strip()
-    with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
-    if not full_text:
-        return
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text: return
     sent_msg = await bot.send_message(chat_id=message.chat.id, text=full_text[0], business_connection_id=message.business_connection_id)
-    if not sent_msg:
-        return
+    if not sent_msg: return
     current_str = full_text[0]
     for char in full_text[1:]:
         current_str += char
         await asyncio.sleep(0.27)
-        with suppress(Exception):
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
-
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
 
 @dp.business_message(F.text.lower().startswith(".п2"))
 async def type_animation_p2(message: Message):
-    if message.from_user.id == message.chat.id:
-        return
+    if message.from_user.id == message.chat.id: return
     full_text = message.text[3:].strip()
-    with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
-    if not full_text:
-        return
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text: return
     sent_msg = await bot.send_message(chat_id=message.chat.id, text=full_text[0] + "▌", business_connection_id=message.business_connection_id)
-    if not sent_msg:
-        return
+    if not sent_msg: return
     current_str = full_text[0]
     for char in full_text[1:]:
         current_str += char
         await asyncio.sleep(0.27)
-        with suppress(Exception):
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str + "▌", business_connection_id=message.business_connection_id)
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str + "▌", business_connection_id=message.business_connection_id)
     await asyncio.sleep(0.3)
-    with suppress(Exception):
-        await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
-
+    with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
 
 @dp.business_message(F.text.lower().startswith(".п3"))
 async def type_animation_p3(message: Message):
-    if message.from_user.id == message.chat.id:
-        return
+    if message.from_user.id == message.chat.id: return
     full_text = message.text[3:].strip()
-    with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
-    if not full_text:
-        return
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text: return
     alphabet = "abcdefghijklmnopqrstuvwxyzабвгдежзийклмнопрстуфхцчшщъыьэюя0123456789_#@$%"
     sent_msg = await bot.send_message(chat_id=message.chat.id, text="...", business_connection_id=message.business_connection_id)
-    if not sent_msg:
-        return
+    if not sent_msg: return
     for i in range(len(full_text) + 1):
         await asyncio.sleep(0.2)
         correct_part = full_text[:i]
         random_part = "".join(random.choice(alphabet) for _ in range(len(full_text) - i))
-        with suppress(Exception):
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=correct_part + random_part, business_connection_id=message.business_connection_id)
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=correct_part + random_part, business_connection_id=message.business_connection_id)
 
-
-# --- 5. МАТЕМАТИКА С ПРЕФИКСОМ .м (0-3 пробела) ---
-@dp.business_message(F.text.regexp(MATH_PREFIX_PATTERN))
-async def math_prefixed(message: Message):
-    if message.from_user.id == message.chat.id:
-        return
-    m = re.match(MATH_PREFIX_PATTERN, message.text)
-    if not m:
-        return
-    raw = normalize_math_input(m.group(1))
-    parsed = parse_math_expression(raw)
-    if not parsed:
-        return
-    try:
-        result = simple_eval(parsed)
-        if isinstance(result, float) and result.is_integer():
-            result = int(result)
-        await message.reply(f"`{parsed}` = **{result}**", parse_mode="Markdown")
-    except (InvalidExpression, ZeroDivisionError, TypeError, SyntaxError):
-        await message.reply("⚠️ Не могу вычислить это выражение.")
-    except Exception:
-        pass
-
-
-# --- 6. АВТО-МАТЕМАТИКА (без префикса, 0-3 пробела между токенами) ---
 @dp.business_message(F.text.regexp(AUTO_MATH_PATTERN))
 async def auto_math(message: Message):
-    if message.from_user.id == message.chat.id:
-        return
-    # не срабатываем на сообщения, начинающиеся с точки (команды)
-    if message.text.lstrip().startswith("."):
-        return
+    if message.from_user.id == message.chat.id: return
+    if message.text.lstrip().startswith("."): return
     raw = normalize_math_input(message.text)
     parsed = parse_math_expression(raw)
-    if not parsed:
-        return
+    if not parsed: return
     try:
         result = simple_eval(parsed)
-        if isinstance(result, float) and result.is_integer():
-            result = int(result)
-        await message.reply(f"`{parsed}` = **{result}**", parse_mode="Markdown")
-    except (InvalidExpression, ZeroDivisionError, TypeError, SyntaxError):
-        pass
-    except Exception:
-        pass
+        if isinstance(result, float) and result.is_integer(): result = int(result)
+    except (InvalidExpression, ZeroDivisionError, TypeError, SyntaxError): return
+    except Exception: return
+    formatted = format_math_expression(parsed)
+    final_text = f"{formatted} = {result}"
+    conn_id = message.business_connection_id
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    with suppress(Exception): await bot.send_message(chat_id=message.chat.id, text=final_text, business_connection_id=conn_id)
 
-
-# --- 7. АВТО-КУРС ("5 баксов", "1000 рублей", 0-3 пробела) ---
 @dp.business_message(F.text.regexp(AUTO_CURRENCY_PATTERN))
 async def auto_currency(message: Message):
-    if message.from_user.id == message.chat.id:
-        return
-    if message.text.lstrip().startswith("."):
-        return
+    if message.from_user.id == message.chat.id: return
+    if message.text.lstrip().startswith("."): return
     m = re.match(AUTO_CURRENCY_PATTERN, message.text)
-    if not m:
-        return
+    if not m: return
     amount = float(m.group(1).replace(",", "."))
     tail = m.group(2).lower()
     code = CURRENCY_ALIASES.get(tail)
-    if not code:
-        return
+    if not code: return
     await send_currency_conversion(message, amount, code)
 
-
-# --- 8. FALLBACK (AFK + сохранение истории) ---
 @dp.business_message()
 async def handle_messages(message: Message):
     chat_id = message.chat.id
@@ -902,7 +642,6 @@ async def handle_messages(message: Message):
     if message.from_user.id != chat_id:
         await ensure_connection(conn_id, message.from_user.id, message.from_user.first_name)
         return
-
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if owner_data:
         owner_id = owner_data["user_id"]
@@ -919,79 +658,57 @@ async def handle_messages(message: Message):
             last_sent = afk_cooldowns.get((owner_id, chat_id), 0)
             if now - last_sent > 300:
                 afk_text = owner_settings.get("afk_text", "Владелец сейчас занят и ответит позже. 💤")
-                with suppress(Exception):
-                    await bot.send_message(chat_id=chat_id, text=afk_text, business_connection_id=conn_id)
+                with suppress(Exception): await bot.send_message(chat_id=chat_id, text=afk_text, business_connection_id=conn_id)
                 afk_cooldowns[(owner_id, chat_id)] = now
 
     mute_key = f"{conn_id}_{chat_id}"
     if mute_key in muted_chats:
-        with suppress(Exception):
-            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+        with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
         return
 
     with suppress(Exception):
         await messages_collection.insert_one({
-            "business_connection_id": conn_id,
-            "message_id": message.message_id,
-            "chat_id": chat_id,
-            "user_id": message.from_user.id,
-            "username": message.from_user.username or "нет_юзернейма",
-            "first_name": message.from_user.first_name or "Без имени",
-            "text": message.text or message.caption or "[Без текста]",
+            "business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id,
+            "user_id": message.from_user.id, "username": message.from_user.username or "нет_юзернейма",
+            "first_name": message.from_user.first_name or "Без имени", "text": message.text or message.caption or "[Без текста]",
             "created_at": datetime.now(timezone.utc)
         })
-
 
 @dp.edited_business_message()
 async def catch_edits(message: Message):
     chat_id = message.chat.id
     conn_id = message.business_connection_id
-    if message.from_user.id != chat_id:
-        return
+    if message.from_user.id != chat_id: return
     new_text = message.text or message.caption or "[Без текста]"
     old_msg = None
-    with suppress(Exception):
-        old_msg = await messages_collection.find_one({"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id})
+    with suppress(Exception): old_msg = await messages_collection.find_one({"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id})
     old_text = old_msg['text'] if old_msg else "[Не успел сохранить]"
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
-    if not owner_data:
-        return
+    if not owner_data: return
     safe_name = html.escape(message.from_user.first_name)
     safe_old = html.escape(old_text)
     safe_new = html.escape(new_text)
     owner_id = owner_data["user_id"]
     log_text = f"✏️ <b>Изменение от {safe_name}</b>\n<b>Было:</b> {safe_old}\n<b>Стало:</b> {safe_new}"
-    with suppress(Exception):
-        await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
-    with suppress(Exception):
-        await history_collection.insert_one({"owner_id": owner_id, "text": log_text, "ts": datetime.now(timezone.utc)})
-    with suppress(Exception):
-        await messages_collection.update_one(
-            {"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id},
-            {"$set": {"text": new_text}}
-        )
-
+    with suppress(Exception): await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
+    with suppress(Exception): await history_collection.insert_one({"owner_id": owner_id, "text": log_text, "ts": datetime.now(timezone.utc)})
+    with suppress(Exception): await messages_collection.update_one({"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id}, {"$set": {"text": new_text}})
 
 @dp.deleted_business_messages()
 async def catch_deletions(deleted: BusinessMessagesDeleted):
     conn_id = deleted.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
-    if not owner_data:
-        return
+    if not owner_data: return
     owner_id = owner_data["user_id"]
     for msg_id in deleted.message_ids:
         old_msg = None
-        with suppress(Exception):
-            old_msg = await messages_collection.find_one({"business_connection_id": conn_id, "message_id": msg_id, "chat_id": deleted.chat.id})
+        with suppress(Exception): old_msg = await messages_collection.find_one({"business_connection_id": conn_id, "message_id": msg_id, "chat_id": deleted.chat.id})
         if old_msg:
             safe_name = html.escape(old_msg.get('first_name', 'Неизвестно'))
             safe_text = html.escape(old_msg['text'])
             log_text = f"🗑 <b>Удаление от {safe_name}</b>\n💬 Текст: {safe_text}"
-            with suppress(Exception):
-                await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
-            with suppress(Exception):
-                await history_collection.insert_one({"owner_id": owner_id, "text": log_text, "ts": datetime.now(timezone.utc)})
-
+            with suppress(Exception): await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
+            with suppress(Exception): await history_collection.insert_one({"owner_id": owner_id, "text": log_text, "ts": datetime.now(timezone.utc)})
 
 @dp.callback_query(F.data.startswith("unmute_"))
 async def unmute_user(call: CallbackQuery):
@@ -999,24 +716,19 @@ async def unmute_user(call: CallbackQuery):
     conn_id = call.message.business_connection_id
     mute_key = f"{conn_id}_{chat_id}"
     if call.from_user.id == chat_id and call.from_user.id != SUPERADMIN_ID:
-        with suppress(TelegramBadRequest):
-            await call.answer("вы не можете снять мут", show_alert=True)
+        with suppress(TelegramBadRequest): await call.answer("вы не можете снять мут", show_alert=True)
         return
     if mute_key in muted_chats or call.from_user.id == SUPERADMIN_ID:
-        if mute_key in muted_chats:
-            muted_chats.remove(mute_key)
+        if mute_key in muted_chats: muted_chats.remove(mute_key)
         with suppress(TelegramBadRequest):
             await call.message.edit_text("мут снят")
             await call.answer("снял")
     else:
-        with suppress(TelegramBadRequest):
-            await call.message.edit_text("уже снял")
-
+        with suppress(TelegramBadRequest): await call.message.edit_text("уже снял")
 
 async def main():
     await start_web_server()
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
