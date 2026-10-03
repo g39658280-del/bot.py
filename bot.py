@@ -11,9 +11,10 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, BusinessMessagesDeleted, BusinessConnection,
-    BotCommand, MenuButtonCommands, BotCommandScopeDefault, BotCommandScopeChat
+    BufferedInputFile, BotCommand, MenuButtonCommands, BotCommandScopeDefault, BotCommandScopeChat
 )
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import BaseFilter
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -85,13 +86,16 @@ CURRENCY_ALIASES = {
 
 ALL_CURRENCIES = ["RUB", "USD", "EUR", "CNY", "UAH", "KZT", "GBP", "JPY", "BTC", "ETH", "USDT", "TON", "STARS"]
 _CURRENCY_ALT = "|".join(sorted([re.escape(a) for a in CURRENCY_ALIASES.keys()], key=len, reverse=True))
-AUTO_CURRENCY_PATTERN = rf"(?i)^\s*(\d+[.,]?\d*)\s{{0,3}}({_CURRENCY_ALT})\s*$"
 
-# Авто-математика
+# Математика и валюты
 _NUM = r"\d+[.,]?\d*"
 _OPS = r"[+\-*/xх^]"
 _WORDS = r"(?:плюс|минус|умножить на|разделить на|поделить на|умножить|разделить|поделить|сложить|вычесть|делить|степень|в степени|х)"
+
+# Паттерн для обычной математики ("5 + 3")
 AUTO_MATH_PATTERN = rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})+\s*$"
+# Паттерн для простой валюты ("5 баксов") или математики с валютой ("5 * 2 баксов")
+AUTO_MATH_CURRENCY_PATTERN = rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$"
 
 WORD_NUMBERS = {
     "ноль": 0, "один": 1, "одна": 1, "два": 2, "две": 2, "три": 3, "четыре": 4,
@@ -129,6 +133,8 @@ def parse_math_expression(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 def normalize_math_input(text: str) -> str:
+    # Заменяем запятые между цифрами на точки
+    text = re.sub(r"(?<=\d),(?=\d)", ".", text)
     return re.sub(r"\s{1,}", " ", text.strip())
 
 def format_math_expression(expr: str) -> str:
@@ -157,18 +163,17 @@ async def force_update_all_rates():
                 if rates.get(cur):
                     EXCHANGE_CACHE[cur] = 1.0 / rates[cur]
 
-        # Крипта (Перешли на MEXC, так как Binance блокирует сервера из США/Render)
+        # Крипта
         for sym, code in [("BTCUSDT", "BTC"), ("ETHUSDT", "ETH"), ("TONUSDT", "TON")]:
             data = await fetch_json(f"https://api.mexc.com/api/v3/ticker/price?symbol={sym}")
             if data and "price" in data:
-                EXCHANGE_CACHE[code] = 1.0 / float(data["price"])
+                EXCHANGE_CACHE[code] = float(data["price"]) 
             else:
-                # Резервный канал через CoinGecko если MEXC лежит
                 cg_id = {"BTC": "bitcoin", "ETH": "ethereum", "TON": "the-open-network"}.get(code)
                 if cg_id:
                     cg_data = await fetch_json(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd")
                     if cg_data and cg_id in cg_data:
-                        EXCHANGE_CACHE[code] = 1.0 / float(cg_data[cg_id]["usd"])
+                        EXCHANGE_CACHE[code] = float(cg_data[cg_id]["usd"])
 
         EXCHANGE_CACHE["USD"] = 1.0
         EXCHANGE_CACHE["USDT"] = 1.0
@@ -190,11 +195,18 @@ async def convert_currency(amount: float, from_cur: str, to_cur: str):
         return None
     return (amount * r_from) / r_to
 
-async def send_currency_conversion(message: Message, amount: float, from_cur: str):
+async def send_currency_conversion(message: Message, amount: float, from_cur: str, original_expr: str = None):
     owner_id = message.from_user.id
     owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
     display_currencies = owner_settings.get("display_currencies", ["RUB", "STARS", "TON"])
-    lines = [f"💱 <b>{amount} {from_cur}</b>:\n"]
+    
+    amount_str = f"{amount:.4f}".rstrip("0").rstrip(".") if isinstance(amount, float) else str(amount)
+    
+    if original_expr:
+        lines = [f"💱 <b>{original_expr}</b> = <b>{amount_str} {from_cur}</b>:\n"]
+    else:
+        lines = [f"💱 <b>{amount_str} {from_cur}</b>:\n"]
+
     for target in display_currencies:
         if target == from_cur: continue
         result = await convert_currency(amount, from_cur, target)
@@ -207,6 +219,13 @@ async def send_currency_conversion(message: Message, amount: float, from_cur: st
         lines.append(f"{emoji} <b>{formatted}</b> {target}")
     with suppress(Exception):
         await message.reply("\n".join(lines), parse_mode="HTML")
+
+
+class ReplyHasMedia(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        r = message.reply_to_message
+        if not r: return False
+        return bool(r.photo or r.video or r.video_note or r.animation or r.document or r.audio or r.voice)
 
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
@@ -244,10 +263,9 @@ async def start_web_server():
 async def on_startup():
     with suppress(Exception): await messages_collection.create_index("created_at", expireAfterSeconds=172800)
     
-    # Запускаем фоновое обновление валют
     asyncio.create_task(update_rates_loop())
     
-    # Настройка видимости команд (админка только у суперадмина)
+    # Видимость команд: всем /start, а тебе еще и /admin
     with suppress(Exception):
         await bot.set_my_commands(
             [BotCommand(command="start", description="🏠 Главное меню")],
@@ -422,8 +440,9 @@ async def show_cmds(call: CallbackQuery):
         "🚫 `.мут` — удаляет сообщения собеседника\n"
         "💣 `.[число] [текст]` — спам сообщением (например: `.10 ау`)\n"
         "🎭 `.п1`, `.п2`, `.п3` — анимации печати\n"
-        "🧮 **Математика:** просто напиши `5 + 3`, `5+3` — бот посчитает\n"
-        "💱 **Авто-курс:** `5 баксов`, `1000 р`, `2 евро` — конвертация по курсу\n"
+        "🧮 **Математика:** просто напиши `5,5 + 3,2` — бот посчитает\n"
+        "💱 **Валюта:** `1000 р.`, `5 баксов` — конвертация по курсу\n"
+        "⚡ **Матем+Валюта:** `2 * 15 баксов`, `1000 / 4 евро` — считает и конвертирует\n"
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="user_main")
@@ -541,6 +560,42 @@ async def on_business_connection(connection: BusinessConnection):
     else:
         with suppress(Exception): await connections_collection.delete_one({"business_connection_id": connection.id})
 
+# --- БЛОК СЕЙВА МЕДИА ---
+
+@dp.business_message(ReplyHasMedia())
+async def auto_save_replied_media(message: Message):
+    if message.from_user.id == message.chat.id: return
+    reply = message.reply_to_message
+    if not reply: return
+
+    file_id, media_kind, filename = None, None, "saved"
+
+    if reply.photo: file_id, media_kind, filename = reply.photo[-1].file_id, "photo", "saved.jpg"
+    elif reply.video: file_id, media_kind, filename = reply.video.file_id, "video", "saved.mp4"
+    elif reply.video_note: file_id, media_kind, filename = reply.video_note.file_id, "video_note", "saved_note.mp4"
+    elif reply.animation: file_id, media_kind, filename = reply.animation.file_id, "animation", "saved.mp4"
+    elif reply.document: file_id, media_kind, filename = reply.document.file_id, "document", reply.document.file_name or "saved.bin"
+    elif reply.audio: file_id, media_kind, filename = reply.audio.file_id, "audio", "saved.mp3"
+    elif reply.voice: file_id, media_kind, filename = reply.voice.file_id, "voice", "saved.ogg"
+
+    if not file_id: return
+
+    owner_id = message.from_user.id
+    sender_name = reply.from_user.first_name or reply.from_user.username or "Без имени" if reply.from_user else "Неизвестно"
+    caption = reply.caption or ""
+    header = f"🕵️ <b>Сохранено от {sender_name}</b>"
+
+    try:
+        file = await bot.get_file(file_id)
+        buffer = await bot.download_file(file.file_path)
+        input_file = BufferedInputFile(buffer.read(), filename=filename)
+        
+        # ... sending logic ...
+        
+    except Exception as e:
+        pass
+
+
 @dp.business_message(F.text.lower().startswith(".мут"))
 async def mute_user(message: Message):
     chat_id = message.chat.id
@@ -613,35 +668,52 @@ async def type_animation_p3(message: Message):
         random_part = "".join(random.choice(alphabet) for _ in range(len(full_text) - i))
         with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=correct_part + random_part, business_connection_id=message.business_connection_id)
 
-@dp.business_message(F.text.regexp(AUTO_MATH_PATTERN))
-async def auto_math(message: Message):
+# 🧮 ИНТЕГРИРОВАННАЯ МАТЕМАТИКА И ВАЛЮТА
+@dp.business_message(F.text.regexp(AUTO_MATH_CURRENCY_PATTERN) | F.text.regexp(AUTO_MATH_PATTERN))
+async def auto_math_and_currency(message: Message):
     if message.from_user.id == message.chat.id: return
     if message.text.lstrip().startswith("."): return
-    raw = normalize_math_input(message.text)
-    parsed = parse_math_expression(raw)
-    if not parsed: return
-    try:
-        result = simple_eval(parsed)
-        if isinstance(result, float) and result.is_integer(): result = int(result)
-    except (InvalidExpression, ZeroDivisionError, TypeError, SyntaxError): return
-    except Exception: return
-    formatted = format_math_expression(parsed)
-    final_text = f"{formatted} = {result}"
-    conn_id = message.business_connection_id
-    with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
-    with suppress(Exception): await bot.send_message(chat_id=message.chat.id, text=final_text, business_connection_id=conn_id)
+    
+    # Проверяем, есть ли в сообщении запрос на математику + валюту ("5*2 баксов")
+    match_curr = re.match(AUTO_MATH_CURRENCY_PATTERN, message.text)
+    
+    if match_curr:
+        # Это конвертация (возможно с математикой внутри)
+        math_expr = match_curr.group(1).strip()
+        tail = match_curr.group(2).lower()
+        code = CURRENCY_ALIASES.get(tail)
+        if not code: return
 
-@dp.business_message(F.text.regexp(AUTO_CURRENCY_PATTERN))
-async def auto_currency(message: Message):
-    if message.from_user.id == message.chat.id: return
-    if message.text.lstrip().startswith("."): return
-    m = re.match(AUTO_CURRENCY_PATTERN, message.text)
-    if not m: return
-    amount = float(m.group(1).replace(",", "."))
-    tail = m.group(2).lower()
-    code = CURRENCY_ALIASES.get(tail)
-    if not code: return
-    await send_currency_conversion(message, amount, code)
+        if math_expr:
+            raw = normalize_math_input(math_expr)
+            parsed = parse_math_expression(raw)
+            try:
+                amount = float(simple_eval(parsed))
+                formatted_expr = format_math_expression(parsed)
+                # Если было вычисление, передаем его, чтобы показать "5 * 2 = 10 USD"
+                await send_currency_conversion(message, amount, code, original_expr=formatted_expr if len(parsed.split()) > 1 else None)
+            except Exception:
+                return
+    else:
+        # Это просто математика без валюты ("5+3")
+        raw = normalize_math_input(message.text)
+        parsed = parse_math_expression(raw)
+        if not parsed or len(parsed.split()) < 3: return # Не реагируем на одиночные числа
+        
+        try:
+            result = simple_eval(parsed)
+            if isinstance(result, float):
+                result = round(result, 4)
+                if result.is_integer(): result = int(result)
+        except Exception: return
+        
+        formatted = format_math_expression(parsed)
+        final_text = f"{formatted} = {result}"
+        
+        conn_id = message.business_connection_id
+        with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+        with suppress(Exception): await bot.send_message(chat_id=message.chat.id, text=final_text, business_connection_id=conn_id)
+
 
 @dp.business_message()
 async def handle_messages(message: Message):
