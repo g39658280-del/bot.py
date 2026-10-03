@@ -391,6 +391,59 @@ async def type_animation_p1(message: Message):
         await asyncio.sleep(0.27)
         with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
 
+@dp.business_message(F.text.lower().startswith(".п2"))
+async def type_animation_p2(message: Message):
+    if message.from_user.id == message.chat.id: return
+    full_text = message.text[3:].strip()
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text: return
+    sent_msg = await bot.send_message(chat_id=message.chat.id, text=full_text[0] + "▌", business_connection_id=message.business_connection_id)
+    if not sent_msg: return
+    current_str = full_text[0]
+    for char in full_text[1:]:
+        current_str += char
+        await asyncio.sleep(0.27)
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str + "▌", business_connection_id=message.business_connection_id)
+    await asyncio.sleep(0.3)
+    with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
+
+@dp.business_message(F.text.lower().startswith(".п3"))
+async def type_animation_p3(message: Message):
+    if message.from_user.id == message.chat.id: return
+    full_text = message.text[3:].strip()
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text: return
+    alphabet = "abcdefghijklmnopqrstuvwxyzабвгдежзийклмнопрстуфхцчшщъыьэюя0123456789_#@$%"
+    sent_msg = await bot.send_message(chat_id=message.chat.id, text="...", business_connection_id=message.business_connection_id)
+    if not sent_msg: return
+    for i in range(len(full_text) + 1):
+        await asyncio.sleep(0.2)
+        correct_part = full_text[:i]
+        random_part = "".join(random.choice(alphabet) for _ in range(len(full_text) - i))
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=correct_part + random_part, business_connection_id=message.business_connection_id)
+
+@dp.business_message(F.text.lower() == "привет")
+async def anim_privet(message: Message):
+    if message.from_user.id == message.chat.id: return
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    frames = ["Привет 👋", "Привет 🖐️", "Привет 👋", "Привет 🖐️", "Привет 👋✨", "Привет"]
+    sent_msg = await bot.send_message(chat_id=message.chat.id, text=frames[0], business_connection_id=message.business_connection_id)
+    if not sent_msg: return
+    for frame in frames[1:]:
+        await asyncio.sleep(0.4)
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=message.business_connection_id)
+
+@dp.business_message(F.text.lower() == "ку")
+async def anim_ku(message: Message):
+    if message.from_user.id == message.chat.id: return
+    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    frames = ["Ку 👋", "Ку 🖐️", "Ку 👋", "Ку 🖐️", "Ку 👋✨", "Ку"]
+    sent_msg = await bot.send_message(chat_id=message.chat.id, text=frames[0], business_connection_id=message.business_connection_id)
+    if not sent_msg: return
+    for frame in frames[1:]:
+        await asyncio.sleep(0.4)
+        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=message.business_connection_id)
+
 # --- ПЕРЕХВАТ И РАСШИФРОВКА ГОЛОСОВЫХ ЧЕРЕЗ HUGGING FACE ---
 @dp.business_message(F.voice)
 async def handle_voice(message: Message):
@@ -418,7 +471,6 @@ async def handle_voice(message: Message):
                     await bot.download_file(file_info.file_path, voice_io)
                     voice_data = voice_io.getvalue()
                     
-                    # Используем более надежную модель и добавляем заголовок Content-Type
                     api_url = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
                     headers = {
                         "Authorization": f"Bearer {hf_token}",
@@ -426,7 +478,7 @@ async def handle_voice(message: Message):
                     }
                     
                     async with aiohttp.ClientSession() as session:
-                        for i in range(4): # Делаем 4 попытки, если модель еще загружается
+                        for i in range(4):
                             async with session.post(api_url, headers=headers, data=voice_data) as resp:
                                 if resp.status == 200:
                                     data = await resp.json()
