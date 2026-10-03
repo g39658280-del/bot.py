@@ -2,10 +2,8 @@ import os
 import asyncio
 import random
 import html
-import io
-import json
+import re
 from datetime import datetime, timezone
-import aiohttp
 from aiohttp import web
 from contextlib import suppress
 from aiogram import Bot, Dispatcher, F
@@ -16,7 +14,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# Токен берется из настроек Render.
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8855259798:AAEw-jiTxWh2k0n9WjjbG7tPX64S4g5WUXU")
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:xgHbZ5HMU2XDj6KZ@cluster0.6q3omrb.mongodb.net/?appName=Cluster0")
 SUPERADMIN_ID = 6548121776
@@ -212,7 +209,7 @@ async def save_afk_time(message: Message, state: FSMContext):
             await message.answer("✅ Время сохранено!", reply_markup=kb)
             await state.clear()
         else:
-            await message.answer("⚠️ Ошибка: часы должны быть от 0 до 23. Попробуй еще раз:")
+            await message.answer("⚠️️ Ошибка: часы должны быть от 0 до 23. Попробуй еще раз:")
     except:
         await message.answer("⚠️ Неверный формат. Напиши просто две цифры, например: `23 7`")
 
@@ -221,8 +218,9 @@ async def show_cmds(call: CallbackQuery):
     text = (
         "📖 **Список команд (писать в чатах):**\n\n"
         "🚫 `.мут` — удаляет сообщения собеседника\n"
+        "💣 `.[число] [текст]` — спам сообщением (например: `.10 ау`)\n"
         "🎭 `.п1`, `.п2`, `.п3` — анимации печати\n"
-        "👋 `привет`, `ку` — анимация приветствия"
+        "🕵️ **Авто-сейв медиа** — просто свайпни влево одноразовое фото/видео/кружок и отправь **любой текст** (или эмодзи). Бот сам поймает медиа и перешлёт его тебе в личку.\n"
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="user_main")
@@ -349,6 +347,29 @@ async def on_business_connection(connection: BusinessConnection):
     else:
         with suppress(Exception): await connections_collection.delete_one({"business_connection_id": connection.id})
 
+# --- КОМАНДА ДЛЯ СПАМА ---
+@dp.business_message(F.text.regexp(r"^\.(\d+)\s+"))
+async def spam_command(message: Message):
+    if message.from_user.id == message.chat.id: return
+    conn_id = message.business_connection_id
+    
+    match = re.match(r"^\.(\d+)\s+(.*)", message.text, re.DOTALL)
+    if not match: return
+    
+    count = int(match.group(1))
+    spam_text = match.group(2)
+    
+    # Ограничение в 50 сообщений, чтобы не улететь в бан от Телеграма
+    if count > 50: count = 50 
+    
+    with suppress(Exception): 
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    
+    for _ in range(count):
+        with suppress(Exception):
+            await bot.send_message(chat_id=message.chat.id, text=spam_text, business_connection_id=conn_id)
+        await asyncio.sleep(0.2) # Обязательная пауза против блокировок
+
 @dp.business_message(F.text.lower().startswith(".мут"))
 async def mute_user(message: Message):
     chat_id = message.chat.id
@@ -361,21 +382,6 @@ async def mute_user(message: Message):
         muted_chats.add(mute_key)
         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute_{chat_id}")]])
         await bot.send_message(chat_id=message.chat.id, text="мут выдан", reply_markup=markup, business_connection_id=conn_id)
-
-@dp.business_message(F.text.lower().startswith(".дроч"))
-async def anim_droch(message: Message):
-    if message.from_user.id == message.chat.id: return
-    conn_id = message.business_connection_id
-    with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
-    frames = ["8==✊===D", "8==✊===D", "8===✊==D", "8====✊=D", "8==✊===D", "8===✊==D", "8==✊===D", "8===✊==D", "8====✊=D", "8==✊===D", "8===✊==D", "8==✊===D", "8===✊==D", "8====✊=D", "8=====D💦", "8===✊==D", "8==✊===D", "8======D💦"]
-    sent_msg = None
-    with suppress(Exception): sent_msg = await bot.send_message(chat_id=message.chat.id, text=frames[0], business_connection_id=conn_id)
-    if not sent_msg: return
-    for frame in frames[1:]:
-        await asyncio.sleep(0.2)
-        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=conn_id)
-    await asyncio.sleep(3.0)
-    with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[sent_msg.message_id])
 
 @dp.business_message(F.text.lower().startswith(".п1"))
 async def type_animation_p1(message: Message):
@@ -422,89 +428,95 @@ async def type_animation_p3(message: Message):
         random_part = "".join(random.choice(alphabet) for _ in range(len(full_text) - i))
         with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=correct_part + random_part, business_connection_id=message.business_connection_id)
 
-@dp.business_message(F.text.lower() == "привет")
-async def anim_privet(message: Message):
-    if message.from_user.id == message.chat.id: return
-    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
-    frames = ["Привет 👋", "Привет 🖐️", "Привет 👋", "Привет 🖐️", "Привет 👋✨", "Привет"]
-    sent_msg = await bot.send_message(chat_id=message.chat.id, text=frames[0], business_connection_id=message.business_connection_id)
-    if not sent_msg: return
-    for frame in frames[1:]:
-        await asyncio.sleep(0.4)
-        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=message.business_connection_id)
+# ==========================================
+# 🕵️ АВТО-СОХРАНЕНИЕ ОДНОРАЗОВЫХ МЕДИА
+# Срабатывает на ЛЮБОЙ ответ владельца на медиа-сообщение.
+# Никаких команд — просто свайпни и напиши что угодно.
+# ==========================================
+@dp.business_message(F.reply_to_message)
+async def auto_save_replied_media(message: Message):
+    # Сообщения от собеседника (не от владельца) — пропускаем
+    if message.from_user.id == message.chat.id:
+        return
 
-@dp.business_message(F.text.lower() == "ку")
-async def anim_ku(message: Message):
-    if message.from_user.id == message.chat.id: return
-    with suppress(Exception): await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
-    frames = ["Ку 👋", "Ку 🖐️", "Ку 👋", "Ку 🖐️", "Ку 👋✨", "Ку"]
-    sent_msg = await bot.send_message(chat_id=message.chat.id, text=frames[0], business_connection_id=message.business_connection_id)
-    if not sent_msg: return
-    for frame in frames[1:]:
-        await asyncio.sleep(0.4)
-        with suppress(Exception): await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=frame, business_connection_id=message.business_connection_id)
+    reply = message.reply_to_message
+    if not reply:
+        return
 
-# --- ПЕРЕХВАТ И РАСШИФРОВКА ГОЛОСОВЫХ ЧЕРЕЗ HUGGING FACE ---
-@dp.business_message(F.voice)
-async def handle_voice(message: Message):
-    chat_id = message.chat.id
-    conn_id = message.business_connection_id
-    if message.from_user.id == chat_id:
-        mute_key = f"{conn_id}_{chat_id}"
-        if mute_key in muted_chats:
-            with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
-            return
+    # Определяем медиа и вытаскиваем file_id
+    file_id = None
+    media_kind = None
+    if reply.photo:
+        file_id, media_kind = reply.photo[-1].file_id, "photo"
+    elif reply.video:
+        file_id, media_kind = reply.video.file_id, "video"
+    elif reply.video_note:
+        file_id, media_kind = reply.video_note.file_id, "video_note"
+    elif reply.animation:
+        file_id, media_kind = reply.animation.file_id, "animation"
+    elif reply.document:
+        file_id, media_kind = reply.document.file_id, "document"
+    elif reply.audio:
+        file_id, media_kind = reply.audio.file_id, "audio"
+    elif reply.voice:
+        file_id, media_kind = reply.voice.file_id, "voice"
 
-        owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
-        if owner_data:
-            owner_id = owner_data["user_id"]
-            safe_name = html.escape(message.from_user.first_name)
-            
-            hf_token = os.environ.get("HF_TOKEN")
-            transcribed_text = "<i>[Добавь HF_TOKEN в Render, чтобы включить расшифровку]</i>"
-            
-            if hf_token:
-                try:
-                    file_id = message.voice.file_id
-                    file_info = await bot.get_file(file_id)
-                    voice_io = io.BytesIO()
-                    await bot.download_file(file_info.file_path, voice_io)
-                    voice_data = voice_io.getvalue()
-                    
-                    api_url = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
-                    headers = {
-                        "Authorization": f"Bearer {hf_token}",
-                        "Content-Type": "audio/ogg"
-                    }
-                    
-                    async with aiohttp.ClientSession() as session:
-                        for i in range(4):
-                            async with session.post(api_url, headers=headers, data=voice_data) as resp:
-                                if resp.status == 200:
-                                    data = await resp.json()
-                                    transcribed_text = data.get('text', '').strip()
-                                    break
-                                elif resp.status == 503:
-                                    await asyncio.sleep(5)
-                                else:
-                                    err_msg = await resp.text()
-                                    transcribed_text = f"<i>[Ошибка HF {resp.status}: {html.escape(err_msg)}]</i>"
-                                    break
-                        else:
-                            if "Ошибка HF" not in transcribed_text and "Добавь" not in transcribed_text:
-                                transcribed_text = "<i>[Нейросеть не успела загрузиться, попробуй позже]</i>"
+    # Если в ответе нет медиа — это обычный текст, ничего не делаем
+    if not file_id:
+        return
 
-                except Exception as e:
-                    print(f"Ошибка расшифровки: {e}")
-                    transcribed_text = f"<i>[Системная ошибка: {html.escape(str(e))}]</i>"
-            
-            log_text = f"🎤 <b>Голосовое сообщение от {safe_name}</b>\n\n📝 <b>Текст:</b> {transcribed_text}"
-            
-            with suppress(Exception):
-                await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
+    owner_id = message.from_user.id
+
+    sender_name = "Неизвестно"
+    if reply.from_user:
+        sender_name = reply.from_user.first_name or reply.from_user.username or "Без имени"
+
+    caption = reply.caption or ""
+
+    # Помечаем, что это потенциально одноразовое / spoiler-медиа
+    is_spoiler = bool(getattr(reply, "has_media_spoiler", False))
+    badge = "🔥 одноразовое" if is_spoiler else "📎 медиа из ответа"
+
+    header = f"🕵️ <b>Сохранено от {sender_name}</b>\n<i>{badge}</i>"
+    full_caption = header + (f"\n\n{caption}" if caption else "")
+
+    try:
+        if media_kind == "photo":
+            await bot.send_photo(chat_id=owner_id, photo=file_id, caption=full_caption, parse_mode="HTML")
+        elif media_kind == "video":
+            await bot.send_video(chat_id=owner_id, video=file_id, caption=full_caption, parse_mode="HTML")
+        elif media_kind == "video_note":
+            await bot.send_video_note(chat_id=owner_id, video_note=file_id)
+            await bot.send_message(chat_id=owner_id, text=header, parse_mode="HTML")
+        elif media_kind == "animation":
+            await bot.send_animation(chat_id=owner_id, animation=file_id, caption=full_caption, parse_mode="HTML")
+        elif media_kind == "document":
+            await bot.send_document(chat_id=owner_id, document=file_id, caption=full_caption, parse_mode="HTML")
+        elif media_kind == "audio":
+            await bot.send_audio(chat_id=owner_id, audio=file_id, caption=full_caption, parse_mode="HTML")
+        elif media_kind == "voice":
+            await bot.send_voice(chat_id=owner_id, voice=file_id)
+            await bot.send_message(chat_id=owner_id, text=header, parse_mode="HTML")
+    except Exception as e:
+        with suppress(Exception):
+            await bot.send_message(
+                chat_id=owner_id,
+                text=f"❌ Не удалось сохранить медиа: <code>{e}</code>",
+                parse_mode="HTML"
+            )
+        return
+
+    # Лог для админки
+    log_text = f"🕵️ Авто-сейв медиа от {sender_name} ({media_kind}, {badge})"
+    with suppress(Exception):
+        await history_collection.insert_one({
+            "owner_id": owner_id,
+            "text": log_text,
+            "ts": datetime.now(timezone.utc)
+        })
 
 # --- ПЕРЕХВАТ ТЕКСТОВЫХ И АВТООТВЕТЧИК ---
-@dp.business_message(~F.voice)
+@dp.business_message()
 async def handle_messages(message: Message):
     chat_id = message.chat.id
     conn_id = message.business_connection_id
