@@ -123,12 +123,13 @@ OPERATORS = {
 }
 
 # ==========================================
-# GIFT SATELLITE API
+# GIFT SATELLITE API (НАДЁЖНЫЙ ПАРСИНГ)
 # ==========================================
 
 async def fetch_gift_satellite(endpoint: str, params: dict = None) -> dict | list | None:
-    """Запрос к Gift Satellite API."""
+    """Запрос к Gift Satellite API с обработкой ошибок."""
     if not GIFT_SATELLITE_TOKEN:
+        print("⚠️ GiftSatellite: токен не задан")
         return None
 
     headers = {"Authorization": f"Token {GIFT_SATELLITE_TOKEN}"}
@@ -141,46 +142,100 @@ async def fetch_gift_satellite(endpoint: str, params: dict = None) -> dict | lis
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 200:
-                    return await resp.json()
+                    data = await resp.json()
+                    return data
                 elif resp.status == 401:
                     print(f"❌ GiftSatellite: неверный токен")
+                elif resp.status == 404:
+                    print(f"⚠️ GiftSatellite: {endpoint} не найден (404)")
                 elif resp.status == 429:
-                    print(f"⚠️ GiftSatellite: rate limit")
+                    print(f"⚠️ GiftSatellite: rate limit (429)")
                 else:
-                    print(f"GiftSatellite {endpoint} → {resp.status}")
+                    text = await resp.text()
+                    print(f"GiftSatellite {endpoint} → {resp.status}: {text[:200]}")
+    except asyncio.TimeoutError:
+        print(f"⏱️ GiftSatellite {endpoint}: timeout")
     except Exception as e:
         print(f"GiftSatellite error: {e}")
     return None
 
 
-async def get_gift_satellite_data(collection_name: str, slug: str = None) -> dict:
+def _extract_price(offer: dict) -> float | None:
+    """Пытается извлечь цену из оффера, конвертируя нанотоны при необходимости."""
+    for key in ("price", "price_ton", "priceTon", "priceInTon", "amount"):
+        val = offer.get(key)
+        if val is not None:
+            try:
+                price = float(val)
+                # Если число очень большое, вероятно, это нанотоны
+                if price > 1_000_000:
+                    price = price / 1e9
+                return price
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def _extract_seller(offer: dict) -> str:
+    """Пытается извлечь имя продавца из оффера."""
+    for key in ("sellerName", "seller", "address", "owner", "username"):
+        val = offer.get(key)
+        if val:
+            s = str(val)
+            # Сокращаем длинные адреса
+            if len(s) > 12 and not s.startswith("@"):
+                return f"{s[:5]}...{s[-4:]}"
+            return s
+    return "?"
+
+
+async def get_gift_satellite_data(collection_name: str) -> dict:
     """Собирает данные о коллекции через Gift Satellite."""
     result = {}
 
     # 1. Данные коллекции: атрибуты и редкость
-    if collection_name:
-        coll_data = await fetch_gift_satellite(f"/gift/collection/{collection_name}")
-        if coll_data:
-            result["collection_rarity"] = {
-                "backdrops": coll_data.get("backdrops", []),
-                "patterns": coll_data.get("patterns", []),
-                "models": coll_data.get("models", []),
-            }
+    coll_data = await fetch_gift_satellite(f"/gift/collection/{collection_name}")
+    if coll_data:
+        result["collection_rarity"] = {
+            "backdrops": coll_data.get("backdrops", []),
+            "patterns": coll_data.get("patterns", []),
+            "models": coll_data.get("models", []),
+        }
+        print(f"✅ GiftSatellite: коллекция {collection_name} найдена")
+    else:
+        print(f"❌ GiftSatellite: коллекция {collection_name} не найдена")
 
-    # 2. Данные конкретного подарка по slug
-    if slug:
-        slug_data = await fetch_gift_satellite(f"/gift/by-slug/{slug}")
-        if slug_data:
-            result["gift_details"] = slug_data
+    # 2. Актуальные офферы на коллекцию (роут 2.7.1)
+    offers_data = await fetch_gift_satellite(
+        "/history/collection-offers",
+        params={"collection": collection_name}
+    )
+    if offers_data:
+        # API может вернуть как список, так и объект с ключом offers/items
+        if isinstance(offers_data, list):
+            result["collection_offers"] = offers_data
+        elif isinstance(offers_data, dict):
+            result["collection_offers"] = (
+                offers_data.get("offers") or
+                offers_data.get("items") or
+                offers_data.get("data") or
+                []
+            )
+        print(f"✅ GiftSatellite: офферы для {collection_name} получены")
+    else:
+        print(f"⚠️ GiftSatellite: офферы для {collection_name} недоступны")
 
-    # 3. Актуальные офферы на коллекцию (роут 2.7.1)
-    if collection_name:
-        offers = await fetch_gift_satellite(
-            "/history/collection-offers",
-            params={"collection": collection_name}
-        )
-        if offers:
-            result["collection_offers"] = offers
+    # 3. История покупок по коллекции (из /user/purchases)
+    purchases = await fetch_gift_satellite(
+        "/user/purchases",
+        params={"collectionName": collection_name, "limit": 10}
+    )
+    if purchases:
+        if isinstance(purchases, dict):
+            result["user_purchases"] = purchases.get("purchases") or purchases.get("items") or []
+        elif isinstance(purchases, list):
+            result["user_purchases"] = purchases
+        print(f"✅ GiftSatellite: история покупок для {collection_name} получена")
 
     return result
 
@@ -199,8 +254,9 @@ async def get_gift_info(text: str) -> dict:
         return {}
 
     raw = tg_match.group(1)
-    name = raw.replace("-", " ")
-    name_clean = re.sub(r"\s+\d+$", "", name).strip()
+    # Название коллекции: "SnoopCigar-25211" -> "SnoopCigar"
+    collection_name = raw.rsplit("-", 1)[0]
+    name_clean = collection_name.replace("-", " ").strip()
 
     try:
         info = gift_parser.get_gift(name_clean)
@@ -255,14 +311,18 @@ def format_gift_card(info: dict) -> str:
     model_r = backdrop_r = pattern_r = None
 
     if rarity:
+        # Модель
         for m in rarity.get("models", []):
             if m.get("name") == model:
+                # rarityPermille -> проценты (‰ / 10)
                 model_r = m.get("rarityPermille", 0) / 10.0
                 break
+        # Фон
         for b in rarity.get("backdrops", []):
             if b.get("name") == backdrop:
                 backdrop_r = b.get("rarityPermille", 0) / 10.0
                 break
+        # Узор
         for p in rarity.get("patterns", []):
             if p.get("name") == pattern:
                 pattern_r = p.get("rarityPermille", 0) / 10.0
@@ -280,24 +340,32 @@ def format_gift_card(info: dict) -> str:
     # Офферы из Gift Satellite
     offers = info.get("collection_offers", [])
     if offers:
-        lines.append("\n<b>Актуальные офферы (Portals):</b>")
+        lines.append("\n<b>Актуальные офферы:</b>")
         lines.append("<blockquote>")
+        valid = 0
         for offer in offers[:5]:
-            price = offer.get("price_ton") or offer.get("price", 0)
-            seller = offer.get("seller", "?")
-            lines.append(f"🔘 {price:.2f} TON — {seller}")
+            price = _extract_price(offer)
+            seller = _extract_seller(offer)
+            if price is not None and price > 0:
+                lines.append(f"🔘 {price:.2f} TON — {seller}")
+                valid += 1
+        if valid == 0:
+            lines.append("<i>Нет активных предложений</i>")
         lines.append("</blockquote>")
+    else:
+        lines.append("\n<i>Офферы временно недоступны</i>")
 
-    # История продаж из Gift Satellite (покупки)
+    # История покупок из Gift Satellite
     purchases = info.get("user_purchases", [])
     if purchases:
         lines.append("\n<b>История продаж модели:</b>")
         lines.append("<blockquote>")
         for p in purchases[:10]:
-            item_slug = p.get("slug", "?")
+            slug = p.get("slug", "?")
             price = p.get("price", 0)
             date = p.get("timestamp", "")[:10] if p.get("timestamp") else "?"
-            lines.append(f"🔘 {item_slug}: {price:.2f} TON — {date}")
+            if price:
+                lines.append(f"🔘 {slug}: {price:.2f} TON — {date}")
         lines.append("</blockquote>")
     else:
         lines.append("\n<i>История продаж недоступна</i>")
@@ -522,7 +590,7 @@ async def on_startup():
     with suppress(Exception):
         me = await fetch_gift_satellite("/user/me")
         if me:
-            print(f"✅ Gift Satellite: {me.get('username')} (уровень {me.get('level')})")
+            print(f"✅ Gift Satellite: {me.get('username')} (уровень {me.get('level')}, баланс {me.get('tonBalance')} TON)")
         else:
             print("⚠️ Gift Satellite: токен не работает или сервис недоступен")
 
@@ -927,7 +995,7 @@ async def spam_command(message: Message):
 # ==========================================
 # АВТО-ПАРСЕР ПОДАРКОВ С GIFT SATELLITE
 # ==========================================
-NFT_LINK_PATTERN = r"(t\.me/nft/[a-zA-Z0-9_-]+|getgems\.io/collection/[\w-]+/[\w-]+|[EU]Q[a-zA-Z0-9_-]{46})"
+NFT_LINK_PATTERN = r"(t\.me/nft/[a-zA-Z0-9_-]+)"
 
 
 @dp.business_message(F.text.regexp(NFT_LINK_PATTERN))
@@ -949,22 +1017,18 @@ async def process_gift_link_auto(message: Message):
     # 1. Базовые данные из TelegramGifts
     tg_info = await get_gift_info(message.text) or {}
 
-    # 2. Извлекаем collection name и slug из ссылки
+    # 2. Извлекаем название коллекции из ссылки
     collection_name = None
-    slug = None
-
     tg_match = re.search(r"t\.me/nft/([a-zA-Z0-9_-]+)", message.text)
     if tg_match:
         raw = tg_match.group(1)
-        name = raw.replace("-", " ")
-        collection_name = re.sub(r"\s+\d+$", "", name).strip()
-        # Формируем slug: "LootBag-10251"
-        parts = raw.rsplit("-", 1)
-        if len(parts) == 2:
-            slug = f"{parts[0]}-{parts[1]}"
+        # "SnoopCigar-25211" -> "SnoopCigar"
+        collection_name = raw.rsplit("-", 1)[0]
 
     # 3. Данные из Gift Satellite
-    gs_data = await get_gift_satellite_data(collection_name, slug) if collection_name else {}
+    gs_data = {}
+    if collection_name:
+        gs_data = await get_gift_satellite_data(collection_name)
 
     # 4. Мержим всё вместе
     combined = {**tg_info, **gs_data}
