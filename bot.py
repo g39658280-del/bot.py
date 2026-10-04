@@ -22,7 +22,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from simpleeval import simple_eval
-from TelegramGifts import TelegramGifts
 
 # ==========================================
 # КОНФИГ И БД
@@ -59,7 +58,6 @@ afk_cooldowns = {}
 # ==========================================
 EXCHANGE_CACHE = {}
 STARS_USD_RATE = 0.015
-gift_parser: TelegramGifts | None = None
 
 CURRENCY_ALIASES = {
     "usd": "USD", "доллар": "USD", "доллары": "USD", "долларов": "USD", "доллара": "USD",
@@ -123,298 +121,169 @@ OPERATORS = {
 }
 
 # ==========================================
-# GIFT SATELLITE API (НАДЁЖНЫЙ ПАРСИНГ)
+# GIFT SATELLITE API (v3 - ПРОВЕРЕНО)
 # ==========================================
 
-async def fetch_gift_satellite(endpoint: str, params: dict = None) -> dict | list | None:
-    """Запрос к Gift Satellite API с обработкой ошибок."""
+async def fetch_gift_satellite(endpoint: str, params: dict = None, retry: int = 2) -> dict | list | None:
+    """Запрос к Gift Satellite API с retry при 429."""
     if not GIFT_SATELLITE_TOKEN:
-        print("⚠️ GiftSatellite: токен не задан")
         return None
 
     headers = {"Authorization": f"Token {GIFT_SATELLITE_TOKEN}"}
     url = f"{GIFT_SATELLITE_BASE}{endpoint}"
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, headers=headers, params=params,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data
-                elif resp.status == 401:
-                    print(f"❌ GiftSatellite: неверный токен")
-                elif resp.status == 404:
-                    print(f"⚠️ GiftSatellite: {endpoint} не найден (404)")
-                elif resp.status == 429:
-                    print(f"⚠️ GiftSatellite: rate limit (429)")
-                else:
-                    text = await resp.text()
-                    print(f"GiftSatellite {endpoint} → {resp.status}: {text[:200]}")
-    except asyncio.TimeoutError:
-        print(f"⏱️ GiftSatellite {endpoint}: timeout")
-    except Exception as e:
-        print(f"GiftSatellite error: {e}")
-    return None
-
-
-def _extract_price(offer: dict) -> float | None:
-    """Пытается извлечь цену из оффера, конвертируя нанотоны при необходимости."""
-    for key in ("price", "price_ton", "priceTon", "priceInTon", "amount"):
-        val = offer.get(key)
-        if val is not None:
-            try:
-                price = float(val)
-                # Если число очень большое, вероятно, это нанотоны
-                if price > 1_000_000:
-                    price = price / 1e9
-                return price
-            except (ValueError, TypeError):
+    for attempt in range(retry + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers=headers, params=params,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 429:
+                        if attempt < retry:
+                            await asyncio.sleep(1.5)
+                            continue
+                        print(f"⚠️ GiftSatellite {endpoint}: rate limit")
+                    elif resp.status == 404:
+                        return None  # тихо, чтобы не спамить
+                    elif resp.status == 400:
+                        print(f"⚠️ GiftSatellite {endpoint}: 400 Bad Request")
+                        return None
+                    else:
+                        print(f"GiftSatellite {endpoint} → {resp.status}")
+                        return None
+        except Exception as e:
+            print(f"GiftSatellite error: {e}")
+            if attempt < retry:
+                await asyncio.sleep(1.0)
                 continue
     return None
 
 
-def _extract_seller(offer: dict) -> str:
-    """Пытается извлечь имя продавца из оффера."""
-    for key in ("sellerName", "seller", "address", "owner", "username"):
-        val = offer.get(key)
-        if val:
-            s = str(val)
-            # Сокращаем длинные адреса
-            if len(s) > 12 and not s.startswith("@"):
-                return f"{s[:5]}...{s[-4:]}"
-            return s
-    return "?"
+async def get_gift_card_data(slug: str) -> dict:
+    """
+    Собирает полную карточку подарка:
+    1. by-slug — узнаём коллекцию, модель, фон, символ
+    2. search/tg — все офферы этой коллекции, фильтруем по модели
+    """
+    result = {"slug": slug}
 
+    # 1. Метаданные подарка
+    gift_info = await fetch_gift_satellite(f"/gift/by-slug/{slug}")
+    if not gift_info:
+        return result
 
-async def get_gift_satellite_data(collection_name: str) -> dict:
-    """Собирает данные о коллекции через Gift Satellite."""
-    result = {}
+    result["collection_name"] = gift_info.get("collectionName", "")
+    result["model"] = gift_info.get("modelName", "")
+    result["backdrop"] = gift_info.get("backdropName", "")
+    result["symbol"] = gift_info.get("symbolName", "")
+    result["number"] = gift_info.get("number")
 
-    # 1. Данные коллекции: атрибуты и редкость
-    coll_data = await fetch_gift_satellite(f"/gift/collection/{collection_name}")
-    if coll_data:
-        result["collection_rarity"] = {
-            "backdrops": coll_data.get("backdrops", []),
-            "patterns": coll_data.get("patterns", []),
-            "models": coll_data.get("models", []),
-        }
-        print(f"✅ GiftSatellite: коллекция {collection_name} найдена")
-    else:
-        print(f"❌ GiftSatellite: коллекция {collection_name} не найдена")
+    collection = result["collection_name"]
+    if not collection:
+        return result
 
-    # 2. Актуальные офферы на коллекцию (роут 2.7.1)
-    offers_data = await fetch_gift_satellite(
-        "/history/collection-offers",
-        params={"collection": collection_name}
-    )
-    if offers_data:
-        # API может вернуть как список, так и объект с ключом offers/items
-        if isinstance(offers_data, list):
-            result["collection_offers"] = offers_data
-        elif isinstance(offers_data, dict):
-            result["collection_offers"] = (
-                offers_data.get("offers") or
-                offers_data.get("items") or
-                offers_data.get("data") or
-                []
-            )
-        print(f"✅ GiftSatellite: офферы для {collection_name} получены")
-    else:
-        print(f"⚠️ GiftSatellite: офферы для {collection_name} недоступны")
+    # 2. Офферы коллекции через /search/tg/
+    await asyncio.sleep(0.3)  # rate limit
+    offers = await fetch_gift_satellite(f"/search/tg/{collection}")
+    if not offers or not isinstance(offers, list):
+        return result
 
-    # 3. История покупок по коллекции (из /user/purchases)
-    purchases = await fetch_gift_satellite(
-        "/user/purchases",
-        params={"collectionName": collection_name, "limit": 10}
-    )
-    if purchases:
-        if isinstance(purchases, dict):
-            result["user_purchases"] = purchases.get("purchases") or purchases.get("items") or []
-        elif isinstance(purchases, list):
-            result["user_purchases"] = purchases
-        print(f"✅ GiftSatellite: история покупок для {collection_name} получена")
+    result["all_offers"] = offers
+
+    # Фильтруем по модели
+    model = result["model"]
+    same_model = [o for o in offers if o.get("modelName") == model]
+    result["model_offers"] = same_model
+
+    # Floor — минимальная цена этой модели
+    if same_model:
+        prices = [o.get("normalizedPrice", 0) for o in same_model if o.get("normalizedPrice")]
+        if prices:
+            result["floor_ton"] = min(prices)
+            result["avg_ton"] = sum(prices) / len(prices)
+
+    # Офферы по всей коллекции (для общей картины)
+    all_prices = [o.get("normalizedPrice", 0) for o in offers if o.get("normalizedPrice")]
+    if all_prices:
+        result["collection_floor_ton"] = min(all_prices)
 
     return result
 
 
-# ==========================================
-# TELEGRAM GIFTS
-# ==========================================
+def format_gift_card(data: dict) -> str:
+    """Формирует карточку подарка из данных Gift Satellite."""
+    if not data or "collection_name" not in data:
+        return "❌ Подарок не найден в базе Gift Satellite."
 
-async def get_gift_info(text: str) -> dict:
-    """Извлекает данные о подарке через TelegramGifts."""
-    if not gift_parser:
-        return {}
+    collection = data.get("collection_name", "Подарок")
+    number = data.get("number", "?")
+    model = data.get("model", "")
+    backdrop = data.get("backdrop", "")
+    symbol = data.get("symbol", "")
 
-    tg_match = re.search(r"t\.me/nft/([a-zA-Z0-9_-]+)", text)
-    if not tg_match:
-        return {}
+    lines = [f"🎁 <b>{collection} #{number}</b>"]
 
-    raw = tg_match.group(1)
-    # Название коллекции: "SnoopCigar-25211" -> "SnoopCigar"
-    collection_name = raw.rsplit("-", 1)[0]
-    name_clean = collection_name.replace("-", " ").strip()
-
-    try:
-        info = gift_parser.get_gift(name_clean)
-        return info or {}
-    except Exception as e:
-        print(f"Gift lookup error: {e}")
-        return {}
-
-
-def format_gift_card(info: dict) -> str:
-    """Формирует полную карточку подарка со всеми данными."""
-    if not info:
-        return "❌ Не удалось получить данные по этому подарку."
-
-    name = info.get("full_name") or info.get("name") or "Подарок"
-    prices = info.get("prices", {})
-
-    floor_ton = prices.get("tgmrkt_price_ton") or prices.get("floor_price_ton")
-    floor_usd = prices.get("tgmrkt_price_usd") or prices.get("floor_price_usd")
-    avg_ton = prices.get("average_price_ton") or prices.get("avg_price_ton")
-    last_ton = prices.get("last_sale_ton") or prices.get("last_price_ton")
-
-    lines = [f"🎁 <b>{name}</b>"]
-
-    # Атрибуты
-    model = info.get("model")
-    backdrop = info.get("backdrop")
-    pattern = info.get("pattern")
     attrs = []
     if model:
         attrs.append(f"Модель: <b>{model}</b>")
     if backdrop:
         attrs.append(f"Фон: <b>{backdrop}</b>")
-    if pattern:
-        attrs.append(f"Узор: <b>{pattern}</b>")
+    if symbol:
+        attrs.append(f"Символ: <b>{symbol}</b>")
     if attrs:
         lines.append(" · ".join(attrs))
 
     lines.append("")
 
-    # Цены
+    # Floor и AVG по модели
+    floor_ton = data.get("floor_ton")
+    avg_ton = data.get("avg_ton")
     if floor_ton is not None:
-        usd_part = f" ≈ {floor_usd:.2f} $" if floor_usd else ""
-        lines.append(f"<b>Floor:</b> {floor_ton:.2f} TON{usd_part}")
+        lines.append(f"<b>Floor (модель «{model}»):</b> {floor_ton:.2f} TON")
     if avg_ton is not None:
-        lines.append(f"<b>AVG (30д):</b> {avg_ton:.2f} TON")
-    if last_ton is not None:
-        lines.append(f"<b>Последняя продажа:</b> {last_ton:.2f} TON")
+        lines.append(f"<b>AVG (модель):</b> {avg_ton:.2f} TON")
 
-    # Редкость из Gift Satellite
-    rarity = info.get("collection_rarity", {})
-    model_r = backdrop_r = pattern_r = None
+    coll_floor = data.get("collection_floor_ton")
+    if coll_floor is not None and coll_floor != floor_ton:
+        lines.append(f"<b>Floor (коллекция):</b> {coll_floor:.2f} TON")
 
-    if rarity:
-        # Модель
-        for m in rarity.get("models", []):
-            if m.get("name") == model:
-                # rarityPermille -> проценты (‰ / 10)
-                model_r = m.get("rarityPermille", 0) / 10.0
-                break
-        # Фон
-        for b in rarity.get("backdrops", []):
-            if b.get("name") == backdrop:
-                backdrop_r = b.get("rarityPermille", 0) / 10.0
-                break
-        # Узор
-        for p in rarity.get("patterns", []):
-            if p.get("name") == pattern:
-                pattern_r = p.get("rarityPermille", 0) / 10.0
-                break
-
-    if any(x is not None for x in [model_r, backdrop_r, pattern_r]):
-        lines.append("\n<b>Редкость:</b>")
-        if model_r is not None:
-            lines.append(f"▸ Модель: {model_r:.1f}%")
-        if backdrop_r is not None:
-            lines.append(f"▸ Фон: {backdrop_r:.1f}%")
-        if pattern_r is not None:
-            lines.append(f"▸ Узор: {pattern_r:.1f}%")
-
-    # Офферы из Gift Satellite
-    offers = info.get("collection_offers", [])
-    if offers:
-        lines.append("\n<b>Актуальные офферы:</b>")
+    # Топ-5 дешёвых офферов этой модели
+    model_offers = data.get("model_offers", [])
+    if model_offers:
+        sorted_offers = sorted(model_offers, key=lambda x: x.get("normalizedPrice", 999999))
+        lines.append(f"\n<b>Дешёвые офферы «{model}» на TG Market:</b>")
         lines.append("<blockquote>")
-        valid = 0
-        for offer in offers[:5]:
-            price = _extract_price(offer)
-            seller = _extract_seller(offer)
-            if price is not None and price > 0:
-                lines.append(f"🔘 {price:.2f} TON — {seller}")
-                valid += 1
-        if valid == 0:
-            lines.append("<i>Нет активных предложений</i>")
+        seen = set()
+        count = 0
+        for off in sorted_offers:
+            price = off.get("normalizedPrice")
+            slug = off.get("slug", "?")
+            if not price or price in seen:
+                continue
+            seen.add(price)
+            lines.append(f"🔘 <a href=\"https://t.me/nft/{slug}\">#{slug}</a> — {price:.2f} TON")
+            count += 1
+            if count >= 5:
+                break
         lines.append("</blockquote>")
     else:
-        lines.append("\n<i>Офферы временно недоступны</i>")
+        lines.append(f"\n<i>Офферов на модель «{model}» сейчас нет</i>")
 
-    # История покупок из Gift Satellite
-    purchases = info.get("user_purchases", [])
-    if purchases:
-        lines.append("\n<b>История продаж модели:</b>")
-        lines.append("<blockquote>")
-        for p in purchases[:10]:
-            slug = p.get("slug", "?")
-            price = p.get("price", 0)
-            date = p.get("timestamp", "")[:10] if p.get("timestamp") else "?"
-            if price:
-                lines.append(f"🔘 {slug}: {price:.2f} TON — {date}")
-        lines.append("</blockquote>")
-    else:
-        lines.append("\n<i>История продаж недоступна</i>")
+    # Общая статистика по коллекции
+    all_offers = data.get("all_offers", [])
+    if all_offers:
+        lines.append(f"\n<i>Всего офферов коллекции на TG Market: {len(all_offers)}</i>")
 
-    supply = info.get("supply")
-    if supply:
-        lines.append(f"\n<b>Выпуск:</b> {supply}")
-
-    emoji_id = info.get("custom_emoji_id")
-    if emoji_id:
-        lines.append(f"<i>Custom Emoji ID:</i> <code>{emoji_id}</code>")
-
-    lines.append("\n<i>Источник: Fragment / GetGems / TGMrkt / Gift Satellite</i>")
+    lines.append("\n<i>Источник: Gift Satellite API (TG Market)</i>")
     return "\n".join(lines)
 
 
 # ==========================================
-# ОСНОВНАЯ ЛОГИКА
+# ОБНОВЛЕНИЕ КУРСОВ И МАТЕМАТИКА
 # ==========================================
-def parse_math_expression(text: str) -> str:
-    text = text.lower().strip()
-    for word, op in sorted(OPERATORS.items(), key=lambda x: -len(x[0])):
-        text = re.sub(rf"(?<!\w){re.escape(word)}(?!\w)", f" {op} ", text)
-
-    words = text.split()
-    result = []
-    for word in words:
-        clean = word.strip(".,!?;:")
-        if clean in WORD_NUMBERS:
-            result.append(str(WORD_NUMBERS[clean]))
-        else:
-            result.append(word)
-
-    text = " ".join(result)
-    text = re.sub(r"[^\d+\-*/().\s]", "", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def normalize_math_input(text: str) -> str:
-    text = re.sub(r"(?<=\d),(?=\d)", ".", text)
-    return re.sub(r"\s{1,}", " ", text.strip())
-
-
-def format_math_expression(expr: str) -> str:
-    expr = re.sub(r"\s+", " ", expr).strip()
-    expr = re.sub(r"\s*(\*\*|[+\-*/])\s*", r" \1 ", expr)
-    return re.sub(r"\s+", " ", expr).strip()
-
-
 async def fetch_json(url: str):
     try:
         async with aiohttp.ClientSession() as session:
@@ -442,9 +311,7 @@ async def force_update_all_rates():
             else:
                 cg_id = {"BTC": "bitcoin", "ETH": "ethereum", "TON": "the-open-network"}.get(code)
                 if cg_id:
-                    cg_data = await fetch_json(
-                        f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd"
-                    )
+                    cg_data = await fetch_json(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd")
                     if cg_data and cg_id in cg_data:
                         EXCHANGE_CACHE[code] = float(cg_data[cg_id]["usd"])
 
@@ -459,6 +326,34 @@ async def update_rates_loop():
     while True:
         await force_update_all_rates()
         await asyncio.sleep(300)
+
+
+def parse_math_expression(text: str) -> str:
+    text = text.lower().strip()
+    for word, op in sorted(OPERATORS.items(), key=lambda x: -len(x[0])):
+        text = re.sub(rf"(?<!\w){re.escape(word)}(?!\w)", f" {op} ", text)
+    words = text.split()
+    result = []
+    for word in words:
+        clean = word.strip(".,!?;:")
+        if clean in WORD_NUMBERS:
+            result.append(str(WORD_NUMBERS[clean]))
+        else:
+            result.append(word)
+    text = " ".join(result)
+    text = re.sub(r"[^\d+\-*/().\s]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_math_input(text: str) -> str:
+    text = re.sub(r"(?<=\d),(?=\d)", ".", text)
+    return re.sub(r"\s{1,}", " ", text.strip())
+
+
+def format_math_expression(expr: str) -> str:
+    expr = re.sub(r"\s+", " ", expr).strip()
+    expr = re.sub(r"\s*(\*\*|[+\-*/])\s*", r" \1 ", expr)
+    return re.sub(r"\s+", " ", expr).strip()
 
 
 async def convert_currency(amount: float, from_cur: str, to_cur: str):
@@ -509,8 +404,7 @@ class ReplyHasMedia(BaseFilter):
         r = message.reply_to_message
         if not r:
             return False
-        return bool(r.photo or r.video or r.video_note or r.animation or
-                    r.document or r.audio or r.voice)
+        return bool(r.photo or r.video or r.video_note or r.animation or r.document or r.audio or r.voice)
 
 
 class AdminStates(StatesGroup):
@@ -530,8 +424,7 @@ async def ensure_connection(conn_id: str, user_id: int, first_name: str):
     with suppress(Exception):
         await connections_collection.update_one(
             {"business_connection_id": conn_id},
-            {"$set": {"business_connection_id": conn_id, "user_id": user_id,
-                      "first_name": first_name or "Без имени"}},
+            {"$set": {"business_connection_id": conn_id, "user_id": user_id, "first_name": first_name or "Без имени"}},
             upsert=True
         )
 
@@ -545,7 +438,7 @@ def check_auto_afk(start_h: int, end_h: int) -> bool:
 
 
 # ==========================================
-# ВЕБ-СЕРВЕР
+# ВЕБ-СЕРВЕР И STARTUP
 # ==========================================
 _web_runner: web.AppRunner | None = None
 
@@ -558,54 +451,35 @@ async def start_web_server() -> web.AppRunner:
     global _web_runner
     app = web.Application()
     app.router.add_get("/", dummy_handler)
-
     runner = web.AppRunner(app)
     await runner.setup()
-
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-
     _web_runner = runner
     print(f"✅ Веб-сервер запущен на порту {port}")
     return runner
 
 
-# ==========================================
-# STARTUP
-# ==========================================
 async def on_startup():
-    global gift_parser
-
     with suppress(Exception):
         await messages_collection.create_index("created_at", expireAfterSeconds=172800)
-
     asyncio.create_task(update_rates_loop())
-
-    with suppress(Exception):
-        gift_parser = TelegramGifts(ttl_seconds=300)
-        print("✅ TelegramGifts инициализирован (авто-обновление каждые 5 минут)")
 
     # Проверка токена Gift Satellite
     with suppress(Exception):
         me = await fetch_gift_satellite("/user/me")
         if me:
-            print(f"✅ Gift Satellite: {me.get('username')} (уровень {me.get('level')}, баланс {me.get('tonBalance')} TON)")
+            print(f"✅ Gift Satellite: {me.get('username')} (уровень {me.get('level')}, баланс {me.get('tonBalance', 0)} TON)")
         else:
-            print("⚠️ Gift Satellite: токен не работает или сервис недоступен")
+            print("⚠️ Gift Satellite: токен не работает")
 
     with suppress(Exception):
-        await bot.set_my_commands(
-            [BotCommand(command="start", description="🏠 Главное меню")],
-            scope=BotCommandScopeDefault()
-        )
-        await bot.set_my_commands(
-            [
-                BotCommand(command="start", description="🏠 Главное меню"),
-                BotCommand(command="admin", description="👑 Админ-панель")
-            ],
-            scope=BotCommandScopeChat(chat_id=SUPERADMIN_ID)
-        )
+        await bot.set_my_commands([BotCommand(command="start", description="🏠 Главное меню")], scope=BotCommandScopeDefault())
+        await bot.set_my_commands([
+            BotCommand(command="start", description="🏠 Главное меню"),
+            BotCommand(command="admin", description="👑 Админ-панель")
+        ], scope=BotCommandScopeChat(chat_id=SUPERADMIN_ID))
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
@@ -646,16 +520,9 @@ async def get_afk_settings_kb(user_id: int):
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     with suppress(Exception):
-        await users_collection.update_one(
-            {"user_id": message.from_user.id},
-            {"$set": {"user_id": message.from_user.id}},
-            upsert=True
-        )
+        await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"user_id": message.from_user.id}}, upsert=True)
     kb = await get_user_main_kb(message.from_user.id)
-    await message.answer(
-        "👋 **Твой личный бот-секретарь.**\nУправляй статусом и настройками ниже:",
-        reply_markup=kb, parse_mode="Markdown"
-    )
+    await message.answer("👋 **Твой личный бот-секретарь.**\nУправляй статусом и настройками ниже:", reply_markup=kb, parse_mode="Markdown")
 
 
 @dp.callback_query(F.data == "user_main")
@@ -669,7 +536,6 @@ async def user_main_handler(call: CallbackQuery, state: FSMContext):
 async def user_mutes_handler(call: CallbackQuery):
     user_conns = await connections_collection.find({"user_id": call.from_user.id}).to_list(length=None)
     conn_ids = [c["business_connection_id"] for c in user_conns]
-
     builder = InlineKeyboardBuilder()
     has_mutes = False
     for mute in list(muted_chats):
@@ -680,20 +546,12 @@ async def user_mutes_handler(call: CallbackQuery):
                 builder.button(text=f"Снять мут: {chat}", callback_data=f"u_unmute_{mute}")
         except Exception:
             continue
-
     builder.button(text="🔙 Назад", callback_data="user_main")
     builder.adjust(1)
-
     if not has_mutes:
-        await call.message.edit_text(
-            "У тебя сейчас нет активных мутов.",
-            reply_markup=builder.as_markup(), parse_mode="Markdown"
-        )
+        await call.message.edit_text("У тебя сейчас нет активных мутов.", reply_markup=builder.as_markup(), parse_mode="Markdown")
     else:
-        await call.message.edit_text(
-            "🔇 **Твои активные муты:**\nНажми на кнопку, чтобы снять мут с собеседника.",
-            reply_markup=builder.as_markup(), parse_mode="Markdown"
-        )
+        await call.message.edit_text("🔇 **Твои активные муты:**\nНажми на кнопку, чтобы снять мут с собеседника.", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 
 @dp.callback_query(F.data.startswith("u_unmute_"))
@@ -711,11 +569,7 @@ async def user_unmute_callback(call: CallbackQuery):
 async def toggle_afk_handler(call: CallbackQuery):
     user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
     new_status = not user_data.get("is_afk", False)
-    await users_collection.update_one(
-        {"user_id": call.from_user.id},
-        {"$set": {"is_afk": new_status}},
-        upsert=True
-    )
+    await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"is_afk": new_status}}, upsert=True)
     kb = await get_user_main_kb(call.from_user.id)
     await call.message.edit_text("🏠 **Главное меню:**", reply_markup=kb, parse_mode="Markdown")
 
@@ -730,11 +584,7 @@ async def afk_settings_handler(call: CallbackQuery):
 async def toggle_auto_afk(call: CallbackQuery):
     user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
     new_status = not user_data.get("auto_afk", False)
-    await users_collection.update_one(
-        {"user_id": call.from_user.id},
-        {"$set": {"auto_afk": new_status}},
-        upsert=True
-    )
+    await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"auto_afk": new_status}}, upsert=True)
     kb = await get_afk_settings_kb(call.from_user.id)
     await call.message.edit_text("⚙️ **Настройки автоответчика:**", reply_markup=kb, parse_mode="Markdown")
 
@@ -745,19 +595,13 @@ async def afk_set_text(call: CallbackQuery, state: FSMContext):
     current = user_data.get("afk_text", "Владелец занят. 💤")
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Отмена", callback_data="afk_settings")
-    await call.message.edit_text(
-        f"Текущий текст:\n_{current}_\n\nОтправь новый текст автоответчика:",
-        reply_markup=builder.as_markup(), parse_mode="Markdown"
-    )
+    await call.message.edit_text(f"Текущий текст:\n_{current}_\n\nОтправь новый текст автоответчика:", reply_markup=builder.as_markup(), parse_mode="Markdown")
     await state.set_state(UserStates.waiting_for_afk_text)
 
 
 @dp.message(UserStates.waiting_for_afk_text)
 async def save_afk_text(message: Message, state: FSMContext):
-    await users_collection.update_one(
-        {"user_id": message.from_user.id},
-        {"$set": {"afk_text": message.text}}
-    )
+    await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"afk_text": message.text}})
     kb = await get_afk_settings_kb(message.from_user.id)
     await message.answer("✅ Текст сохранен!", reply_markup=kb)
     await state.clear()
@@ -767,10 +611,7 @@ async def save_afk_text(message: Message, state: FSMContext):
 async def afk_set_time(call: CallbackQuery, state: FSMContext):
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Отмена", callback_data="afk_settings")
-    await call.message.edit_text(
-        "Отправь время включения и выключения в часах через пробел или дефис.\nПример: `23 7`",
-        reply_markup=builder.as_markup(), parse_mode="Markdown"
-    )
+    await call.message.edit_text("Отправь время включения и выключения в часах через пробел или дефис.\nПример: `23 7` (с 23:00 до 07:00)", reply_markup=builder.as_markup(), parse_mode="Markdown")
     await state.set_state(UserStates.waiting_for_afk_time)
 
 
@@ -780,35 +621,27 @@ async def save_afk_time(message: Message, state: FSMContext):
         parts = message.text.replace("-", " ").split()
         start_h, end_h = int(parts[0]), int(parts[1])
         if 0 <= start_h <= 23 and 0 <= end_h <= 23:
-            await users_collection.update_one(
-                {"user_id": message.from_user.id},
-                {"$set": {"afk_start": start_h, "afk_end": end_h}}
-            )
+            await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"afk_start": start_h, "afk_end": end_h}})
             kb = await get_afk_settings_kb(message.from_user.id)
             await message.answer("✅ Время сохранено!", reply_markup=kb)
             await state.clear()
         else:
             await message.answer("⚠ Ошибка: часы должны быть от 0 до 23.")
-    except Exception:
-        await message.answer("⚠️ Неверный формат. Напиши просто две цифры: `23 7`")
+    except:
+        await message.answer("⚠️ Неверный формат. Напиши просто две цифры, например: `23 7`")
 
 
 @dp.callback_query(F.data == "currency_settings")
 async def currency_settings_handler(call: CallbackQuery):
     owner_settings = await users_collection.find_one({"user_id": call.from_user.id}) or {}
     display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON"])
-
     builder = InlineKeyboardBuilder()
     for cur in ALL_CURRENCIES:
         check = "✅" if cur in display else "⬜"
         builder.button(text=f"{check} {cur}", callback_data=f"cur_toggle_{cur}")
-
     builder.button(text="🔙 Назад", callback_data="user_main")
     builder.adjust(2)
-    await call.message.edit_text(
-        "💱 <b>Выбери валюты для отображения</b>:",
-        reply_markup=builder.as_markup(), parse_mode="HTML"
-    )
+    await call.message.edit_text("💱 <b>Выбери валюты для отображения</b>:", reply_markup=builder.as_markup(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("cur_toggle_"))
@@ -816,17 +649,11 @@ async def currency_toggle_handler(call: CallbackQuery):
     cur = call.data.replace("cur_toggle_", "")
     owner_settings = await users_collection.find_one({"user_id": call.from_user.id}) or {}
     display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON"])
-
     if cur in display:
         display.remove(cur)
     else:
         display.append(cur)
-
-    await users_collection.update_one(
-        {"user_id": call.from_user.id},
-        {"$set": {"display_currencies": display}},
-        upsert=True
-    )
+    await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"display_currencies": display}}, upsert=True)
     await currency_settings_handler(call)
 
 
@@ -837,12 +664,129 @@ async def show_cmds(call: CallbackQuery):
         "🚫 `.мут` — удаляет сообщения собеседника\n"
         "💣 `.[число] [текст]` — спам сообщением\n"
         "🎭 `.п1`, `.п2`, `.п3` — анимации печати\n"
-        "🧮 **Математика/Валюта:** `5+3`, `5 баксов`\n"
+        "🧮 **Математика:** `5,5+3`, `5 баксов`, `10 * 20 рублей`\n"
         "🎁 **Подарки:** бот автоматически ловит ссылки t.me/nft/...\n"
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="user_main")
     await call.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
+
+
+def get_admin_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="👥 Пользователи и Логи", callback_data="admin_users")],
+        [InlineKeyboardButton(text="🔇 Активные муты", callback_data="admin_mutes")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")]
+    ])
+
+
+@dp.message(F.text == "/admin")
+async def cmd_admin(message: Message):
+    if message.from_user.id != SUPERADMIN_ID:
+        return
+    await message.answer("👑 **Панель управления ботом:**", reply_markup=get_admin_main_kb(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "admin_main")
+async def back_to_main_admin(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != SUPERADMIN_ID:
+        return
+    await state.clear()
+    await call.message.edit_text("👑 **Панель управления ботом:**", reply_markup=get_admin_main_kb(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("admin_"))
+async def admin_callbacks(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != SUPERADMIN_ID:
+        return
+    action = call.data.replace("admin_", "")
+    builder = InlineKeyboardBuilder()
+    try:
+        if action == "stats":
+            users_count = await connections_collection.count_documents({})
+            msgs_count = await messages_collection.count_documents({})
+            logs_count = await history_collection.count_documents({})
+            builder.button(text="🔙 Назад", callback_data="admin_main")
+            await call.message.edit_text(f"📊 **Статистика:**\nБизнесов: {users_count}\nСообщений: {msgs_count}\nЛогов: {logs_count}", reply_markup=builder.as_markup(), parse_mode="Markdown")
+        elif action == "mutes":
+            if not muted_chats:
+                builder.button(text="🔙 Назад", callback_data="admin_main")
+                await call.message.edit_text("Активных мутов сейчас нет.", reply_markup=builder.as_markup())
+                return
+            for mute in list(muted_chats):
+                conn, chat = mute.rsplit("_", 1)
+                builder.button(text=f"Снять мут: {chat}", callback_data=f"forceunmute_{mute}")
+            builder.button(text="🔙 Назад", callback_data="admin_main")
+            builder.adjust(1)
+            await call.message.edit_text("🔇 **Активные муты:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
+        elif action == "users":
+            users = await connections_collection.find({}).to_list(length=100)
+            if not users:
+                builder.button(text="🔙 Назад", callback_data="admin_main")
+                await call.message.edit_text("Никого нет.", reply_markup=builder.as_markup())
+                return
+            for u in users:
+                name, uid = u.get('first_name', 'Без имени'), u.get('user_id')
+                builder.button(text=f"👤 {name} ({uid})", callback_data=f"userlog_{uid}")
+            builder.button(text="🔙 Назад", callback_data="admin_main")
+            builder.adjust(1)
+            await call.message.edit_text("👥 **Выбери пользователя:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
+        elif action == "broadcast":
+            builder.button(text="🔙 Отмена", callback_data="admin_main")
+            await call.message.edit_text("Напиши сообщение для рассылки:", reply_markup=builder.as_markup())
+            await state.set_state(AdminStates.waiting_for_broadcast)
+    except Exception as e:
+        print(f"Ошибка в меню админки: {e}")
+    with suppress(Exception):
+        await call.answer()
+
+
+@dp.callback_query(F.data.startswith("userlog_"))
+async def view_user_logs(call: CallbackQuery):
+    if call.from_user.id != SUPERADMIN_ID:
+        return
+    target_id = int(call.data.replace("userlog_", ""))
+    logs = await history_collection.find({"owner_id": target_id}).sort("ts", -1).limit(5).to_list(length=5)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 К списку", callback_data="admin_users")
+    if not logs:
+        await call.message.edit_text("Логов пока нет.", reply_markup=builder.as_markup())
+        return
+    text = f"🗂 **Последние 5 событий (ID `{target_id}`):**\n\n"
+    for log in logs:
+        text += f"▪️ {log['text']}\n〰️〰️〰️〰〰️〰️\n"
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+    await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("forceunmute_"))
+async def force_unmute(call: CallbackQuery):
+    if call.from_user.id != SUPERADMIN_ID:
+        return
+    mute_key = call.data.replace("forceunmute_", "")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 К мутам", callback_data="admin_mutes")
+    if mute_key in muted_chats:
+        muted_chats.remove(mute_key)
+        await call.message.edit_text("✅ Мут снят.", reply_markup=builder.as_markup())
+    else:
+        await call.message.edit_text("Мут уже снят.", reply_markup=builder.as_markup())
+    with suppress(Exception):
+        await call.answer()
+
+
+@dp.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast(message: Message, state: FSMContext):
+    users = await connections_collection.find({}).to_list(length=100)
+    count = 0
+    for u in users:
+        with suppress(Exception):
+            await bot.send_message(u['user_id'], f"📢 **Сообщение от создателя:**\n\n{message.text}", parse_mode="Markdown")
+            count += 1
+    await message.answer(f"✅ Отправлено {count} пользователям.", reply_markup=get_admin_main_kb())
+    await state.clear()
 
 
 # ==========================================
@@ -862,12 +806,8 @@ async def auto_save_replied_media(message: Message):
     """Сохраняет ТОЛЬКО защищённые (предположительно одноразовые) медиа при reply."""
     if message.from_user.id == message.chat.id:
         return
-
     reply = message.reply_to_message
-    if not reply:
-        return
-
-    if not is_protected_media(reply):
+    if not reply or not is_protected_media(reply):
         return
 
     file_id, media_kind, filename = None, None, "saved"
@@ -890,10 +830,7 @@ async def auto_save_replied_media(message: Message):
         return
 
     owner_id = message.from_user.id
-    sender_name = (
-        reply.from_user.first_name or reply.from_user.username or "Без имени"
-        if reply.from_user else "Неизвестно"
-    )
+    sender_name = reply.from_user.first_name or reply.from_user.username or "Без имени" if reply.from_user else "Неизвестно"
     caption = reply.caption or ""
     header = f"🕵️ <b>Сохранено от {sender_name}</b>"
 
@@ -903,27 +840,21 @@ async def auto_save_replied_media(message: Message):
         input_file = BufferedInputFile(buffer.read(), filename=filename)
 
         if media_kind == "photo":
-            await bot.send_photo(chat_id=owner_id, photo=input_file,
-                                 caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
+            await bot.send_photo(chat_id=owner_id, photo=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
         elif media_kind == "video":
-            await bot.send_video(chat_id=owner_id, video=input_file,
-                                 caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
+            await bot.send_video(chat_id=owner_id, video=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
         elif media_kind == "video_note":
             await bot.send_video_note(chat_id=owner_id, video_note=input_file)
             await bot.send_message(chat_id=owner_id, text=header, parse_mode="HTML")
         elif media_kind == "animation":
-            await bot.send_animation(chat_id=owner_id, animation=input_file,
-                                     caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
+            await bot.send_animation(chat_id=owner_id, animation=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
         elif media_kind == "document":
-            await bot.send_document(chat_id=owner_id, document=input_file,
-                                    caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
+            await bot.send_document(chat_id=owner_id, document=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
         elif media_kind == "audio":
-            await bot.send_audio(chat_id=owner_id, audio=input_file,
-                                 caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
+            await bot.send_audio(chat_id=owner_id, audio=input_file, caption=header + (f"\n\n{caption}" if caption else ""), parse_mode="HTML")
         elif media_kind == "voice":
             await bot.send_voice(chat_id=owner_id, voice=input_file)
             await bot.send_message(chat_id=owner_id, text=header, parse_mode="HTML")
-
     except Exception as e:
         with suppress(Exception):
             await bot.send_message(chat_id=owner_id, text=f"❌ Не удалось сохранить: <code>{e}</code>", parse_mode="HTML")
@@ -941,59 +872,100 @@ async def auto_save_replied_media(message: Message):
 async def mute_user(message: Message):
     chat_id = message.chat.id
     conn_id = message.business_connection_id
-
     if message.from_user.id != chat_id:
         await ensure_connection(conn_id, message.from_user.id, message.from_user.first_name)
         with suppress(Exception):
-            await bot.delete_business_messages(
-                business_connection_id=conn_id,
-                message_ids=[message.message_id]
-            )
-
+            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
         mute_key = f"{conn_id}_{chat_id}"
         if mute_key in muted_chats:
             return
-
         muted_chats.add(mute_key)
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Размутить", callback_data=f"unmute_{chat_id}")]
-        ])
-        await bot.send_message(
-            chat_id=message.chat.id,
-            text="мут выдан",
-            reply_markup=markup,
-            business_connection_id=conn_id
-        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute_{chat_id}")]])
+        await bot.send_message(chat_id=message.chat.id, text="мут выдан", reply_markup=markup, business_connection_id=conn_id)
 
 
 @dp.business_message(F.text.regexp(r"^\.(\d+)\s+"))
 async def spam_command(message: Message):
     if message.from_user.id == message.chat.id:
         return
-
     match = re.match(r"^\.(\d+)\s+(.*)", message.text, re.DOTALL)
     if not match:
         return
-
     count = min(int(match.group(1)), 50)
     with suppress(Exception):
-        await bot.delete_business_messages(
-            business_connection_id=message.business_connection_id,
-            message_ids=[message.message_id]
-        )
-
+        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
     for _ in range(count):
         with suppress(Exception):
-            await bot.send_message(
-                chat_id=message.chat.id,
-                text=match.group(2),
-                business_connection_id=message.business_connection_id
-            )
+            await bot.send_message(chat_id=message.chat.id, text=match.group(2), business_connection_id=message.business_connection_id)
         await asyncio.sleep(0.5)
 
 
+@dp.business_message(F.text.lower().startswith(".п1"))
+async def type_animation_p1(message: Message):
+    if message.from_user.id == message.chat.id:
+        return
+    full_text = message.text[3:].strip()
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text:
+        return
+    sent_msg = await bot.send_message(chat_id=message.chat.id, text=full_text[0], business_connection_id=message.business_connection_id)
+    if not sent_msg:
+        return
+    current_str = full_text[0]
+    for char in full_text[1:]:
+        current_str += char
+        await asyncio.sleep(0.27)
+        with suppress(Exception):
+            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
+
+
+@dp.business_message(F.text.lower().startswith(".п2"))
+async def type_animation_p2(message: Message):
+    if message.from_user.id == message.chat.id:
+        return
+    full_text = message.text[3:].strip()
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text:
+        return
+    sent_msg = await bot.send_message(chat_id=message.chat.id, text=full_text[0] + "▌", business_connection_id=message.business_connection_id)
+    if not sent_msg:
+        return
+    current_str = full_text[0]
+    for char in full_text[1:]:
+        current_str += char
+        await asyncio.sleep(0.27)
+        with suppress(Exception):
+            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str + "▌", business_connection_id=message.business_connection_id)
+    await asyncio.sleep(0.3)
+    with suppress(Exception):
+        await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=current_str, business_connection_id=message.business_connection_id)
+
+
+@dp.business_message(F.text.lower().startswith(".п3"))
+async def type_animation_p3(message: Message):
+    if message.from_user.id == message.chat.id:
+        return
+    full_text = message.text[3:].strip()
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+    if not full_text:
+        return
+    alphabet = "abcdefghijklmnopqrstuvwxyzабвгдежзийклмнопрстуфхцчшщъыьэюя0123456789_#@$%"
+    sent_msg = await bot.send_message(chat_id=message.chat.id, text="...", business_connection_id=message.business_connection_id)
+    if not sent_msg:
+        return
+    for i in range(len(full_text) + 1):
+        await asyncio.sleep(0.2)
+        correct_part = full_text[:i]
+        random_part = "".join(random.choice(alphabet) for _ in range(len(full_text) - i))
+        with suppress(Exception):
+            await bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=correct_part + random_part, business_connection_id=message.business_connection_id)
+
+
 # ==========================================
-# АВТО-ПАРСЕР ПОДАРКОВ С GIFT SATELLITE
+# АВТО-ПАРСЕР ПОДАРКОВ
 # ==========================================
 NFT_LINK_PATTERN = r"(t\.me/nft/[a-zA-Z0-9_-]+)"
 
@@ -1002,37 +974,24 @@ NFT_LINK_PATTERN = r"(t\.me/nft/[a-zA-Z0-9_-]+)"
 @dp.message(F.text.regexp(NFT_LINK_PATTERN))
 async def process_gift_link_auto(message: Message):
     conn_id = getattr(message, "business_connection_id", None)
-
     if conn_id and message.from_user.id == message.chat.id:
         return
+
+    tg_match = re.search(r"t\.me/nft/([a-zA-Z0-9_-]+)", message.text)
+    if not tg_match:
+        return
+    slug = tg_match.group(1)
 
     loading_msg = None
     with suppress(Exception):
         loading_msg = await bot.send_message(
             chat_id=message.chat.id,
-            text="🔍 Ищу данные по подарку...",
+            text="🔍 Анализирую подарок...",
             business_connection_id=conn_id
         )
 
-    # 1. Базовые данные из TelegramGifts
-    tg_info = await get_gift_info(message.text) or {}
-
-    # 2. Извлекаем название коллекции из ссылки
-    collection_name = None
-    tg_match = re.search(r"t\.me/nft/([a-zA-Z0-9_-]+)", message.text)
-    if tg_match:
-        raw = tg_match.group(1)
-        # "SnoopCigar-25211" -> "SnoopCigar"
-        collection_name = raw.rsplit("-", 1)[0]
-
-    # 3. Данные из Gift Satellite
-    gs_data = {}
-    if collection_name:
-        gs_data = await get_gift_satellite_data(collection_name)
-
-    # 4. Мержим всё вместе
-    combined = {**tg_info, **gs_data}
-    result_text = format_gift_card(combined)
+    data = await get_gift_card_data(slug)
+    result_text = format_gift_card(data)
 
     if loading_msg:
         with suppress(Exception):
@@ -1046,7 +1005,7 @@ async def process_gift_link_auto(message: Message):
 
 
 # ==========================================
-# ОСТАЛЬНЫЕ ХЭНДЛЕРЫ
+# МАТЕМАТИКА / ВАЛЮТЫ
 # ==========================================
 @dp.business_message(F.text.regexp(AUTO_MATH_CURRENCY_PATTERN) | F.text.regexp(AUTO_MATH_PATTERN))
 async def auto_math_and_currency(message: Message):
@@ -1062,17 +1021,13 @@ async def auto_math_and_currency(message: Message):
         code = CURRENCY_ALIASES.get(tail)
         if not code:
             return
-
         if math_expr:
             raw = normalize_math_input(math_expr)
             parsed = parse_math_expression(raw)
             try:
                 amount = float(simple_eval(parsed))
                 formatted_expr = format_math_expression(parsed)
-                await send_currency_conversion(
-                    message, amount, code,
-                    original_expr=formatted_expr if len(parsed.split()) > 1 else None
-                )
+                await send_currency_conversion(message, amount, code, original_expr=formatted_expr if len(parsed.split()) > 1 else None)
             except Exception:
                 return
     else:
@@ -1080,32 +1035,22 @@ async def auto_math_and_currency(message: Message):
         parsed = parse_math_expression(raw)
         if not parsed or len(parsed.split()) < 3:
             return
-
         try:
             result = simple_eval(parsed)
             if isinstance(result, float):
                 result = int(result) if round(result, 4).is_integer() else round(result, 4)
         except Exception:
             return
-
         formatted = format_math_expression(parsed)
         with suppress(Exception):
-            await bot.delete_business_messages(
-                business_connection_id=message.business_connection_id,
-                message_ids=[message.message_id]
-            )
-            await bot.send_message(
-                chat_id=message.chat.id,
-                text=f"{formatted} = {result}",
-                business_connection_id=message.business_connection_id
-            )
+            await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
+            await bot.send_message(chat_id=message.chat.id, text=f"{formatted} = {result}", business_connection_id=message.business_connection_id)
 
 
 @dp.business_message()
 async def handle_messages(message: Message):
     chat_id = message.chat.id
     conn_id = message.business_connection_id
-
     if message.from_user.id != chat_id:
         await ensure_connection(conn_id, message.from_user.id, message.from_user.first_name)
         return
@@ -1115,31 +1060,20 @@ async def handle_messages(message: Message):
         owner_id = owner_data["user_id"]
         owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
         manual_afk = owner_settings.get("is_afk", False)
-        in_schedule = (
-            check_auto_afk(owner_settings.get("afk_start", 23), owner_settings.get("afk_end", 7))
-            if owner_settings.get("auto_afk", False) else False
-        )
-
+        in_schedule = check_auto_afk(owner_settings.get("afk_start", 23), owner_settings.get("afk_end", 7)) if owner_settings.get("auto_afk", False) else False
         if manual_afk or in_schedule:
             now = datetime.now().timestamp()
             last_sent = afk_cooldowns.get((owner_id, chat_id), 0)
             if now - last_sent > 300:
                 afk_text = owner_settings.get("afk_text", "Владелец сейчас занят и ответит позже. 💤")
                 with suppress(Exception):
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=afk_text,
-                        business_connection_id=conn_id
-                    )
+                    await bot.send_message(chat_id=chat_id, text=afk_text, business_connection_id=conn_id)
                 afk_cooldowns[(owner_id, chat_id)] = now
 
     mute_key = f"{conn_id}_{chat_id}"
     if mute_key in muted_chats:
         with suppress(Exception):
-            await bot.delete_business_messages(
-                business_connection_id=conn_id,
-                message_ids=[message.message_id]
-            )
+            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
         return
 
     with suppress(Exception):
@@ -1155,17 +1089,63 @@ async def handle_messages(message: Message):
         })
 
 
+@dp.edited_business_message()
+async def catch_edits(message: Message):
+    chat_id = message.chat.id
+    conn_id = message.business_connection_id
+    if message.from_user.id != chat_id:
+        return
+    new_text = message.text or message.caption or "[Без текста]"
+    old_msg = None
+    with suppress(Exception):
+        old_msg = await messages_collection.find_one({"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id})
+    old_text = old_msg['text'] if old_msg else "[Не успел сохранить]"
+    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    if not owner_data:
+        return
+    safe_name = html.escape(message.from_user.first_name)
+    safe_old = html.escape(old_text)
+    safe_new = html.escape(new_text)
+    owner_id = owner_data["user_id"]
+    log_text = f"✏️ <b>Изменение от {safe_name}</b>\n<b>Было:</b> {safe_old}\n<b>Стало:</b> {safe_new}"
+    with suppress(Exception):
+        await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
+    with suppress(Exception):
+        await history_collection.insert_one({"owner_id": owner_id, "text": log_text, "ts": datetime.now(timezone.utc)})
+    with suppress(Exception):
+        await messages_collection.update_one({"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": chat_id}, {"$set": {"text": new_text}})
+
+
+@dp.deleted_business_messages()
+async def catch_deletions(deleted: BusinessMessagesDeleted):
+    conn_id = deleted.business_connection_id
+    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    if not owner_data:
+        return
+    owner_id = owner_data["user_id"]
+    for msg_id in deleted.message_ids:
+        old_msg = None
+        with suppress(Exception):
+            old_msg = await messages_collection.find_one({"business_connection_id": conn_id, "message_id": msg_id, "chat_id": deleted.chat.id})
+        if old_msg:
+            safe_name = html.escape(old_msg.get('first_name', 'Неизвестно'))
+            safe_text = html.escape(old_msg['text'])
+            log_text = f"🗑 <b>Удаление от {safe_name}</b>\n💬 Текст: {safe_text}"
+            with suppress(Exception):
+                await bot.send_message(chat_id=owner_id, text=log_text, parse_mode="HTML")
+            with suppress(Exception):
+                await history_collection.insert_one({"owner_id": owner_id, "text": log_text, "ts": datetime.now(timezone.utc)})
+
+
 @dp.callback_query(F.data.startswith("unmute_"))
 async def unmute_user(call: CallbackQuery):
     chat_id = int(call.data.split("_")[1])
     conn_id = call.message.business_connection_id
     mute_key = f"{conn_id}_{chat_id}"
-
     if call.from_user.id == chat_id and call.from_user.id != SUPERADMIN_ID:
         with suppress(TelegramBadRequest):
             await call.answer("вы не можете снять мут", show_alert=True)
         return
-
     if mute_key in muted_chats or call.from_user.id == SUPERADMIN_ID:
         if mute_key in muted_chats:
             muted_chats.remove(mute_key)
