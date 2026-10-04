@@ -31,6 +31,13 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8855259798:AAEw-jiTxWh2k0n9WjjbG7tPX64S
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:xgHbZ5HMU2XDj6KZ@cluster0.6q3omrb.mongodb.net/?appName=Cluster0")
 SUPERADMIN_ID = 6548121776
 
+# Gift Satellite API
+GIFT_SATELLITE_TOKEN = os.environ.get(
+    "GIFT_SATELLITE_TOKEN",
+    "f5fca5357f0721d8f95fed1a3874b60ae097ee7500eb2a2e41cbfc74cc201683"
+)
+GIFT_SATELLITE_BASE = "https://gift-satellite.dev/api"
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -116,11 +123,74 @@ OPERATORS = {
 }
 
 # ==========================================
-# TELEGRAM GIFTS (АВТО-ОБНОВЛЕНИЕ ЧЕРЕЗ TTL)
+# GIFT SATELLITE API
+# ==========================================
+
+async def fetch_gift_satellite(endpoint: str, params: dict = None) -> dict | list | None:
+    """Запрос к Gift Satellite API."""
+    if not GIFT_SATELLITE_TOKEN:
+        return None
+
+    headers = {"Authorization": f"Token {GIFT_SATELLITE_TOKEN}"}
+    url = f"{GIFT_SATELLITE_BASE}{endpoint}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=headers, params=params,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                elif resp.status == 401:
+                    print(f"❌ GiftSatellite: неверный токен")
+                elif resp.status == 429:
+                    print(f"⚠️ GiftSatellite: rate limit")
+                else:
+                    print(f"GiftSatellite {endpoint} → {resp.status}")
+    except Exception as e:
+        print(f"GiftSatellite error: {e}")
+    return None
+
+
+async def get_gift_satellite_data(collection_name: str, slug: str = None) -> dict:
+    """Собирает данные о коллекции через Gift Satellite."""
+    result = {}
+
+    # 1. Данные коллекции: атрибуты и редкость
+    if collection_name:
+        coll_data = await fetch_gift_satellite(f"/gift/collection/{collection_name}")
+        if coll_data:
+            result["collection_rarity"] = {
+                "backdrops": coll_data.get("backdrops", []),
+                "patterns": coll_data.get("patterns", []),
+                "models": coll_data.get("models", []),
+            }
+
+    # 2. Данные конкретного подарка по slug
+    if slug:
+        slug_data = await fetch_gift_satellite(f"/gift/by-slug/{slug}")
+        if slug_data:
+            result["gift_details"] = slug_data
+
+    # 3. Актуальные офферы на коллекцию (роут 2.7.1)
+    if collection_name:
+        offers = await fetch_gift_satellite(
+            "/history/collection-offers",
+            params={"collection": collection_name}
+        )
+        if offers:
+            result["collection_offers"] = offers
+
+    return result
+
+
+# ==========================================
+# TELEGRAM GIFTS
 # ==========================================
 
 async def get_gift_info(text: str) -> dict:
-    """Извлекает данные о подарке Telegram через TelegramGifts (offline, без API-ключа)."""
+    """Извлекает данные о подарке через TelegramGifts."""
     if not gift_parser:
         return {}
 
@@ -141,7 +211,7 @@ async def get_gift_info(text: str) -> dict:
 
 
 def format_gift_card(info: dict) -> str:
-    """Формирует карточку подарка по данным TelegramGifts."""
+    """Формирует полную карточку подарка со всеми данными."""
     if not info:
         return "❌ Не удалось получить данные по этому подарку."
 
@@ -155,11 +225,10 @@ def format_gift_card(info: dict) -> str:
 
     lines = [f"🎁 <b>{name}</b>"]
 
+    # Атрибуты
     model = info.get("model")
     backdrop = info.get("backdrop")
     pattern = info.get("pattern")
-    rarity = info.get("rarity")
-
     attrs = []
     if model:
         attrs.append(f"Модель: <b>{model}</b>")
@@ -167,30 +236,81 @@ def format_gift_card(info: dict) -> str:
         attrs.append(f"Фон: <b>{backdrop}</b>")
     if pattern:
         attrs.append(f"Узор: <b>{pattern}</b>")
-    if rarity:
-        attrs.append(f"Редкость: <b>{rarity}</b>")
     if attrs:
         lines.append(" · ".join(attrs))
 
     lines.append("")
 
+    # Цены
     if floor_ton is not None:
         usd_part = f" ≈ {floor_usd:.2f} $" if floor_usd else ""
         lines.append(f"<b>Floor:</b> {floor_ton:.2f} TON{usd_part}")
     if avg_ton is not None:
-        lines.append(f"<b>AVG:</b> {avg_ton:.2f} TON")
+        lines.append(f"<b>AVG (30д):</b> {avg_ton:.2f} TON")
     if last_ton is not None:
         lines.append(f"<b>Последняя продажа:</b> {last_ton:.2f} TON")
 
+    # Редкость из Gift Satellite
+    rarity = info.get("collection_rarity", {})
+    model_r = backdrop_r = pattern_r = None
+
+    if rarity:
+        for m in rarity.get("models", []):
+            if m.get("name") == model:
+                model_r = m.get("rarityPermille", 0) / 10.0
+                break
+        for b in rarity.get("backdrops", []):
+            if b.get("name") == backdrop:
+                backdrop_r = b.get("rarityPermille", 0) / 10.0
+                break
+        for p in rarity.get("patterns", []):
+            if p.get("name") == pattern:
+                pattern_r = p.get("rarityPermille", 0) / 10.0
+                break
+
+    if any(x is not None for x in [model_r, backdrop_r, pattern_r]):
+        lines.append("\n<b>Редкость:</b>")
+        if model_r is not None:
+            lines.append(f"▸ Модель: {model_r:.1f}%")
+        if backdrop_r is not None:
+            lines.append(f"▸ Фон: {backdrop_r:.1f}%")
+        if pattern_r is not None:
+            lines.append(f"▸ Узор: {pattern_r:.1f}%")
+
+    # Офферы из Gift Satellite
+    offers = info.get("collection_offers", [])
+    if offers:
+        lines.append("\n<b>Актуальные офферы (Portals):</b>")
+        lines.append("<blockquote>")
+        for offer in offers[:5]:
+            price = offer.get("price_ton") or offer.get("price", 0)
+            seller = offer.get("seller", "?")
+            lines.append(f"🔘 {price:.2f} TON — {seller}")
+        lines.append("</blockquote>")
+
+    # История продаж из Gift Satellite (покупки)
+    purchases = info.get("user_purchases", [])
+    if purchases:
+        lines.append("\n<b>История продаж модели:</b>")
+        lines.append("<blockquote>")
+        for p in purchases[:10]:
+            item_slug = p.get("slug", "?")
+            price = p.get("price", 0)
+            date = p.get("timestamp", "")[:10] if p.get("timestamp") else "?"
+            lines.append(f"🔘 {item_slug}: {price:.2f} TON — {date}")
+        lines.append("</blockquote>")
+    else:
+        lines.append("\n<i>История продаж недоступна</i>")
+
     supply = info.get("supply")
     if supply:
-        lines.append(f"<b>Выпуск:</b> {supply}")
+        lines.append(f"\n<b>Выпуск:</b> {supply}")
 
     emoji_id = info.get("custom_emoji_id")
     if emoji_id:
-        lines.append(f"\n<i>Custom Emoji ID:</i> <code>{emoji_id}</code>")
+        lines.append(f"<i>Custom Emoji ID:</i> <code>{emoji_id}</code>")
 
-    lines.append("\n<i>Источник: Fragment / GetGems / TGMrkt</i>")
+    lines.append("\n<i>Источник: Fragment / GetGems / TGMrkt / Gift Satellite</i>")
     return "\n".join(lines)
 
 
@@ -335,7 +455,6 @@ class UserStates(StatesGroup):
 
 
 def is_protected_media(message: Message) -> bool:
-    """Эвристика: защищённый контент часто = view-once / одноразовое."""
     return bool(getattr(message, "has_protected_content", False))
 
 
@@ -398,6 +517,14 @@ async def on_startup():
     with suppress(Exception):
         gift_parser = TelegramGifts(ttl_seconds=300)
         print("✅ TelegramGifts инициализирован (авто-обновление каждые 5 минут)")
+
+    # Проверка токена Gift Satellite
+    with suppress(Exception):
+        me = await fetch_gift_satellite("/user/me")
+        if me:
+            print(f"✅ Gift Satellite: {me.get('username')} (уровень {me.get('level')})")
+        else:
+            print("⚠️ Gift Satellite: токен не работает или сервис недоступен")
 
     with suppress(Exception):
         await bot.set_my_commands(
@@ -798,7 +925,7 @@ async def spam_command(message: Message):
 
 
 # ==========================================
-# АВТО-ПАРСЕР ПОДАРКОВ
+# АВТО-ПАРСЕР ПОДАРКОВ С GIFT SATELLITE
 # ==========================================
 NFT_LINK_PATTERN = r"(t\.me/nft/[a-zA-Z0-9_-]+|getgems\.io/collection/[\w-]+/[\w-]+|[EU]Q[a-zA-Z0-9_-]{46})"
 
@@ -819,8 +946,29 @@ async def process_gift_link_auto(message: Message):
             business_connection_id=conn_id
         )
 
-    info = await get_gift_info(message.text)
-    result_text = format_gift_card(info) if info else "❌ Не удалось распознать подарок."
+    # 1. Базовые данные из TelegramGifts
+    tg_info = await get_gift_info(message.text) or {}
+
+    # 2. Извлекаем collection name и slug из ссылки
+    collection_name = None
+    slug = None
+
+    tg_match = re.search(r"t\.me/nft/([a-zA-Z0-9_-]+)", message.text)
+    if tg_match:
+        raw = tg_match.group(1)
+        name = raw.replace("-", " ")
+        collection_name = re.sub(r"\s+\d+$", "", name).strip()
+        # Формируем slug: "LootBag-10251"
+        parts = raw.rsplit("-", 1)
+        if len(parts) == 2:
+            slug = f"{parts[0]}-{parts[1]}"
+
+    # 3. Данные из Gift Satellite
+    gs_data = await get_gift_satellite_data(collection_name, slug) if collection_name else {}
+
+    # 4. Мержим всё вместе
+    combined = {**tg_info, **gs_data}
+    result_text = format_gift_card(combined)
 
     if loading_msg:
         with suppress(Exception):
