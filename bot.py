@@ -259,6 +259,45 @@ def _sanitize(name: str) -> str:
 
 
 # ==========================================
+# КЕШ СОБЕСЕДНИКОВ
+# ==========================================
+_peer_cache = {}
+
+
+async def get_peer_info(conn_id: str, peer_id: int) -> dict:
+    """Возвращает имя и username собеседника (chat_id) — того, с кем ведётся переписка."""
+    key = (conn_id, peer_id)
+    if key in _peer_cache:
+        return _peer_cache[key]
+
+    # Из последнего сообщения собеседника в архиве
+    doc = await archive_collection.find_one(
+        {"conn_id": conn_id, "chat_id": peer_id, "is_owner": False},
+        sort=[("created_at", -1)]
+    )
+    if doc:
+        info = {
+            "first_name": doc.get("first_name") or "Без имени",
+            "username": doc.get("username") or ""
+        }
+        _peer_cache[key] = info
+        return info
+
+    # Из Telegram API
+    try:
+        chat = await bot.get_chat(peer_id)
+        info = {
+            "first_name": chat.first_name or "Без имени",
+            "username": chat.username or ""
+        }
+    except Exception:
+        info = {"first_name": "Без имени", "username": ""}
+
+    _peer_cache[key] = info
+    return info
+
+
+# ==========================================
 # АРХИВАЦИЯ (БЫСТРАЯ ЗАПИСЬ + ФОНОВАЯ ЗАГРУЗКА МЕДИА)
 # ==========================================
 def _extract_media_info(message: Message):
@@ -310,6 +349,16 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
     text = message.text or message.caption or ""
     media_type, file_id, ext, mime = _extract_media_info(message)
 
+    # Данные собеседника — от кого именно ведётся переписка
+    if is_owner:
+        peer_info = await get_peer_info(conn_id, peer_id)
+    else:
+        peer_info = {
+            "first_name": message.from_user.first_name or "Без имени",
+            "username": message.from_user.username or ""
+        }
+        _peer_cache[(conn_id, peer_id)] = peer_info
+
     doc = {
         "conn_id": conn_id,
         "chat_id": peer_id,
@@ -318,6 +367,8 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
         "user_id": message.from_user.id,
         "first_name": message.from_user.first_name or "Без имени",
         "username": message.from_user.username or "",
+        "peer_first_name": peer_info["first_name"],
+        "peer_username": peer_info["username"],
         "text": text,
         "is_owner": is_owner,
         "media_type": media_type,
@@ -418,6 +469,10 @@ async def refresh_usernames_loop():
                     await archive_collection.update_many(
                         {"user_id": uid},
                         {"$set": {"username": new_username, "first_name": new_first_name}}
+                    )
+                    await archive_collection.update_many(
+                        {"user_id": uid, "is_owner": False},
+                        {"$set": {"peer_username": new_username, "peer_first_name": new_first_name}}
                     )
                     await deleted_users_collection.update_many(
                         {"user_id": uid},
@@ -537,7 +592,6 @@ EXCHANGE_CACHE = {}
 STARS_USD_RATE = 0.015
 
 CURRENCY_ALIASES = {
-    # USD / USDT
     "usd": "USDT", "usdt": "USDT",
     "доллар": "USDT", "доллары": "USDT", "долларов": "USDT", "доллара": "USDT",
     "долл": "USDT", "долл.": "USDT",
@@ -552,7 +606,6 @@ CURRENCY_ALIASES = {
     "юста": "USDT", "юст": "USDT",
     "$": "USDT", "💵": "USDT", "💰": "USDT", "💲": "USDT",
 
-    # RUB
     "rub": "RUB", "руб": "RUB", "руб.": "RUB",
     "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "рубля": "RUB", "рублю": "RUB",
     "рубас": "RUB", "рубасов": "RUB", "рубаса": "RUB", "рубасы": "RUB",
@@ -560,24 +613,20 @@ CURRENCY_ALIASES = {
     "деревянный": "RUB", "деревянных": "RUB", "деревянные": "RUB",
     "р": "RUB", "р.": "RUB", "₽": "RUB",
 
-    # EUR
     "eur": "EUR", "евро": "EUR", "еврик": "EUR", "еврики": "EUR",
     "евриков": "EUR", "еврика": "EUR", "евра": "EUR", "евров": "EUR",
     "€": "EUR",
 
-    # CNY
     "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "юаня": "CNY",
     "юан": "CNY", "yuan": "CNY", "юанчики": "CNY",
     "женьминьби": "CNY", "жэньминьби": "CNY", "¥": "CNY",
 
-    # BTC
     "btc": "BTC", "биткоин": "BTC", "биткоины": "BTC", "биткоинов": "BTC",
     "биткоина": "BTC", "биткойн": "BTC", "биткойны": "BTC", "биткойнов": "BTC",
     "биток": "BTC", "битки": "BTC", "битков": "BTC", "битка": "BTC",
     "бит": "BTC", "биты": "BTC", "битов": "BTC",
     "₿": "BTC",
 
-    # TON
     "ton": "TON", "тон": "TON", "тона": "TON", "тонов": "TON", "тоны": "TON",
     "тоник": "TON", "тоника": "TON", "тоников": "TON", "тонику": "TON",
     "грам": "TON", "грама": "TON", "грамов": "TON", "граммы": "TON",
@@ -585,7 +634,6 @@ CURRENCY_ALIASES = {
     "павлуша": "TON", "дуров": "TON",
     "💎": "TON",
 
-    # STARS
     "stars": "STARS", "star": "STARS",
     "звезда": "STARS", "звёзда": "STARS", "звезды": "STARS", "звёзды": "STARS",
     "звезд": "STARS", "звёзд": "STARS", "звезде": "STARS", "звёзде": "STARS",
@@ -597,27 +645,22 @@ CURRENCY_ALIASES = {
     "starчик": "STARS", "стар": "STARS", "стары": "STARS", "старов": "STARS",
     "⭐": "STARS", "🌟": "STARS", "✨": "STARS",
 
-    # ETH
     "eth": "ETH", "эфир": "ETH", "эфира": "ETH", "эфиров": "ETH", "эфиры": "ETH",
     "эфириум": "ETH", "эфирка": "ETH", "эфирки": "ETH", "эфирок": "ETH",
     "эфирчик": "ETH", "эфирчика": "ETH",
     "Ξ": "ETH",
 
-    # KZT
     "kzt": "KZT", "тенге": "KZT", "теньге": "KZT", "теньга": "KZT",
     "тг": "KZT", "тг.": "KZT", "₸": "KZT",
 
-    # UAH
     "uah": "UAH", "гривна": "UAH", "гривны": "UAH", "гривен": "UAH",
     "гривне": "UAH", "гривня": "UAH", "гривню": "UAH",
     "грн": "UAH", "грн.": "UAH", "₴": "UAH",
 
-    # GBP
     "gbp": "GBP", "фунт": "GBP", "фунты": "GBP", "фунтов": "GBP", "фунта": "GBP",
     "стерлинг": "GBP", "стерлинги": "GBP", "стерлингов": "GBP",
     "£": "GBP",
 
-    # JPY
     "jpy": "JPY", "иена": "JPY", "иены": "JPY", "иен": "JPY",
     "йена": "JPY", "йены": "JPY", "йен": "JPY",
 }
@@ -774,7 +817,6 @@ async def send_currency_conversion(message: Message, amount: float, from_cur: st
             target = "USDT"
         if target in shown:
             continue
-        # ← ПРОПУСКАЕМ исходную валюту — не показываем её в результатах
         if target == from_cur:
             continue
         shown.add(target)
@@ -878,6 +920,7 @@ async def on_startup():
         await archive_collection.create_index([("owner_id", 1), ("conn_id", 1), ("chat_id", 1), ("created_at", -1)])
         await archive_collection.create_index([("conn_id", 1), ("chat_id", 1), ("message_id", 1)])
         await archive_collection.create_index([("user_id", 1)])
+        await archive_collection.create_index([("conn_id", 1), ("chat_id", 1), ("is_owner", 1), ("created_at", -1)])
     with suppress(Exception):
         await deleted_users_collection.create_index([("conn_id", 1), ("chat_id", 1)])
 
@@ -998,8 +1041,8 @@ async def deleted_menu_handler(call: CallbackQuery):
             "_id": {"conn_id": "$conn_id", "chat_id": "$chat_id"},
             "del_count": {"$sum": {"$cond": [{"$eq": ["$is_deleted", True]}, 1, 0]}},
             "edit_count": {"$sum": {"$cond": [{"$eq": ["$is_edited", True]}, 1, 0]}},
-            "first_name": {"$last": "$first_name"},
-            "username": {"$last": "$username"},
+            "first_name": {"$last": "$peer_first_name"},
+            "username": {"$last": "$peer_username"},
         }},
         {"$sort": {"del_count": -1, "edit_count": -1}},
     ]
@@ -1213,7 +1256,7 @@ async def download_archive(call: CallbackQuery):
         await call.answer("Пусто", show_alert=True)
         return
 
-    chat_title = msgs[0].get("first_name") or f"chat_{chat_id}"
+    chat_title = msgs[0].get("peer_first_name") or msgs[0].get("first_name") or f"chat_{chat_id}"
     content = _build_archive_html(msgs, chat_title).encode("utf-8")
     filename = f"archive_{chat_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
 
@@ -1268,9 +1311,11 @@ async def admin_twinks(call: CallbackQuery):
 
     for c in conns:
         name = c.get("first_name", "Без имени")
+        uname = f"@{c.get('username', '')}" if c.get("username") else ""
         conn_id = c["business_connection_id"]
         count = await archive_collection.count_documents({"conn_id": conn_id})
-        builder.button(text=f"💼 {name} ({count})", callback_data=f"twink|{conn_id}")
+        label = f"💼 {name} {uname} ({count})"
+        builder.button(text=label[:60], callback_data=f"twink|{conn_id}")
     builder.button(text="🔙 Назад", callback_data="admin_main")
     builder.adjust(1)
     await show_menu(call, "💼 <b>Выбери аккаунт (твинк):</b>", builder.as_markup(), with_photo=True)
@@ -1293,8 +1338,8 @@ async def twink_chats(call: CallbackQuery):
             "_id": {"chat_id": "$chat_id"},
             "count": {"$sum": 1},
             "deleted": {"$sum": {"$cond": [{"$eq": ["$is_deleted", True]}, 1, 0]}},
-            "first_name": {"$last": "$first_name"},
-            "username": {"$last": "$username"},
+            "first_name": {"$last": "$peer_first_name"},
+            "username": {"$last": "$peer_username"},
         }},
         {"$sort": {"count": -1}},
     ]
@@ -1356,7 +1401,11 @@ async def twink_full_chat(call: CallbackQuery):
             text_body += f'\n📎 <a href="{m["drive_link"]}">[{m["media_type"]}]</a>'
         lines.append(f"{prefix} <b>{ts_str} · {author}</b>\n{text_body}\n{'─' * 15}")
 
-    header = f"<b>💬 Полная переписка</b>\nВсего: {total} · Удалено: {deleted}\nПоказано: последние {len(msgs)}\n{'━' * 18}\n\n"
+    peer_name = msgs[-1].get("peer_first_name") or "Собеседник"
+    peer_uname = msgs[-1].get("peer_username") or ""
+    peer_str = f"{peer_name} @{peer_uname}" if peer_uname else peer_name
+
+    header = f"<b>💬 Переписка с {html.escape(peer_str)}</b>\nВсего: {total} · Удалено: {deleted}\nПоказано: последние {len(msgs)}\n{'━' * 18}\n\n"
     full_text = header + "\n".join(lines)
     if len(full_text) > 3900:
         full_text = full_text[:3900] + "\n<i>...обрезано</i>"
