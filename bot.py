@@ -259,7 +259,7 @@ def _sanitize(name: str) -> str:
 
 
 # ==========================================
-# АРХИВАЦИЯ
+# АРХИВАЦИЯ (БЫСТРАЯ ЗАПИСЬ + ФОНОВАЯ ЗАГРУЗКА МЕДИА)
 # ==========================================
 def _extract_media_info(message: Message):
     if message.photo:
@@ -283,7 +283,30 @@ def _extract_media_info(message: Message):
     return None, None, None, None
 
 
-async def archive_message(message: Message, conn_id: str, peer_id: int, owner_id: int, owner_name: str, is_owner: bool):
+async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_raw, peer_id, owner_name):
+    try:
+        peer_name = _sanitize(peer_name_raw or f"peer_{peer_id}")
+        owner_folder = _sanitize(owner_name)
+        folder_path = f"{ROOT_FOLDER_NAME}/{owner_folder}/{peer_name} ({peer_id})/media"
+        file = await bot.get_file(file_id)
+        buffer = await bot.download_file(file.file_path)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"{ts}_{media_type}.{ext}"
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, upload_to_drive, buffer.read(), filename, folder_path, mime
+        )
+        if result:
+            await archive_collection.update_one(
+                {"_id": archive_id},
+                {"$set": {"drive_link": result["link"], "drive_file_id": result["id"]}}
+            )
+            print(f"✅ Медиа загружено: {media_type} для {peer_id}")
+    except Exception as e:
+        print(f"upload_media_bg error: {e}")
+
+
+async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner_id: int, owner_name: str, is_owner: bool):
     text = message.text or message.caption or ""
     media_type, file_id, ext, mime = _extract_media_info(message)
 
@@ -307,40 +330,26 @@ async def archive_message(message: Message, conn_id: str, peer_id: int, owner_id
         "created_at": datetime.now(timezone.utc),
     }
 
-    if media_type and file_id:
-        try:
-            peer_name = _sanitize(message.from_user.first_name or f"peer_{peer_id}")
-            owner_folder = _sanitize(owner_name)
-            folder_path = f"{ROOT_FOLDER_NAME}/{owner_folder}/{peer_name} ({peer_id})/media"
-            file = await bot.get_file(file_id)
-            buffer = await bot.download_file(file.file_path)
-            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            filename = f"{ts}_{media_type}.{ext}"
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None, upload_to_drive, buffer.read(), filename, folder_path, mime
-            )
-            if result:
-                doc["drive_link"] = result["link"]
-                doc["drive_file_id"] = result["id"]
-            else:
-                doc["text"] = text or f"[{media_type} — не загружено]"
-        except Exception as e:
-            print(f"Media upload error: {e}")
-            doc["text"] = text or f"[{media_type}]"
+    try:
+        result = await archive_collection.insert_one(doc)
+        doc["_id"] = result.inserted_id
+    except Exception as e:
+        print(f"save_message_quick insert error: {e}")
+        return None
 
-    with suppress(Exception):
-        await archive_collection.insert_one(doc)
+    if media_type and file_id:
+        asyncio.create_task(upload_media_bg(
+            doc["_id"], file_id, media_type, ext, mime,
+            message.from_user.first_name, peer_id, owner_name
+        ))
 
     return doc
 
 
 # ==========================================
-# УВЕДОМЛЕНИЯ ВЛАДЕЛЬЦУ
+# УВЕДОМЛЕНИЯ
 # ==========================================
 async def notify_owner_about_deletion(owner_id, sender_name, sender_username, text, media_type=None, drive_link=None, deleted_at=None):
-    if owner_id == SUPERADMIN_ID:
-        return
     time_str = deleted_at.strftime("%d.%m %H:%M") if deleted_at else datetime.now().strftime("%d.%m %H:%M")
     uname = f" @{sender_username}" if sender_username else ""
 
@@ -357,7 +366,7 @@ async def notify_owner_about_deletion(owner_id, sender_name, sender_username, te
         if drive_link:
             parts.append(f'📎 <a href="{drive_link}">[{media_type}]</a>')
         else:
-            parts.append(f"📎 [{media_type}]")
+            parts.append(f"📎 [{media_type}] (загрузка...)")
 
     with suppress(Exception):
         await bot.send_message(
@@ -369,8 +378,6 @@ async def notify_owner_about_deletion(owner_id, sender_name, sender_username, te
 
 
 async def notify_owner_about_edit(owner_id, sender_name, sender_username, old_text, new_text, edited_at=None):
-    if owner_id == SUPERADMIN_ID:
-        return
     time_str = edited_at.strftime("%d.%m %H:%M") if edited_at else datetime.now().strftime("%d.%m %H:%M")
     uname = f" @{sender_username}" if sender_username else ""
 
@@ -529,24 +536,94 @@ def format_gift_card(data: dict) -> str:
 EXCHANGE_CACHE = {}
 STARS_USD_RATE = 0.015
 
+# --- РАСШИРЕННЫЕ АЛИАСЫ ---
 CURRENCY_ALIASES = {
-    "usd": "USD", "доллар": "USD", "доллары": "USD", "долларов": "USD", "бакс": "USD", "баксы": "USD", "баксов": "USD", "$": "USD",
-    "rub": "RUB", "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "руб": "RUB", "₽": "RUB",
-    "eur": "EUR", "евро": "EUR", "€": "EUR",
-    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "¥": "CNY",
-    "btc": "BTC", "биткоин": "BTC", "биток": "BTC", "₿": "BTC",
-    "ton": "TON", "тон": "TON", "тонов": "TON", "тона": "TON", "тоны": "TON",
-    "тоник": "TON", "тоника": "TON", "тоников": "TON", "грам": "TON", "gram": "TON",
-    "stars": "STARS", "звезд": "STARS", "звёзд": "STARS", "звезды": "STARS", "⭐": "STARS",
-    "eth": "ETH", "эфир": "ETH", "Ξ": "ETH",
-    "usdt": "USDT", "тетер": "USDT", "юсдт": "USDT",
-    "kzt": "KZT", "тенге": "KZT", "₸": "KZT",
-    "uah": "UAH", "гривна": "UAH", "гривен": "UAH", "₴": "UAH",
-    "gbp": "GBP", "фунт": "GBP", "£": "GBP",
-    "jpy": "JPY", "иена": "JPY", "йена": "JPY",
+    # USD / USDT (объединены)
+    "usd": "USDT", "usdt": "USDT",
+    "доллар": "USDT", "доллары": "USDT", "долларов": "USDT", "доллара": "USDT",
+    "долл": "USDT", "долл.": "USDT",
+    "бакс": "USDT", "баксы": "USDT", "баксов": "USDT", "бакса": "USDT",
+    "бачей": "USDT", "бач": "USDT", "бач.": "USDT",
+    "баксик": "USDT", "баксиков": "USDT", "баксика": "USDT",
+    "зеленый": "USDT", "зелёный": "USDT", "зеленых": "USDT", "зелёных": "USDT",
+    "зелень": "USDT", "зелени": "USDT",
+    "юсд": "USDT", "юсдт": "USDT", "усд": "USDT", "усдт": "USDT",
+    "тетер": "USDT", "тетеры": "USDT", "тетеров": "USDT", "тетера": "USDT",
+    "тезер": "USDT", "тезеры": "USDT", "тезеров": "USDT", "тезера": "USDT",
+    "юста": "USDT", "юст": "USDT",
+    "$": "USDT", "💵": "USDT", "💰": "USDT", "💲": "USDT",
+
+    # RUB
+    "rub": "RUB", "руб": "RUB", "руб.": "RUB",
+    "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "рубля": "RUB", "рублю": "RUB",
+    "рубас": "RUB", "рубасов": "RUB", "рубаса": "RUB", "рубасы": "RUB",
+    "рубчик": "RUB", "рубчики": "RUB", "рубчиков": "RUB",
+    "деревянный": "RUB", "деревянных": "RUB", "деревянные": "RUB",
+    "р": "RUB", "р.": "RUB", "₽": "RUB",
+
+    # EUR
+    "eur": "EUR", "евро": "EUR", "еврик": "EUR", "еврики": "EUR",
+    "евриков": "EUR", "еврика": "EUR", "евра": "EUR", "евров": "EUR",
+    "€": "EUR",
+
+    # CNY
+    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "юаня": "CNY",
+    "юан": "CNY", "yuan": "CNY", "юанчики": "CNY",
+    "женьминьби": "CNY", "жэньминьби": "CNY", "¥": "CNY",
+
+    # BTC
+    "btc": "BTC", "биткоин": "BTC", "биткоины": "BTC", "биткоинов": "BTC",
+    "биткоина": "BTC", "биткойн": "BTC", "биткойны": "BTC", "биткойнов": "BTC",
+    "биток": "BTC", "битки": "BTC", "битков": "BTC", "битка": "BTC",
+    "бит": "BTC", "биты": "BTC", "битов": "BTC",
+    "₿": "BTC",
+
+    # TON
+    "ton": "TON", "тон": "TON", "тона": "TON", "тонов": "TON", "тоны": "TON",
+    "тоник": "TON", "тоника": "TON", "тоников": "TON", "тонику": "TON",
+    "грам": "TON", "грама": "TON", "грамов": "TON", "граммы": "TON",
+    "грамм": "TON", "gram": "TON", "grams": "TON",
+    "павлуша": "TON", "дуров": "TON",
+    "💎": "TON",
+
+    # STARS
+    "stars": "STARS", "star": "STARS",
+    "звезда": "STARS", "звёзда": "STARS", "звезды": "STARS", "звёзды": "STARS",
+    "звезд": "STARS", "звёзд": "STARS", "звезде": "STARS", "звёзде": "STARS",
+    "звездочка": "STARS", "звёздочка": "STARS",
+    "звездочки": "STARS", "звёздочки": "STARS",
+    "звездочек": "STARS", "звёздочек": "STARS",
+    "зв": "STARS", "зв.": "STARS",
+    "звездулька": "STARS", "звездульки": "STARS",
+    "starчик": "STARS", "стар": "STARS", "стары": "STARS", "старов": "STARS",
+    "⭐": "STARS", "🌟": "STARS", "✨": "STARS",
+
+    # ETH
+    "eth": "ETH", "эфир": "ETH", "эфира": "ETH", "эфиров": "ETH", "эфиры": "ETH",
+    "эфириум": "ETH", "эфирка": "ETH", "эфирки": "ETH", "эфирок": "ETH",
+    "эфирчик": "ETH", "эфирчика": "ETH",
+    "Ξ": "ETH",
+
+    # KZT
+    "kzt": "KZT", "тенге": "KZT", "теньге": "KZT", "теньга": "KZT",
+    "тг": "KZT", "тг.": "KZT", "₸": "KZT",
+
+    # UAH
+    "uah": "UAH", "гривна": "UAH", "гривны": "UAH", "гривен": "UAH",
+    "гривне": "UAH", "гривня": "UAH", "гривню": "UAH",
+    "грн": "UAH", "грн.": "UAH", "₴": "UAH",
+
+    # GBP
+    "gbp": "GBP", "фунт": "GBP", "фунты": "GBP", "фунтов": "GBP", "фунта": "GBP",
+    "стерлинг": "GBP", "стерлинги": "GBP", "стерлингов": "GBP",
+    "£": "GBP",
+
+    # JPY
+    "jpy": "JPY", "иена": "JPY", "иены": "JPY", "иен": "JPY",
+    "йена": "JPY", "йены": "JPY", "йен": "JPY",
 }
 
-ALL_CURRENCIES = ["RUB", "USD", "EUR", "CNY", "UAH", "KZT", "GBP", "JPY", "BTC", "ETH", "USDT", "TON", "STARS"]
+ALL_CURRENCIES = ["RUB", "USDT", "EUR", "CNY", "KZT", "UAH", "GBP", "JPY", "BTC", "ETH", "TON", "STARS"]
 _CURRENCY_ALT = "|".join(sorted([re.escape(a) for a in CURRENCY_ALIASES.keys()], key=len, reverse=True))
 _NUM = r"\d+[.,]?\d*"
 _OPS = r"[+\-*/xх^]"
@@ -602,12 +679,7 @@ async def fetch_json(url: str):
 
 
 async def force_update_all_rates():
-    """
-    Обновление курсов. Для TON пробуем несколько источников по очереди:
-    MEXC TONUSDT -> MEXC GRAMUSDT -> CoinGecko the-open-network.
-    """
     try:
-        # --- Фиат ---
         fiat_data = await fetch_json("https://open.er-api.com/v6/latest/USD")
         if fiat_data and "rates" in fiat_data:
             rates = fiat_data["rates"]
@@ -615,7 +687,6 @@ async def force_update_all_rates():
                 if rates.get(cur):
                     EXCHANGE_CACHE[cur] = 1.0 / rates[cur]
 
-        # --- Крипта через MEXC ---
         for sym, code in [("BTCUSDT", "BTC"), ("ETHUSDT", "ETH")]:
             data = await fetch_json(f"https://api.mexc.com/api/v3/ticker/price?symbol={sym}")
             if data and "price" in data:
@@ -629,7 +700,6 @@ async def force_update_all_rates():
                     if cg_data and cg_id in cg_data:
                         EXCHANGE_CACHE[code] = float(cg_data[cg_id]["usd"])
 
-        # --- TON: пробуем TONUSDT, потом GRAMUSDT, потом CoinGecko ---
         ton_price = None
         for ton_sym in ["TONUSDT", "GRAMUSDT"]:
             data = await fetch_json(f"https://api.mexc.com/api/v3/ticker/price?symbol={ton_sym}")
@@ -678,25 +748,55 @@ async def convert_currency(amount: float, from_cur: str, to_cur: str):
 async def send_currency_conversion(message: Message, amount: float, from_cur: str, original_expr: str = None):
     owner_id = message.from_user.id
     owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
-    display_currencies = owner_settings.get("display_currencies", ["RUB", "STARS", "TON"])
-    amount_str = f"{amount:.4f}".rstrip("0").rstrip(".") if isinstance(amount, float) else str(amount)
-    lines = [f"💱 <b>{original_expr}</b> = <b>{amount_str} {from_cur}</b>:\n"] if original_expr else [f"💱 <b>{amount_str} {from_cur}</b>:\n"]
+    display_currencies = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
+
+    if from_cur == "USD":
+        from_cur = "USDT"
+
+    if original_expr:
+        header = f"🔄 Конвертация {original_expr} {from_cur}"
+    else:
+        amount_str = f"{amount:.6f}".rstrip("0").rstrip(".")
+        header = f"🔄 Конвертация {amount_str} {from_cur}"
+
+    lines = [f"<b>{header}</b>", ""]
+
+    emoji_map = {
+        "RUB": "🇷🇺", "USDT": "💵", "EUR": "🇪🇺", "CNY": "🇨🇳", "KZT": "🇰🇿",
+        "UAH": "🇺🇦", "GBP": "🇬🇧", "JPY": "🇯🇵", "BTC": "₿", "ETH": "Ξ",
+        "TON": "💎", "STARS": "⭐",
+    }
+
+    shown = set()
     for target in display_currencies:
+        if target == "USD":
+            target = "USDT"
+        if target in shown:
+            continue
+        shown.add(target)
+
         if target == from_cur:
-            continue
-        result = await convert_currency(amount, from_cur, target)
-        if result is None:
-            continue
+            result = amount
+        else:
+            result = await convert_currency(amount, from_cur, target)
+            if result is None:
+                continue
+
         if target in ("BTC", "ETH", "TON"):
             formatted = f"{result:.6f}".rstrip("0").rstrip(".")
         elif target == "STARS":
-            formatted = f"{result:.0f}"
-        else:
+            formatted = f"{result:.2f}".rstrip("0").rstrip(".")
+        elif target in ("RUB", "KZT", "UAH", "JPY"):
             formatted = f"{result:.2f}"
-        emoji = {"RUB": "🇷🇺", "USD": "🇺🇸", "EUR": "🇪🇺", "CNY": "🇨🇳", "UAH": "🇺🇦",
-                 "KZT": "🇰🇿", "GBP": "🇬🇧", "JPY": "🇯🇵", "BTC": "₿", "ETH": "Ξ",
-                 "USDT": "💵", "TON": "💎", "STARS": "⭐"}.get(target, "•")
-        lines.append(f"{emoji} <b>{formatted}</b> {target}")
+        else:
+            formatted = f"{result:.3f}".rstrip("0").rstrip(".")
+
+        if not formatted:
+            formatted = "0"
+
+        emoji = emoji_map.get(target, "•")
+        lines.append(f"{target} {emoji}: <code>{formatted}</code>")
+
     with suppress(Exception):
         await message.reply("\n".join(lines), parse_mode="HTML")
 
@@ -1004,6 +1104,8 @@ async def _render_page(conn_id: str, chat_id: int, owner_id: int, mode: str, off
             body = html.escape(m.get("text") or "[медиа]")
             if m.get("media_type") and m.get("drive_link"):
                 body += f'\n📎 <a href="{m["drive_link"]}">[{m["media_type"]}]</a>'
+            elif m.get("media_type"):
+                body += f'\n📎 [{m["media_type"]}] (загрузка...)'
 
         lines.append(f"{prefix}<b>{ts_str} · {sender}</b>\n{body}\n{'─' * 18}")
 
@@ -1151,9 +1253,7 @@ async def admin_twinks(call: CallbackQuery):
         await call.answer("Нет доступа", show_alert=True)
         return
 
-    conns = await connections_collection.find({
-        "user_id": {"$ne": SUPERADMIN_ID}
-    }).to_list(length=100)
+    conns = await connections_collection.find({}).to_list(length=100)
 
     builder = InlineKeyboardBuilder()
     if not conns:
@@ -1181,11 +1281,6 @@ async def twink_chats(call: CallbackQuery):
         await call.answer("Ошибка", show_alert=True)
         return
     _, conn_id = parts
-
-    conn_doc = await connections_collection.find_one({"business_connection_id": conn_id})
-    if conn_doc and conn_doc.get("user_id") == SUPERADMIN_ID:
-        await call.answer("Это соединение недоступно", show_alert=True)
-        return
 
     pipeline = [
         {"$match": {"conn_id": conn_id}},
@@ -1276,10 +1371,10 @@ async def admin_stats(call: CallbackQuery):
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="admin_main")
 
-    total_archive = await archive_collection.count_documents({"owner_id": {"$ne": SUPERADMIN_ID}})
-    total_deleted = await archive_collection.count_documents({"owner_id": {"$ne": SUPERADMIN_ID}, "is_deleted": True})
-    total_edited = await archive_collection.count_documents({"owner_id": {"$ne": SUPERADMIN_ID}, "is_edited": True})
-    total_conns = await connections_collection.count_documents({"user_id": {"$ne": SUPERADMIN_ID}})
+    total_archive = await archive_collection.count_documents({})
+    total_deleted = await archive_collection.count_documents({"is_deleted": True})
+    total_edited = await archive_collection.count_documents({"is_edited": True})
+    total_conns = await connections_collection.count_documents({})
 
     await show_menu(
         call,
@@ -1447,7 +1542,7 @@ async def currency_settings_handler(call: CallbackQuery):
         await show_menu(call, get_connect_text(), kb, with_photo=True)
         return
     owner_settings = await users_collection.find_one({"user_id": call.from_user.id}) or {}
-    display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON"])
+    display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
     builder = InlineKeyboardBuilder()
     for cur in ALL_CURRENCIES:
         check = "✅" if cur in display else "⬜"
@@ -1466,7 +1561,7 @@ async def currency_toggle_handler(call: CallbackQuery):
         return
     cur = parts[1]
     owner_settings = await users_collection.find_one({"user_id": call.from_user.id}) or {}
-    display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON"])
+    display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
     if cur in display:
         display.remove(cur)
     else:
@@ -1562,8 +1657,6 @@ async def show_cmds(call: CallbackQuery):
 @dp.business_connection()
 async def on_business_connection(connection: BusinessConnection):
     if connection.is_enabled:
-        if connection.user.id == SUPERADMIN_ID:
-            return
         await ensure_connection(
             connection.id,
             connection.user.id,
@@ -1829,23 +1922,17 @@ async def auto_math_and_currency(message: Message):
 
 
 # ==========================================
-# ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
+# ГЛАВНЫЙ ОБРАБОТЧИК
 # ==========================================
 @dp.business_message()
 async def handle_messages(message: Message):
     conn_id = message.business_connection_id
-
-    if message.from_user.id == SUPERADMIN_ID:
-        return
 
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
 
     owner_id = owner_data["user_id"]
-    if owner_id == SUPERADMIN_ID:
-        return
-
     owner_name = owner_data.get("first_name", "owner")
     peer_id = message.chat.id
 
@@ -1865,7 +1952,7 @@ async def handle_messages(message: Message):
             })
 
     with suppress(Exception):
-        await archive_message(message, conn_id, peer_id, owner_id, owner_name, is_owner)
+        await save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner)
 
     if is_owner:
         owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
@@ -1894,15 +1981,10 @@ async def handle_messages(message: Message):
 async def catch_edits(message: Message):
     conn_id = message.business_connection_id
 
-    if message.from_user.id == SUPERADMIN_ID:
-        return
-
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
-    if owner_id == SUPERADMIN_ID:
-        return
 
     peer_id = message.chat.id
     is_owner = (message.from_user.id == owner_id)
@@ -1938,7 +2020,7 @@ async def catch_edits(message: Message):
             {"$set": {"text": new_text}}
         )
 
-    if not old_doc.get("is_owner") and not is_owner:
+    if not is_owner:
         sender_name = old_doc.get("first_name") or message.from_user.first_name or "Неизвестный"
         sender_username = old_doc.get("username") or message.from_user.username or ""
         await notify_owner_about_edit(owner_id, sender_name, sender_username, old_text, new_text, edited_at)
@@ -1971,8 +2053,6 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
-    if owner_id == SUPERADMIN_ID:
-        return
 
     for msg_id in deleted.message_ids:
         old_msg = await archive_collection.find_one({
@@ -2037,7 +2117,7 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
 
 
 # ==========================================
-# СНЯТИЕ МУТА (кнопка)
+# СНЯТИЕ МУТА
 # ==========================================
 @dp.callback_query(F.data.startswith("unmute|"))
 async def unmute_user(call: CallbackQuery):
