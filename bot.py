@@ -536,9 +536,8 @@ def format_gift_card(data: dict) -> str:
 EXCHANGE_CACHE = {}
 STARS_USD_RATE = 0.015
 
-# --- РАСШИРЕННЫЕ АЛИАСЫ ---
 CURRENCY_ALIASES = {
-    # USD / USDT (объединены)
+    # USD / USDT
     "usd": "USDT", "usdt": "USDT",
     "доллар": "USDT", "доллары": "USDT", "долларов": "USDT", "доллара": "USDT",
     "долл": "USDT", "долл.": "USDT",
@@ -768,19 +767,21 @@ async def send_currency_conversion(message: Message, amount: float, from_cur: st
     }
 
     shown = set()
+    results_found = 0
+
     for target in display_currencies:
         if target == "USD":
             target = "USDT"
         if target in shown:
             continue
+        # ← ПРОПУСКАЕМ исходную валюту — не показываем её в результатах
+        if target == from_cur:
+            continue
         shown.add(target)
 
-        if target == from_cur:
-            result = amount
-        else:
-            result = await convert_currency(amount, from_cur, target)
-            if result is None:
-                continue
+        result = await convert_currency(amount, from_cur, target)
+        if result is None:
+            continue
 
         if target in ("BTC", "ETH", "TON"):
             formatted = f"{result:.6f}".rstrip("0").rstrip(".")
@@ -796,6 +797,10 @@ async def send_currency_conversion(message: Message, amount: float, from_cur: st
 
         emoji = emoji_map.get(target, "•")
         lines.append(f"{target} {emoji}: <code>{formatted}</code>")
+        results_found += 1
+
+    if results_found == 0:
+        lines.append("<i>Нет доступных валют для конвертации</i>")
 
     with suppress(Exception):
         await message.reply("\n".join(lines), parse_mode="HTML")
