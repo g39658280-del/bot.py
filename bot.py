@@ -2043,18 +2043,33 @@ async def mute_user(message: Message):
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
-    peer_id = message.chat.id
 
+    # ИСПРАВЛЕНО: Команду должен выполнять ТОЛЬКО владелец бота, а не собеседник
     if message.from_user.id != owner_id:
-        with suppress(Exception):
-            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
-        mute_key = f"{conn_id}_{peer_id}"
-        if mute_key in muted_chats:
-            return
-        muted_chats.add(mute_key)
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute|{peer_id}", style="danger")]])
-        with suppress(Exception):
-            await bot.send_message(chat_id=peer_id, text="мут выдан", reply_markup=markup, business_connection_id=conn_id)
+        return
+        
+    peer_id = message.chat.id
+    mute_key = f"{conn_id}_{peer_id}"
+
+    # Удаляем саму команду .мут
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=conn_id, 
+            message_ids=[message.message_id]
+        )
+
+    if mute_key in muted_chats:
+        return
+        
+    muted_chats.add(mute_key)
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute|{peer_id}", style="danger")]])
+    with suppress(Exception):
+        await bot.send_message(
+            chat_id=peer_id, 
+            text="🔇 Собеседник замьючен.", 
+            reply_markup=markup, 
+            business_connection_id=conn_id
+        )
 
 
 @dp.business_message(F.text.lower().startswith(".амут"))
@@ -2338,8 +2353,10 @@ async def handle_messages(message: Message):
 
     mute_key = f"{conn_id}_{peer_id}"
     if mute_key in muted_chats:
-        with suppress(Exception):
-            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+        # ИСПРАВЛЕНО: Удаляем сообщение ТОЛЬКО если это пишет собеседник, чтобы не удалять свои сообщения
+        if not is_owner:
+            with suppress(Exception):
+                await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
 
 # ==========================================
@@ -2493,8 +2510,6 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                         },
                         upsert=True
                     )
-        # ← Убрал fallback-ветку: не отправляем уведомление, если сообщения нет в архиве
-        # (это команды бота, свои удаления и т.д.)
 
 
 # ==========================================
