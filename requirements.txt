@@ -1,4 +1,4 @@
-aiogram
+aiogram>=3.25.0
 aiohttp
 motor
 simpleeval
