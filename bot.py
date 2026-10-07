@@ -6,6 +6,7 @@ import html
 import re
 import json
 import aiohttp
+import tempfile
 from datetime import datetime, timezone
 from aiohttp import web
 from contextlib import suppress
@@ -23,11 +24,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from simpleeval import simple_eval
+from cachetools import TTLCache
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload
 
 # ==========================================
 # КОНФИГ
@@ -65,8 +67,8 @@ except Exception as e:
     print(f"Ошибка БД: {e}")
 
 muted_chats = set()
-afk_cooldowns = {}
-active_amute = {}  # key: "{conn_id}_{peer_id}" -> {"text", "end_ts", "message_id"}
+afk_cooldowns = TTLCache(maxsize=2000, ttl=300)
+active_amute = TTLCache(maxsize=1000, ttl=15)  # key: "{conn_id}_{peer_id}"
 
 BOT_USERNAME = "your_bot_username"
 
@@ -177,10 +179,11 @@ async def show_menu(call: CallbackQuery, caption: str, kb, with_photo: bool = Tr
 
 
 # ==========================================
-# GOOGLE DRIVE
+# GOOGLE DRIVE (ОПТИМИЗИРОВАНО)
 # ==========================================
 _drive_service = None
-_folder_cache = {}
+_folder_cache = TTLCache(maxsize=1000, ttl=86400)
+drive_lock = asyncio.Lock()
 ROOT_FOLDER_NAME = "TelegramArchiveBot"
 
 
@@ -255,27 +258,10 @@ def get_or_create_folder(path: str) -> str | None:
     return parent
 
 
-def upload_to_drive(file_bytes: bytes, filename: str, folder_path: str, mime_type: str = "application/octet-stream") -> dict | None:
-    if not _drive():
-        return None
-    try:
-        folder_id = get_or_create_folder(folder_path)
-        if not folder_id:
-            return None
-        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
-        meta = {"name": filename, "parents": [folder_id]}
-        file = _drive().files().create(
-            body=meta, media_body=media,
-            fields="id, webViewLink, webContentLink"
-        ).execute()
-        return {
-            "id": file.get("id"),
-            "link": file.get("webViewLink"),
-            "download": file.get("webContentLink"),
-        }
-    except Exception as e:
-        print(f"Drive upload error: {e}")
-        return None
+async def async_get_or_create_folder(path: str):
+    async with drive_lock:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, get_or_create_folder, path)
 
 
 def _sanitize(name: str) -> str:
@@ -285,7 +271,7 @@ def _sanitize(name: str) -> str:
 # ==========================================
 # КЕШ СОБЕСЕДНИКОВ
 # ==========================================
-_peer_cache = {}
+_peer_cache = TTLCache(maxsize=5000, ttl=86400)
 
 
 async def get_peer_info(conn_id: str, peer_id: int) -> dict:
@@ -323,52 +309,71 @@ async def get_peer_info(conn_id: str, peer_id: int) -> dict:
 # ==========================================
 def _extract_media_info(message: Message):
     if message.photo:
-        return "photo", message.photo[-1].file_id, "jpg", "image/jpeg"
+        return "photo", message.photo[-1].file_id, "jpg", "image/jpeg", message.photo[-1].file_size
     if message.video:
-        return "video", message.video.file_id, "mp4", "video/mp4"
+        return "video", message.video.file_id, "mp4", "video/mp4", message.video.file_size
     if message.video_note:
-        return "video_note", message.video_note.file_id, "mp4", "video/mp4"
+        return "video_note", message.video_note.file_id, "mp4", "video/mp4", message.video_note.file_size
     if message.animation:
-        return "animation", message.animation.file_id, "mp4", "video/mp4"
+        return "animation", message.animation.file_id, "mp4", "video/mp4", message.animation.file_size
     if message.document:
         fname = message.document.file_name or "file"
         ext = fname.rsplit(".", 1)[-1] if "." in fname else "bin"
-        return "document", message.document.file_id, ext, message.document.mime_type or "application/octet-stream"
+        return "document", message.document.file_id, ext, message.document.mime_type or "application/octet-stream", message.document.file_size
     if message.audio:
-        return "audio", message.audio.file_id, "mp3", message.audio.mime_type or "audio/mpeg"
+        return "audio", message.audio.file_id, "mp3", message.audio.mime_type or "audio/mpeg", message.audio.file_size
     if message.voice:
-        return "voice", message.voice.file_id, "ogg", "audio/ogg"
+        return "voice", message.voice.file_id, "ogg", "audio/ogg", message.voice.file_size
     if message.sticker:
-        return "sticker", message.sticker.file_id, "webp", "image/webp"
-    return None, None, None, None
+        return "sticker", message.sticker.file_id, "webp", "image/webp", message.sticker.file_size
+    return None, None, None, None, None
 
 
-async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_raw, peer_id, owner_name):
+async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_raw, peer_id, owner_name, file_size):
     try:
+        if file_size and file_size > 20 * 1024 * 1024:
+            print(f"⚠️ Файл слишком большой ({file_size} байт), пропускаем загрузку на Диск для {peer_id}")
+            return
+
         peer_name = _sanitize(peer_name_raw or f"peer_{peer_id}")
         owner_folder = _sanitize(owner_name)
         folder_path = f"{ROOT_FOLDER_NAME}/{owner_folder}/{peer_name} ({peer_id})/media"
-        file = await bot.get_file(file_id)
-        buffer = await bot.download_file(file.file_path)
+        
+        folder_id = await async_get_or_create_folder(folder_path)
+        if not folder_id:
+            return
+
+        file_obj = await bot.get_file(file_id)
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"{ts}_{media_type}.{ext}"
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, upload_to_drive, buffer.read(), filename, folder_path, mime
-        )
-        if result:
-            await archive_collection.update_one(
-                {"_id": archive_id},
-                {"$set": {"drive_link": result["link"], "drive_file_id": result["id"]}}
-            )
-            print(f"✅ Медиа загружено: {media_type} для {peer_id}")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+            await bot.download_file(file_obj.file_path, destination=tmp.name)
+            tmp_path = tmp.name
+
+        def _sync_upload():
+            media = MediaFileUpload(tmp_path, mimetype=mime, resumable=True)
+            meta = {"name": filename, "parents": [folder_id]}
+            return _drive().files().create(body=meta, media_body=media, fields="id, webViewLink, webContentLink").execute()
+
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, _sync_upload)
+            if result:
+                await archive_collection.update_one(
+                    {"_id": archive_id},
+                    {"$set": {"drive_link": result.get("webViewLink"), "drive_file_id": result.get("id")}}
+                )
+                print(f"✅ Медиа загружено: {media_type} для {peer_id}")
+        finally:
+            os.remove(tmp_path)
     except Exception as e:
         print(f"upload_media_bg error: {e}")
 
 
 async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner_id: int, owner_name: str, is_owner: bool):
     text = message.text or message.caption or ""
-    media_type, file_id, ext, mime = _extract_media_info(message)
+    media_type, file_id, ext, mime, file_size = _extract_media_info(message)
 
     if is_owner:
         peer_info = await get_peer_info(conn_id, peer_id)
@@ -411,7 +416,7 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
     if media_type and file_id:
         asyncio.create_task(upload_media_bg(
             doc["_id"], file_id, media_type, ext, mime,
-            message.from_user.first_name, peer_id, owner_name
+            message.from_user.first_name, peer_id, owner_name, file_size
         ))
 
     return doc
@@ -437,7 +442,7 @@ async def notify_owner_about_deletion(owner_id, sender_name, sender_username, te
         if drive_link:
             parts.append(f'📎 <a href="{drive_link}">[{media_type}]</a>')
         else:
-            parts.append(f"📎 [{media_type}] (загрузка...)")
+            parts.append(f"📎 [{media_type}] (размер превышен или загрузка...)")
 
     with suppress(Exception):
         await bot.send_message(
@@ -470,60 +475,6 @@ async def notify_owner_about_edit(owner_id, sender_name, sender_username, old_te
             parse_mode="HTML",
             disable_web_page_preview=True
         )
-
-
-# ==========================================
-# ОБНОВЛЕНИЕ ЮЗЕРНЕЙМОВ
-# ==========================================
-async def refresh_usernames_loop():
-    while True:
-        try:
-            await asyncio.sleep(86400)
-            unique_users = await archive_collection.distinct("user_id")
-            updated = 0
-            for uid in unique_users:
-                try:
-                    chat = await bot.get_chat(uid)
-                    new_username = chat.username or ""
-                    new_first_name = chat.first_name or "Без имени"
-                    await archive_collection.update_many(
-                        {"user_id": uid},
-                        {"$set": {"username": new_username, "first_name": new_first_name}}
-                    )
-                    await archive_collection.update_many(
-                        {"user_id": uid, "is_owner": False},
-                        {"$set": {"peer_username": new_username, "peer_first_name": new_first_name}}
-                    )
-                    await deleted_users_collection.update_many(
-                        {"user_id": uid},
-                        {"$set": {"username": new_username, "first_name": new_first_name}}
-                    )
-                    updated += 1
-                    await asyncio.sleep(0.4)
-                except Exception:
-                    continue
-            print(f"✅ Usernames refreshed: {updated}")
-        except Exception as e:
-            print(f"refresh_usernames_loop error: {e}")
-            await asyncio.sleep(3600)
-
-
-# ==========================================
-# ЧИСТИЛЬЩИК АМУТ-СЕССИЙ
-# ==========================================
-async def amute_cleanup_loop():
-    while True:
-        try:
-            await asyncio.sleep(5)
-            now_ts = datetime.now(timezone.utc).timestamp()
-            expired = [k for k, v in active_amute.items() if now_ts >= v.get("end_ts", 0)]
-            for k in expired:
-                active_amute.pop(k, None)
-            if expired:
-                print(f"🧹 Очищено амут-сессий: {len(expired)}")
-        except Exception as e:
-            print(f"amute_cleanup_loop error: {e}")
-            await asyncio.sleep(10)
 
 
 # ==========================================
@@ -705,16 +656,19 @@ CURRENCY_ALIASES = {
 
 ALL_CURRENCIES = ["RUB", "USDT", "EUR", "CNY", "KZT", "UAH", "GBP", "JPY", "BTC", "ETH", "TON", "STARS"]
 _CURRENCY_ALT = "|".join(sorted([re.escape(a) for a in CURRENCY_ALIASES.keys()], key=len, reverse=True))
-_NUM = r"\d+[.,]?\d*"
-_OPS = r"[+\-*/xх^]"
-_WORDS = r"(?:плюс|минус|умножить на|разделить на|поделить на|умножить|разделить|поделить|сложить|вычесть|делить|степень|в степени|х)"
-AUTO_MATH_PATTERN = rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})+\s*$"
-AUTO_MATH_CURRENCY_PATTERN = rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$"
 
 WORD_NUMBERS = {
     "ноль": 0, "один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6,
     "семь": 7, "восемь": 8, "девять": 9, "десять": 10, "сто": 100, "тысяча": 1000,
 }
+
+_NUM_WORDS = "|".join(WORD_NUMBERS.keys())
+_NUM = rf"(?:\d+[.,]?\d*|{_NUM_WORDS})"
+_OPS = r"[+\-*/xх^]"
+_WORDS = r"(?:плюс|минус|умножить на|разделить на|поделить на|умножить|разделить|поделить|сложить|вычесть|делить|степень|в степени|х)"
+AUTO_MATH_PATTERN = rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})+\s*$"
+AUTO_MATH_CURRENCY_PATTERN = rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$"
+
 OPERATORS = {
     "умножить на": "*", "разделить на": "/", "поделить на": "/", "в степени": "**",
     "плюс": "+", "сложить": "+", "минус": "-", "вычесть": "-",
@@ -948,8 +902,6 @@ async def on_startup():
         await deleted_users_collection.create_index([("conn_id", 1), ("chat_id", 1)])
 
     asyncio.create_task(update_rates_loop())
-    asyncio.create_task(refresh_usernames_loop())
-    asyncio.create_task(amute_cleanup_loop())
     _init_drive()
 
     with suppress(Exception):
@@ -2044,14 +1996,12 @@ async def mute_user(message: Message):
         return
     owner_id = owner_data["user_id"]
 
-    # ИСПРАВЛЕНО: Команду должен выполнять ТОЛЬКО владелец бота, а не собеседник
     if message.from_user.id != owner_id:
         return
         
     peer_id = message.chat.id
     mute_key = f"{conn_id}_{peer_id}"
 
-    # Удаляем саму команду .мут
     with suppress(Exception):
         await bot.delete_business_messages(
             business_connection_id=conn_id, 
@@ -2109,10 +2059,9 @@ async def amute_command(message: Message):
     key = f"{conn_id}_{peer_id}"
     active_amute[key] = {
         "text": text,
-        "end_ts": datetime.now(timezone.utc).timestamp() + 10.0,
         "message_id": sent.message_id,
     }
-    print(f"🔁 Амут-сессия на 10с: {key} → {text[:50]}")
+    print(f"🔁 Амут-сессия на 15с: {key} → {text[:50]}")
 
 
 @dp.business_message(F.text.regexp(r"^\.(\d+)\s+"))
@@ -2260,6 +2209,9 @@ async def process_gift_link_auto(message: Message):
 # ==========================================
 @dp.business_message(F.text.regexp(AUTO_MATH_CURRENCY_PATTERN) | F.text.regexp(AUTO_MATH_PATTERN))
 async def auto_math_and_currency(message: Message):
+    if len(message.text) > 150:
+        return
+        
     conn_id = message.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
@@ -2341,19 +2293,17 @@ async def handle_messages(message: Message):
         owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
         manual_afk = owner_settings.get("is_afk", False)
         in_schedule = check_auto_afk(owner_settings.get("afk_start", 23), owner_settings.get("afk_end", 7)) if owner_settings.get("auto_afk", False) else False
+        
         if manual_afk or in_schedule:
-            now = datetime.now().timestamp()
-            last_sent = afk_cooldowns.get((owner_id, peer_id), 0)
-            if now - last_sent > 300:
+            if (owner_id, peer_id) not in afk_cooldowns:
                 afk_text = owner_settings.get("afk_text", "Владелец сейчас занят. 💤")
                 with suppress(Exception):
                     await bot.send_message(chat_id=peer_id, text=afk_text, business_connection_id=conn_id)
-                afk_cooldowns[(owner_id, peer_id)] = now
+                afk_cooldowns[(owner_id, peer_id)] = True
         return
 
     mute_key = f"{conn_id}_{peer_id}"
     if mute_key in muted_chats:
-        # ИСПРАВЛЕНО: Удаляем сообщение ТОЛЬКО если это пишет собеседник, чтобы не удалять свои сообщения
         if not is_owner:
             with suppress(Exception):
                 await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
@@ -2419,8 +2369,8 @@ async def catch_edits(message: Message):
                         "chat_id": peer_id,
                         "owner_id": owner_id,
                         "user_id": message.from_user.id,
-                        "first_name": old_doc.get("first_name", "Без имени"),
-                        "username": old_doc.get("username", ""),
+                        "first_name": sender_name,
+                        "username": sender_username,
                         "last_edited_at": edited_at
                     },
                     "$inc": {"edit_count": 1}
@@ -2444,21 +2394,16 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
         key = f"{conn_id}_{peer_id}"
         session = active_amute.get(key)
         if session and session.get("message_id") == msg_id:
-            now_ts = datetime.now(timezone.utc).timestamp()
-            if now_ts < session["end_ts"]:
-                new_sent = None
-                with suppress(Exception):
-                    new_sent = await bot.send_message(
-                        chat_id=peer_id,
-                        text=session["text"],
-                        business_connection_id=conn_id
-                    )
-                if new_sent:
-                    session["message_id"] = new_sent.message_id
-                    print(f"🔁 Амут: переотправлено в {key}")
-            else:
-                active_amute.pop(key, None)
-            # ← ФИКС: не отправляем лишних уведомлений для амут-сообщения
+            new_sent = None
+            with suppress(Exception):
+                new_sent = await bot.send_message(
+                    chat_id=peer_id,
+                    text=session["text"],
+                    business_connection_id=conn_id
+                )
+            if new_sent:
+                session["message_id"] = new_sent.message_id
+                print(f"🔁 Амут: переотправлено в {key}")
             continue
 
         # ════ ОБЫЧНАЯ ОБРАБОТКА ════
