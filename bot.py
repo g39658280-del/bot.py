@@ -47,6 +47,7 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 
 MENU_PHOTO = "https://files.catbox.moe/bph5iz.webp"
+CAPTION_LIMIT = 1024
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -65,6 +66,7 @@ except Exception as e:
 
 muted_chats = set()
 afk_cooldowns = {}
+active_amute = {}  # key: "{conn_id}_{peer_id}" -> {"text", "end_ts", "message_id"}
 
 BOT_USERNAME = "your_bot_username"
 
@@ -97,10 +99,10 @@ def get_connect_kb():
 def get_connect_text() -> str:
     return (
         "🔌 <b>Подключение бота</b>\n\n"
-        "1️⃣ Настройки профиля — <a href=\"tg://settings/edit\">открыть</a>\n\n"
-        "2️⃣ <b>«Автоматизация чатов»</b>\n\n"
-        f"3️⃣ В поиск <code>@{BOT_USERNAME}</code> — добавить\n\n"
-        "4️⃣ Дайте <b>все права на сообщения</b>\n\n"
+        "Настройки профиля — <a href=\"tg://settings/edit\">открыть</a>\n\n"
+        "Дальше пролистай вниз до <b>«Автоматизация чатов»</b>\n\n"
+        f"В поиск введи <code>@{BOT_USERNAME}</code> и добавь\n\n"
+        "Дай <b>все права на сообщения</b>\n\n"
         "После подключения нажми <b>«Я подключил — проверить»</b>"
     )
 
@@ -115,21 +117,26 @@ def get_profile_kb():
 def get_profile_access_text() -> str:
     return (
         "🔌 <b>Доступ к профилю</b>\n\n"
-        "Теперь дай боту доступ к профилю. Нужно только:\n\n"
-        "• 👤 <b>Имя</b>\n"
-        "• 📝 <b>Описание (bio)</b>\n\n"
-        "1️⃣ Настройки профиля — <a href=\"tg://settings/edit\">открыть</a>\n\n"
-        f"2️⃣ <b>«Автоматизация чатов»</b> → <code>@{BOT_USERNAME}</code>\n\n"
-        "3️⃣ Включи <b>«Управление профилем»</b>\n\n"
-        "4️⃣ Нажми <b>«Проверить доступ»</b>"
+        "Нужно дать боту доступ только к:\n\n"
+        "• <b>Имя</b>\n"
+        "• <b>Описание (bio)</b>\n\n"
+        "Настройки профиля — <a href=\"tg://settings/edit\">открыть</a>\n\n"
+        f"Дальше <b>«Автоматизация чатов»</b> → <code>@{BOT_USERNAME}</code>\n\n"
+        "Включи <b>«Управление профилем»</b>\n\n"
+        "И нажми <b>«Проверить доступ»</b>"
     )
 
 
 # ==========================================
-# ПОКАЗ МЕНЮ С ФОТО
+# ПОКАЗ МЕНЮ С ФОТО (С ЗАЩИТОЙ ОТ ДЛИННОГО ТЕКСТА)
 # ==========================================
 async def show_menu(call: CallbackQuery, caption: str, kb, with_photo: bool = True):
     msg = call.message
+
+    # Защита: если caption длиннее лимита — показываем без фото
+    if len(caption) > CAPTION_LIMIT:
+        with_photo = False
+
     try:
         if with_photo:
             if msg.photo:
@@ -499,6 +506,24 @@ async def refresh_usernames_loop():
         except Exception as e:
             print(f"refresh_usernames_loop error: {e}")
             await asyncio.sleep(3600)
+
+
+# ==========================================
+# ЧИСТИЛЬЩИК АМУТ-СЕССИЙ
+# ==========================================
+async def amute_cleanup_loop():
+    while True:
+        try:
+            await asyncio.sleep(5)
+            now_ts = datetime.now(timezone.utc).timestamp()
+            expired = [k for k, v in active_amute.items() if now_ts >= v.get("end_ts", 0)]
+            for k in expired:
+                active_amute.pop(k, None)
+            if expired:
+                print(f"🧹 Очищено амут-сессий: {len(expired)}")
+        except Exception as e:
+            print(f"amute_cleanup_loop error: {e}")
+            await asyncio.sleep(10)
 
 
 # ==========================================
@@ -924,6 +949,7 @@ async def on_startup():
 
     asyncio.create_task(update_rates_loop())
     asyncio.create_task(refresh_usernames_loop())
+    asyncio.create_task(amute_cleanup_loop())
     _init_drive()
 
     with suppress(Exception):
@@ -949,7 +975,7 @@ dp.startup.register(on_startup)
 
 
 # ==========================================
-# ГЛАВНОЕ МЕНЮ (ЦВЕТНЫЕ КНОПКИ)
+# ГЛАВНОЕ МЕНЮ
 # ==========================================
 async def get_user_main_kb(user_id: int):
     user_data = await users_collection.find_one({"user_id": user_id}) or {}
@@ -992,7 +1018,6 @@ async def cmd_start(message: Message, state: FSMContext):
             upsert=True
         )
 
-    # Админ — сразу в меню
     if message.from_user.id == SUPERADMIN_ID:
         kb = await get_user_main_kb(message.from_user.id)
         text = "👋 <b>Твой личный бот-секретарь.</b>\nУправляй настройками ниже:"
@@ -1002,7 +1027,6 @@ async def cmd_start(message: Message, state: FSMContext):
             await message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
 
-    # Этап 1 — не подключён
     if not await is_bot_connected(message.from_user.id):
         try:
             await message.answer_photo(photo=MENU_PHOTO, caption=get_connect_text(), reply_markup=get_connect_kb(), parse_mode="HTML")
@@ -1010,7 +1034,6 @@ async def cmd_start(message: Message, state: FSMContext):
             await message.answer(get_connect_text(), reply_markup=get_connect_kb(), parse_mode="HTML")
         return
 
-    # Этап 2 — подключён, но нет доступа к профилю
     if not await has_profile_access(message.from_user.id):
         try:
             await message.answer_photo(photo=MENU_PHOTO, caption=get_profile_access_text(), reply_markup=get_profile_kb(), parse_mode="HTML")
@@ -1018,7 +1041,6 @@ async def cmd_start(message: Message, state: FSMContext):
             await message.answer(get_profile_access_text(), reply_markup=get_profile_kb(), parse_mode="HTML")
         return
 
-    # Всё подключено
     kb = await get_user_main_kb(message.from_user.id)
     text = "👋 <b>Твой личный бот-секретарь.</b>\nУправляй настройками ниже:"
     try:
@@ -1552,7 +1574,7 @@ async def force_unmute(call: CallbackQuery):
 
 
 # ==========================================
-# АВТООТВЕТЧИК (МЕНЮ + НАСТРОЙКИ)
+# АВТООТВЕТЧИК
 # ==========================================
 @dp.callback_query(F.data == "afk_menu")
 async def afk_menu_handler(call: CallbackQuery):
@@ -1704,7 +1726,7 @@ async def save_afk_time(message: Message, state: FSMContext):
 
 
 # ==========================================
-# ВАЛЮТЫ
+# ВАЛЮТЫ (серые / зелёные)
 # ==========================================
 @dp.callback_query(F.data == "currency_settings")
 async def currency_settings_handler(call: CallbackQuery):
@@ -1713,12 +1735,26 @@ async def currency_settings_handler(call: CallbackQuery):
             kb = get_connect_kb()
             await show_menu(call, get_connect_text(), kb, with_photo=True)
             return
+
     owner_settings = await users_collection.find_one({"user_id": call.from_user.id}) or {}
     display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
+
     builder = InlineKeyboardBuilder()
     for cur in ALL_CURRENCIES:
-        check = "✅" if cur in display else "⬜"
-        builder.button(text=f"{check} {cur}", callback_data=f"cur_toggle|{cur}", style="primary")
+        if cur in display:
+            # Выбрана — зелёная с галочкой
+            builder.button(
+                text=f"✅ {cur}",
+                callback_data=f"cur_toggle|{cur}",
+                style="success"
+            )
+        else:
+            # Не выбрана — обычная (без style)
+            builder.button(
+                text=cur,
+                callback_data=f"cur_toggle|{cur}"
+            )
+
     builder.button(text="🔙 Назад", callback_data="user_main", style="primary")
     builder.adjust(2)
     await show_menu(call, "💱 <b>Выбери валюты:</b>", builder.as_markup(), with_photo=True)
@@ -1805,35 +1841,47 @@ async def user_unmute_callback(call: CallbackQuery):
 
 
 # ==========================================
-# СТАТУС (БЕЗ ИМЕНИ И ФОТО)
+# СТАТУС (ФИКС: РАБОТАЕТ ДЛЯ ВСЕХ, ПОЛНАЯ ИНФА)
 # ==========================================
 @dp.callback_query(F.data == "user_status")
 async def user_status_handler(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID:
-        if not await is_bot_connected(call.from_user.id):
-            kb = get_connect_kb()
-            await show_menu(call, get_connect_text(), kb, with_photo=True)
-            return
-
     owner_id = call.from_user.id
+
+    user_data = await users_collection.find_one({"user_id": owner_id}) or {}
+    is_afk = user_data.get("is_afk", False)
+    afk_text = user_data.get("afk_text", "—")
+    display_cur = user_data.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
 
     conns = await connections_collection.find({"user_id": owner_id}).to_list(length=None)
     conn_ids = [c["business_connection_id"] for c in conns]
 
     total_archive = 0
+    total_deleted = 0
+    total_edited = 0
     if conn_ids:
         total_archive = await archive_collection.count_documents({"conn_id": {"$in": conn_ids}})
+        total_deleted = await archive_collection.count_documents({"conn_id": {"$in": conn_ids}, "is_deleted": True})
+        total_edited = await archive_collection.count_documents({"conn_id": {"$in": conn_ids}, "is_edited": True})
 
-    user_data = await users_collection.find_one({"user_id": owner_id}) or {}
-    is_afk = user_data.get("is_afk", False)
+    connected = len(conns) > 0
 
-    text = (
-        f"👤 <b>Мой статус</b>\n\n"
-        f"🆔 ID: <code>{owner_id}</code>\n"
-        f"💼 Подключено аккаунтов: <b>{len(conns)}</b>\n"
-        f"📦 В архиве: <b>{total_archive}</b> сообщений\n"
-        f"💤 Автоответчик: <b>{'🟢 ВКЛ' if is_afk else '🔴 ВЫКЛ'}</b>"
-    )
+    lines = ["👤 <b>Мой статус</b>", ""]
+    lines.append(f"🆔 <b>ID:</b> <code>{owner_id}</code>")
+    lines.append(f"🔗 <b>Бот подключён:</b> {'✅ Да' if connected else '❌ Нет'}")
+    lines.append(f"💼 <b>Аккаунтов:</b> {len(conns)}")
+    lines.append("")
+    lines.append("<b>📦 Архив сообщений</b>")
+    lines.append(f"• Всего: <b>{total_archive}</b>")
+    lines.append(f"• Удалено: <b>{total_deleted}</b>")
+    lines.append(f"• Изменено: <b>{total_edited}</b>")
+    lines.append("")
+    lines.append(f"💤 <b>Автоответчик:</b> {'🟢 ВКЛ' if is_afk else '🔴 ВЫКЛ'}")
+    if is_afk and afk_text and afk_text != "—":
+        lines.append(f"💬 <i>{html.escape(afk_text[:100])}</i>")
+    lines.append("")
+    lines.append(f"💱 <b>Валюты:</b> <code>{', '.join(display_cur)}</code>")
+
+    text = "\n".join(lines)
 
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="user_main", style="primary")
@@ -1849,15 +1897,52 @@ async def show_cmds(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID:
         if not await is_bot_connected(call.from_user.id):
             return
+
     text = (
-        "📖 <b>Команды (в бизнес-чатах):</b>\n\n"
-        "🚫 <code>.мут</code> — мут собеседника\n"
-        "💣 <code>.[N] [текст]</code> — спам\n"
-        "🎭 <code>.п1</code>, <code>.п2</code>, <code>.п3</code> — анимации печати\n"
-        "🧮 <code>5+3</code>, <code>5 баксов</code> — математика и валюты\n"
-        "🎁 <code>t.me/nft/...</code> — карточка подарка\n"
-        "🗑 <b>Удалённые и изменения</b> — в главном меню"
+        "📖 <b>Команды бота</b>\n"
+        "<i>Все команды пишутся в бизнес-чатах с префиксом точки</i>\n\n"
+
+        "<b>🚫 .мут</b>\n"
+        "Мутит собеседника — все его следующие сообщения будут удаляться\n"
+        "Пример: <code>.мут</code>\n\n"
+
+        "<b>🔁 .амут [текст]</b>\n"
+        "Антимут. Отправляет сообщение и переотправляет его 10 секунд при удалении мут-ботом\n"
+        "Пример: <code>.амут привет</code>\n\n"
+
+        "<b>💣 .[N] [текст]</b>\n"
+        "Спам. Отправляет текст N раз (максимум 50)\n"
+        "Пример: <code>.10 привет</code>\n\n"
+
+        "<b>🎭 .п1 [текст]</b>\n"
+        "Анимация печати — текст появляется посимвольно\n"
+        "Пример: <code>.п1 привет мир</code>\n\n"
+
+        "<b>⌨️ .п2 [текст]</b>\n"
+        "Анимация печати с курсором в конце\n"
+        "Пример: <code>.п2 привет</code>\n\n"
+
+        "<b>🌀 .п3 [текст]</b>\n"
+        "Анимация с рандомными буквами — текст «собирается» постепенно\n"
+        "Пример: <code>.п3 секретное сообщение</code>\n\n"
+
+        "<b>🧮 Математика</b>\n"
+        "Бот автоматически считает простые выражения\n"
+        "Пример: <code>5+3</code> → <code>8</code>\n"
+        "Пример: <code>10 умножить на 5</code> → <code>50</code>\n\n"
+
+        "<b>💱 Валюты</b>\n"
+        "Конвертация валют по актуальному курсу\n"
+        "Пример: <code>100 баксов</code>\n"
+        "Пример: <code>5 баксов + 10 евро</code>\n\n"
+
+        "<b>🎁 Подарки Telegram</b>\n"
+        "Кидай ссылку — бот покажет модель, фон, floor и офферы\n"
+        "Пример: <code>t.me/nft/PlushPepe-274</code>\n\n"
+
+        "<i>💡 Совет: зажми сообщение с командой и скопируй её себе</i>"
     )
+
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="user_main", style="primary")
     await show_menu(call, text, builder.as_markup(), with_photo=True)
@@ -1970,6 +2055,49 @@ async def mute_user(message: Message):
         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute|{peer_id}", style="danger")]])
         with suppress(Exception):
             await bot.send_message(chat_id=peer_id, text="мут выдан", reply_markup=markup, business_connection_id=conn_id)
+
+
+@dp.business_message(F.text.lower().startswith(".амут"))
+async def amute_command(message: Message):
+    conn_id = message.business_connection_id
+    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    if not owner_data:
+        return
+    owner_id = owner_data["user_id"]
+
+    if message.from_user.id != owner_id:
+        return
+
+    text = message.text[5:].strip()
+    if not text:
+        return
+
+    peer_id = message.chat.id
+
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=conn_id,
+            message_ids=[message.message_id]
+        )
+
+    sent = None
+    with suppress(Exception):
+        sent = await bot.send_message(
+            chat_id=peer_id,
+            text=text,
+            business_connection_id=conn_id
+        )
+
+    if not sent:
+        return
+
+    key = f"{conn_id}_{peer_id}"
+    active_amute[key] = {
+        "text": text,
+        "end_ts": datetime.now(timezone.utc).timestamp() + 10.0,
+        "message_id": sent.message_id,
+    }
+    print(f"🔁 Амут-сессия на 10с: {key} → {text[:50]}")
 
 
 @dp.business_message(F.text.regexp(r"^\.(\d+)\s+"))
@@ -2215,7 +2343,7 @@ async def handle_messages(message: Message):
 
 
 # ==========================================
-# РЕДАКТИРОВАНИЯ И УДАЛЕНИЯ
+# РЕДАКТИРОВАНИЯ И УДАЛЕНИЯ (С ФИКСОМ АМУТА)
 # ==========================================
 @dp.edited_business_message()
 async def catch_edits(message: Message):
@@ -2295,6 +2423,28 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
     owner_id = owner_data["user_id"]
 
     for msg_id in deleted.message_ids:
+        # ════ ФИКС: АМУТ — переотправка + пропуск обычной обработки ════
+        key = f"{conn_id}_{peer_id}"
+        session = active_amute.get(key)
+        if session and session.get("message_id") == msg_id:
+            now_ts = datetime.now(timezone.utc).timestamp()
+            if now_ts < session["end_ts"]:
+                new_sent = None
+                with suppress(Exception):
+                    new_sent = await bot.send_message(
+                        chat_id=peer_id,
+                        text=session["text"],
+                        business_connection_id=conn_id
+                    )
+                if new_sent:
+                    session["message_id"] = new_sent.message_id
+                    print(f"🔁 Амут: переотправлено в {key}")
+            else:
+                active_amute.pop(key, None)
+            # ← ФИКС: не отправляем лишних уведомлений для амут-сообщения
+            continue
+
+        # ════ ОБЫЧНАЯ ОБРАБОТКА ════
         old_msg = await archive_collection.find_one({
             "conn_id": conn_id,
             "chat_id": peer_id,
@@ -2343,17 +2493,8 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                         },
                         upsert=True
                     )
-        else:
-            with suppress(Exception):
-                await bot.send_message(
-                    chat_id=owner_id,
-                    text=(
-                        f"🗑 <b>Удалено сообщение</b>\n"
-                        f"🕐 {deleted_at.strftime('%d.%m %H:%M')}\n"
-                        f"<i>Сообщение отсутствует в архиве (не успело сохраниться)</i>"
-                    ),
-                    parse_mode="HTML"
-                )
+        # ← Убрал fallback-ветку: не отправляем уведомление, если сообщения нет в архиве
+        # (это команды бота, свои удаления и т.д.)
 
 
 # ==========================================
