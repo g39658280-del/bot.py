@@ -6,7 +6,7 @@ import html
 import re
 import json
 import aiohttp
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from aiohttp import web
 from contextlib import suppress
 from aiogram import Bot, Dispatcher, F
@@ -60,6 +60,7 @@ try:
     history_collection = db['history']
     archive_collection = db['chat_archive']
     deleted_users_collection = db['deleted_users']
+    schedules_collection = db['profile_schedules']
 except Exception as e:
     print(f"Ошибка БД: {e}")
 
@@ -67,6 +68,10 @@ muted_chats = set()
 afk_cooldowns = {}
 
 BOT_USERNAME = "your_bot_username"
+
+# Флаги, что права на изменение профиля обязательны
+REQUIRED_PROFILE_RIGHTS = ["can_edit_bio", "can_edit_name", "can_edit_username"]
+
 
 # ==========================================
 # ПОДКЛЮЧЕНИЕ БИЗНЕС-БОТА
@@ -105,6 +110,52 @@ def get_connect_text() -> str:
         "• Отправлять тебе удалённые и изменённые сообщения\n"
         "• Сохранять медиа на Google Drive\n"
         "• Отвечать на команды в чатах"
+    )
+
+
+# ==========================================
+# ПРОВЕРКА ПРАВ НА ПРОФИЛЬ
+# ==========================================
+async def get_profile_rights(conn_id: str) -> dict:
+    """Возвращает словарь прав на изменение профиля для данного соединения."""
+    doc = await connections_collection.find_one({"business_connection_id": conn_id})
+    if not doc:
+        return {}
+    return doc.get("rights", {})
+
+
+async def has_profile_edit_rights(conn_id: str) -> tuple[bool, list]:
+    """Проверяет, есть ли права на изменение bio / имени / username.
+       Возвращает (есть_все_права, список_недостающих)."""
+    rights = await get_profile_rights(conn_id)
+    missing = [r for r in REQUIRED_PROFILE_RIGHTS if not rights.get(r)]
+    return (len(missing) == 0, missing)
+
+
+def get_profile_rights_instruction(missing: list) -> str:
+    """Инструкция по выдаче недостающих прав."""
+    items = {
+        "can_edit_bio": "Описание профиля (bio)",
+        "can_edit_name": "Имя и фамилия",
+        "can_edit_username": "Username",
+    }
+    missing_lines = "\n".join([f"  • {items.get(m, m)}" for m in missing])
+    return (
+        "⚠️ <b>Не хватает прав для управления профилем</b>\n\n"
+        "Бот не может менять bio/имя/username твоего аккаунта, потому что ты не выдал соответствующие права.\n\n"
+        "<b>Что не хватает:</b>\n"
+        f"{missing_lines}\n\n"
+        "<b>📋 Как выдать права:</b>\n\n"
+        "1️⃣ Открой Telegram → <b>Настройки</b>\n"
+        "2️⃣ Прокрути до <b>«Автоматизация чатов»</b>\n"
+        "3️⃣ Нажми на нашего бота\n"
+        "4️⃣ Пролистай до раздела <b>«Разрешения для бота»</b>\n"
+        "5️⃣ Включи галочки:\n"
+        "   ✅ <b>Редактировать имя</b>\n"
+        "   ✅ <b>Редактировать описание</b>\n"
+        "   ✅ <b>Редактировать username</b>\n"
+        "6️⃣ Сохрани\n"
+        "7️⃣ Вернись сюда и проверь снова\n"
     )
 
 
@@ -265,40 +316,28 @@ _peer_cache = {}
 
 
 async def get_peer_info(conn_id: str, peer_id: int) -> dict:
-    """Возвращает имя и username собеседника (chat_id) — того, с кем ведётся переписка."""
     key = (conn_id, peer_id)
     if key in _peer_cache:
         return _peer_cache[key]
-
-    # Из последнего сообщения собеседника в архиве
     doc = await archive_collection.find_one(
         {"conn_id": conn_id, "chat_id": peer_id, "is_owner": False},
         sort=[("created_at", -1)]
     )
     if doc:
-        info = {
-            "first_name": doc.get("first_name") or "Без имени",
-            "username": doc.get("username") or ""
-        }
+        info = {"first_name": doc.get("first_name") or "Без имени", "username": doc.get("username") or ""}
         _peer_cache[key] = info
         return info
-
-    # Из Telegram API
     try:
         chat = await bot.get_chat(peer_id)
-        info = {
-            "first_name": chat.first_name or "Без имени",
-            "username": chat.username or ""
-        }
+        info = {"first_name": chat.first_name or "Без имени", "username": chat.username or ""}
     except Exception:
         info = {"first_name": "Без имени", "username": ""}
-
     _peer_cache[key] = info
     return info
 
 
 # ==========================================
-# АРХИВАЦИЯ (БЫСТРАЯ ЗАПИСЬ + ФОНОВАЯ ЗАГРУЗКА МЕДИА)
+# АРХИВАЦИЯ
 # ==========================================
 def _extract_media_info(message: Message):
     if message.photo:
@@ -332,9 +371,7 @@ async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"{ts}_{media_type}.{ext}"
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, upload_to_drive, buffer.read(), filename, folder_path, mime
-        )
+        result = await loop.run_in_executor(None, upload_to_drive, buffer.read(), filename, folder_path, mime)
         if result:
             await archive_collection.update_one(
                 {"_id": archive_id},
@@ -349,7 +386,6 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
     text = message.text or message.caption or ""
     media_type, file_id, ext, mime = _extract_media_info(message)
 
-    # Данные собеседника — от кого именно ведётся переписка
     if is_owner:
         peer_info = await get_peer_info(conn_id, peer_id)
     else:
@@ -403,38 +439,27 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
 async def notify_owner_about_deletion(owner_id, sender_name, sender_username, text, media_type=None, drive_link=None, deleted_at=None):
     time_str = deleted_at.strftime("%d.%m %H:%M") if deleted_at else datetime.now().strftime("%d.%m %H:%M")
     uname = f" @{sender_username}" if sender_username else ""
-
     parts = ["🗑 <b>Удалено сообщение</b>"]
     parts.append(f"👤 От: <b>{html.escape(sender_name)}</b>{html.escape(uname)}")
     parts.append(f"🕐 {time_str}")
-
     if text:
         preview = text[:500] + ("..." if len(text) > 500 else "")
         parts.append("")
         parts.append(f"💬 {html.escape(preview)}")
-
     if media_type:
         if drive_link:
             parts.append(f'📎 <a href="{drive_link}">[{media_type}]</a>')
         else:
             parts.append(f"📎 [{media_type}] (загрузка...)")
-
     with suppress(Exception):
-        await bot.send_message(
-            chat_id=owner_id,
-            text="\n".join(parts),
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
+        await bot.send_message(chat_id=owner_id, text="\n".join(parts), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def notify_owner_about_edit(owner_id, sender_name, sender_username, old_text, new_text, edited_at=None):
     time_str = edited_at.strftime("%d.%m %H:%M") if edited_at else datetime.now().strftime("%d.%m %H:%M")
     uname = f" @{sender_username}" if sender_username else ""
-
     old_preview = (old_text or "")[:400] + ("..." if len(old_text or "") > 400 else "")
     new_preview = (new_text or "")[:400] + ("..." if len(new_text or "") > 400 else "")
-
     body = (
         f"✏️ <b>Изменено сообщение</b>\n"
         f"👤 От: <b>{html.escape(sender_name)}</b>{html.escape(uname)}\n"
@@ -442,14 +467,8 @@ async def notify_owner_about_edit(owner_id, sender_name, sender_username, old_te
         f"📝 <b>Было:</b>\n<i>{html.escape(old_preview or '[пусто]')}</i>\n\n"
         f"📝 <b>Стало:</b>\n{html.escape(new_preview or '[пусто]')}"
     )
-
     with suppress(Exception):
-        await bot.send_message(
-            chat_id=owner_id,
-            text=body,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
+        await bot.send_message(chat_id=owner_id, text=body, parse_mode="HTML", disable_web_page_preview=True)
 
 
 # ==========================================
@@ -466,18 +485,9 @@ async def refresh_usernames_loop():
                     chat = await bot.get_chat(uid)
                     new_username = chat.username or ""
                     new_first_name = chat.first_name or "Без имени"
-                    await archive_collection.update_many(
-                        {"user_id": uid},
-                        {"$set": {"username": new_username, "first_name": new_first_name}}
-                    )
-                    await archive_collection.update_many(
-                        {"user_id": uid, "is_owner": False},
-                        {"$set": {"peer_username": new_username, "peer_first_name": new_first_name}}
-                    )
-                    await deleted_users_collection.update_many(
-                        {"user_id": uid},
-                        {"$set": {"username": new_username, "first_name": new_first_name}}
-                    )
+                    await archive_collection.update_many({"user_id": uid}, {"$set": {"username": new_username, "first_name": new_first_name}})
+                    await archive_collection.update_many({"user_id": uid, "is_owner": False}, {"$set": {"peer_username": new_username, "peer_first_name": new_first_name}})
+                    await deleted_users_collection.update_many({"user_id": uid}, {"$set": {"username": new_username, "first_name": new_first_name}})
                     updated += 1
                     await asyncio.sleep(0.4)
                 except Exception:
@@ -486,6 +496,75 @@ async def refresh_usernames_loop():
         except Exception as e:
             print(f"refresh_usernames_loop error: {e}")
             await asyncio.sleep(3600)
+
+
+# ==========================================
+# РАСПИСАНИЯ ПРОФИЛЯ (ФОНОВАЯ ЗАДАЧА)
+# ==========================================
+async def apply_schedules_loop():
+    """Раз в минуту проверяет расписания и применяет изменения профиля."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now = datetime.now(timezone.utc) + timedelta(hours=3)  # MSK
+            current_hm = now.hour * 60 + now.minute
+
+            # Берём все активные расписания
+            async for sched in schedules_collection.find({"enabled": True}):
+                owner_id = sched.get("owner_id")
+                conn_id = sched.get("conn_id")
+                start_hm = sched.get("start_minutes", 0)
+                end_hm = sched.get("end_minutes", 0)
+                target = sched.get("target")       # "bio" / "name" / "username"
+                value = sched.get("value", "")
+
+                # Проверяем, попадаем ли в период
+                in_period = False
+                if start_hm <= end_hm:
+                    in_period = start_hm <= current_hm < end_hm
+                else:  # переход через полночь
+                    in_period = current_hm >= start_hm or current_hm < end_hm
+
+                last_applied = sched.get("last_applied_state")  # "on" / "off"
+                should_be = "on" if in_period else "off"
+                if last_applied == should_be:
+                    continue
+
+                # Применяем
+                if in_period:
+                    success = await apply_profile_value(conn_id, target, value)
+                    if success:
+                        await schedules_collection.update_one({"_id": sched["_id"]}, {"$set": {"last_applied_state": "on"}})
+                        print(f"✅ Профиль обновлён ({target}) → {value}")
+                else:
+                    # Откатываем: ставим пустое значение (или исходное)
+                    default_value = sched.get("default_value", "")
+                    success = await apply_profile_value(conn_id, target, default_value)
+                    if success:
+                        await schedules_collection.update_one({"_id": sched["_id"]}, {"$set": {"last_applied_state": "off"}})
+                        print(f"✅ Профиль откачен ({target})")
+
+        except Exception as e:
+            print(f"apply_schedules_loop error: {e}")
+            await asyncio.sleep(30)
+
+
+async def apply_profile_value(conn_id: str, target: str, value: str) -> bool:
+    """Применяет значение к профилю через Bot API."""
+    try:
+        if target == "bio":
+            await bot.set_business_account_bio(business_connection_id=conn_id, bio=value or "")
+        elif target == "name":
+            parts = (value or "").split(" ", 1)
+            first_name = parts[0] if parts else ""
+            last_name = parts[1] if len(parts) > 1 else ""
+            await bot.set_business_account_name(business_connection_id=conn_id, first_name=first_name, last_name=last_name)
+        elif target == "username":
+            await bot.set_business_account_username(business_connection_id=conn_id, username=value or "")
+        return True
+    except Exception as e:
+        print(f"apply_profile_value error ({target}): {e}")
+        return False
 
 
 # ==========================================
@@ -592,77 +671,24 @@ EXCHANGE_CACHE = {}
 STARS_USD_RATE = 0.015
 
 CURRENCY_ALIASES = {
-    "usd": "USDT", "usdt": "USDT",
-    "доллар": "USDT", "доллары": "USDT", "долларов": "USDT", "доллара": "USDT",
-    "долл": "USDT", "долл.": "USDT",
-    "бакс": "USDT", "баксы": "USDT", "баксов": "USDT", "бакса": "USDT",
-    "бачей": "USDT", "бач": "USDT", "бач.": "USDT",
-    "баксик": "USDT", "баксиков": "USDT", "баксика": "USDT",
-    "зеленый": "USDT", "зелёный": "USDT", "зеленых": "USDT", "зелёных": "USDT",
-    "зелень": "USDT", "зелени": "USDT",
-    "юсд": "USDT", "юсдт": "USDT", "усд": "USDT", "усдт": "USDT",
-    "тетер": "USDT", "тетеры": "USDT", "тетеров": "USDT", "тетера": "USDT",
-    "тезер": "USDT", "тезеры": "USDT", "тезеров": "USDT", "тезера": "USDT",
-    "юста": "USDT", "юст": "USDT",
+    "usd": "USDT", "usdt": "USDT", "доллар": "USDT", "доллары": "USDT", "долларов": "USDT",
+    "долл": "USDT", "бакс": "USDT", "баксы": "USDT", "баксов": "USDT", "бачей": "USDT",
+    "баксик": "USDT", "зеленый": "USDT", "зелёный": "USDT", "зелень": "USDT",
+    "юсд": "USDT", "юсдт": "USDT", "усд": "USDT", "усдт": "USDT", "тетер": "USDT", "тезер": "USDT",
     "$": "USDT", "💵": "USDT", "💰": "USDT", "💲": "USDT",
-
-    "rub": "RUB", "руб": "RUB", "руб.": "RUB",
-    "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "рубля": "RUB", "рублю": "RUB",
-    "рубас": "RUB", "рубасов": "RUB", "рубаса": "RUB", "рубасы": "RUB",
-    "рубчик": "RUB", "рубчики": "RUB", "рубчиков": "RUB",
-    "деревянный": "RUB", "деревянных": "RUB", "деревянные": "RUB",
-    "р": "RUB", "р.": "RUB", "₽": "RUB",
-
-    "eur": "EUR", "евро": "EUR", "еврик": "EUR", "еврики": "EUR",
-    "евриков": "EUR", "еврика": "EUR", "евра": "EUR", "евров": "EUR",
-    "€": "EUR",
-
-    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "юаня": "CNY",
-    "юан": "CNY", "yuan": "CNY", "юанчики": "CNY",
-    "женьминьби": "CNY", "жэньминьби": "CNY", "¥": "CNY",
-
-    "btc": "BTC", "биткоин": "BTC", "биткоины": "BTC", "биткоинов": "BTC",
-    "биткоина": "BTC", "биткойн": "BTC", "биткойны": "BTC", "биткойнов": "BTC",
-    "биток": "BTC", "битки": "BTC", "битков": "BTC", "битка": "BTC",
-    "бит": "BTC", "биты": "BTC", "битов": "BTC",
-    "₿": "BTC",
-
-    "ton": "TON", "тон": "TON", "тона": "TON", "тонов": "TON", "тоны": "TON",
-    "тоник": "TON", "тоника": "TON", "тоников": "TON", "тонику": "TON",
-    "грам": "TON", "грама": "TON", "грамов": "TON", "граммы": "TON",
-    "грамм": "TON", "gram": "TON", "grams": "TON",
-    "павлуша": "TON", "дуров": "TON",
-    "💎": "TON",
-
-    "stars": "STARS", "star": "STARS",
-    "звезда": "STARS", "звёзда": "STARS", "звезды": "STARS", "звёзды": "STARS",
-    "звезд": "STARS", "звёзд": "STARS", "звезде": "STARS", "звёзде": "STARS",
-    "звездочка": "STARS", "звёздочка": "STARS",
-    "звездочки": "STARS", "звёздочки": "STARS",
-    "звездочек": "STARS", "звёздочек": "STARS",
-    "зв": "STARS", "зв.": "STARS",
-    "звездулька": "STARS", "звездульки": "STARS",
-    "starчик": "STARS", "стар": "STARS", "стары": "STARS", "старов": "STARS",
-    "⭐": "STARS", "🌟": "STARS", "✨": "STARS",
-
-    "eth": "ETH", "эфир": "ETH", "эфира": "ETH", "эфиров": "ETH", "эфиры": "ETH",
-    "эфириум": "ETH", "эфирка": "ETH", "эфирки": "ETH", "эфирок": "ETH",
-    "эфирчик": "ETH", "эфирчика": "ETH",
-    "Ξ": "ETH",
-
-    "kzt": "KZT", "тенге": "KZT", "теньге": "KZT", "теньга": "KZT",
-    "тг": "KZT", "тг.": "KZT", "₸": "KZT",
-
-    "uah": "UAH", "гривна": "UAH", "гривны": "UAH", "гривен": "UAH",
-    "гривне": "UAH", "гривня": "UAH", "гривню": "UAH",
-    "грн": "UAH", "грн.": "UAH", "₴": "UAH",
-
-    "gbp": "GBP", "фунт": "GBP", "фунты": "GBP", "фунтов": "GBP", "фунта": "GBP",
-    "стерлинг": "GBP", "стерлинги": "GBP", "стерлингов": "GBP",
-    "£": "GBP",
-
-    "jpy": "JPY", "иена": "JPY", "иены": "JPY", "иен": "JPY",
-    "йена": "JPY", "йены": "JPY", "йен": "JPY",
+    "rub": "RUB", "руб": "RUB", "рубль": "RUB", "рубли": "RUB", "рублей": "RUB",
+    "рубчик": "RUB", "деревянный": "RUB", "₽": "RUB",
+    "eur": "EUR", "евро": "EUR", "еврик": "EUR", "€": "EUR",
+    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "¥": "CNY",
+    "btc": "BTC", "биткоин": "BTC", "биток": "BTC", "битки": "BTC", "бит": "BTC", "₿": "BTC",
+    "ton": "TON", "тон": "TON", "тонов": "TON", "грам": "TON", "грамм": "TON", "grams": "TON", "💎": "TON",
+    "stars": "STARS", "star": "STARS", "звезда": "STARS", "звезды": "STARS", "звезд": "STARS",
+    "звездочка": "STARS", "звездочки": "STARS", "зв": "STARS", "стар": "STARS", "⭐": "STARS", "🌟": "STARS",
+    "eth": "ETH", "эфир": "ETH", "эфириум": "ETH", "эфирка": "ETH", "Ξ": "ETH",
+    "kzt": "KZT", "тенге": "KZT", "₸": "KZT",
+    "uah": "UAH", "гривна": "UAH", "гривен": "UAH", "грн": "UAH", "₴": "UAH",
+    "gbp": "GBP", "фунт": "GBP", "£": "GBP",
+    "jpy": "JPY", "иена": "JPY", "йена": "JPY",
 }
 
 ALL_CURRENCIES = ["RUB", "USDT", "EUR", "CNY", "KZT", "UAH", "GBP", "JPY", "BTC", "ETH", "TON", "STARS"]
@@ -673,15 +699,8 @@ _WORDS = r"(?:плюс|минус|умножить на|разделить на|
 AUTO_MATH_PATTERN = rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})+\s*$"
 AUTO_MATH_CURRENCY_PATTERN = rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$"
 
-WORD_NUMBERS = {
-    "ноль": 0, "один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6,
-    "семь": 7, "восемь": 8, "девять": 9, "десять": 10, "сто": 100, "тысяча": 1000,
-}
-OPERATORS = {
-    "умножить на": "*", "разделить на": "/", "поделить на": "/", "в степени": "**",
-    "плюс": "+", "сложить": "+", "минус": "-", "вычесть": "-",
-    "умножить": "*", "разделить": "/", "делить": "/", "поделить": "/", "х": "*",
-}
+WORD_NUMBERS = {"ноль": 0, "один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10, "сто": 100, "тысяча": 1000}
+OPERATORS = {"умножить на": "*", "разделить на": "/", "поделить на": "/", "в степени": "**", "плюс": "+", "сложить": "+", "минус": "-", "вычесть": "-", "умножить": "*", "разделить": "/", "делить": "/", "поделить": "/", "х": "*"}
 
 
 def parse_math_expression(text: str) -> str:
@@ -728,20 +747,10 @@ async def force_update_all_rates():
             for cur in ["RUB", "EUR", "CNY", "UAH", "KZT", "GBP", "JPY"]:
                 if rates.get(cur):
                     EXCHANGE_CACHE[cur] = 1.0 / rates[cur]
-
         for sym, code in [("BTCUSDT", "BTC"), ("ETHUSDT", "ETH")]:
             data = await fetch_json(f"https://api.mexc.com/api/v3/ticker/price?symbol={sym}")
             if data and "price" in data:
                 EXCHANGE_CACHE[code] = float(data["price"])
-            else:
-                cg_id = {"BTC": "bitcoin", "ETH": "ethereum"}.get(code)
-                if cg_id:
-                    cg_data = await fetch_json(
-                        f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd"
-                    )
-                    if cg_data and cg_id in cg_data:
-                        EXCHANGE_CACHE[code] = float(cg_data[cg_id]["usd"])
-
         ton_price = None
         for ton_sym in ["TONUSDT", "GRAMUSDT"]:
             data = await fetch_json(f"https://api.mexc.com/api/v3/ticker/price?symbol={ton_sym}")
@@ -752,18 +761,13 @@ async def force_update_all_rates():
                     break
                 except (ValueError, TypeError):
                     pass
-
         if ton_price is None:
-            cg_data = await fetch_json(
-                "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd"
-            )
+            cg_data = await fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd")
             if cg_data and "the-open-network" in cg_data:
                 ton_price = float(cg_data["the-open-network"]["usd"])
                 print(f"✅ TON курс с CoinGecko: {ton_price}")
-
         if ton_price is not None:
             EXCHANGE_CACHE["TON"] = ton_price
-
         EXCHANGE_CACHE["USD"] = 1.0
         EXCHANGE_CACHE["USDT"] = 1.0
         EXCHANGE_CACHE["STARS"] = STARS_USD_RATE
@@ -791,40 +795,26 @@ async def send_currency_conversion(message: Message, amount: float, from_cur: st
     owner_id = message.from_user.id
     owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
     display_currencies = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
-
     if from_cur == "USD":
         from_cur = "USDT"
-
     if original_expr:
         header = f"🔄 Конвертация {original_expr} {from_cur}"
     else:
         amount_str = f"{amount:.6f}".rstrip("0").rstrip(".")
         header = f"🔄 Конвертация {amount_str} {from_cur}"
-
     lines = [f"<b>{header}</b>", ""]
-
-    emoji_map = {
-        "RUB": "🇷🇺", "USDT": "💵", "EUR": "🇪🇺", "CNY": "🇨🇳", "KZT": "🇰🇿",
-        "UAH": "🇺🇦", "GBP": "🇬🇧", "JPY": "🇯🇵", "BTC": "₿", "ETH": "Ξ",
-        "TON": "💎", "STARS": "⭐",
-    }
-
+    emoji_map = {"RUB": "🇷🇺", "USDT": "💵", "EUR": "🇪🇺", "CNY": "🇨🇳", "KZT": "🇰🇿", "UAH": "🇺🇦", "GBP": "🇬🇧", "JPY": "🇯🇵", "BTC": "₿", "ETH": "Ξ", "TON": "💎", "STARS": "⭐"}
     shown = set()
     results_found = 0
-
     for target in display_currencies:
         if target == "USD":
             target = "USDT"
-        if target in shown:
-            continue
-        if target == from_cur:
+        if target in shown or target == from_cur:
             continue
         shown.add(target)
-
         result = await convert_currency(amount, from_cur, target)
         if result is None:
             continue
-
         if target in ("BTC", "ETH", "TON"):
             formatted = f"{result:.6f}".rstrip("0").rstrip(".")
         elif target == "STARS":
@@ -833,17 +823,13 @@ async def send_currency_conversion(message: Message, amount: float, from_cur: st
             formatted = f"{result:.2f}"
         else:
             formatted = f"{result:.3f}".rstrip("0").rstrip(".")
-
         if not formatted:
             formatted = "0"
-
         emoji = emoji_map.get(target, "•")
         lines.append(f"{target} {emoji}: <code>{formatted}</code>")
         results_found += 1
-
     if results_found == 0:
         lines.append("<i>Нет доступных валют для конвертации</i>")
-
     with suppress(Exception):
         await message.reply("\n".join(lines), parse_mode="HTML")
 
@@ -862,19 +848,26 @@ class ReplyHasMedia(BaseFilter):
 class UserStates(StatesGroup):
     waiting_for_afk_text = State()
     waiting_for_afk_time = State()
+    waiting_sched_start = State()
+    waiting_sched_end = State()
+    waiting_sched_value = State()
+    waiting_sched_default = State()
 
 
-async def ensure_connection(conn_id: str, owner_id: int, owner_name: str, owner_username: str = ""):
+async def ensure_connection(conn_id: str, owner_id: int, owner_name: str, owner_username: str = "", rights: dict = None):
     with suppress(Exception):
+        update = {
+            "business_connection_id": conn_id,
+            "user_id": owner_id,
+            "first_name": owner_name or "Без имени",
+            "username": owner_username or "",
+            "updated_at": datetime.now(timezone.utc)
+        }
+        if rights is not None:
+            update["rights"] = rights
         await connections_collection.update_one(
             {"business_connection_id": conn_id},
-            {"$set": {
-                "business_connection_id": conn_id,
-                "user_id": owner_id,
-                "first_name": owner_name or "Без имени",
-                "username": owner_username or "",
-                "updated_at": datetime.now(timezone.utc)
-            }},
+            {"$set": update},
             upsert=True
         )
 
@@ -913,7 +906,6 @@ async def start_web_server() -> web.AppRunner:
 
 async def on_startup():
     global BOT_USERNAME
-
     with suppress(Exception):
         await messages_collection.create_index("created_at", expireAfterSeconds=172800)
     with suppress(Exception):
@@ -923,16 +915,18 @@ async def on_startup():
         await archive_collection.create_index([("conn_id", 1), ("chat_id", 1), ("is_owner", 1), ("created_at", -1)])
     with suppress(Exception):
         await deleted_users_collection.create_index([("conn_id", 1), ("chat_id", 1)])
+    with suppress(Exception):
+        await schedules_collection.create_index([("owner_id", 1), ("conn_id", 1)])
 
     asyncio.create_task(update_rates_loop())
     asyncio.create_task(refresh_usernames_loop())
+    asyncio.create_task(apply_schedules_loop())
     _init_drive()
 
     with suppress(Exception):
         me = await bot.get_me()
         BOT_USERNAME = me.username or "your_bot_username"
         print(f"✅ Бот: @{BOT_USERNAME}")
-
     with suppress(Exception):
         me = await fetch_gift_satellite("/user/me")
         if me:
@@ -956,14 +950,17 @@ dp.startup.register(on_startup)
 async def get_user_main_kb(user_id: int):
     user_data = await users_collection.find_one({"user_id": user_id}) or {}
     is_afk = user_data.get("is_afk", False)
-    status_text = "🔴 ВЫКЛ" if not is_afk else "🟢 ВКЛ"
+    afk_btn = InlineKeyboardButton(
+        text="🟢 Автоответчик — ВКЛЮЧЕН" if is_afk else "🔴 Автоответчик — ВЫКЛЮЧЕН",
+        callback_data="afk_menu"
+    )
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💤 Автоответчик: {status_text}", callback_data="toggle_afk")],
-        [InlineKeyboardButton(text="⚙️ Настройки автоответчика", callback_data="afk_settings")],
-        [InlineKeyboardButton(text="💱 Валюты для конвертации", callback_data="currency_settings")],
-        [InlineKeyboardButton(text="🔇 Управление мутами", callback_data="user_mutes")],
-        [InlineKeyboardButton(text="🗑 Удалённые и изменения", callback_data="deleted_menu")],
-        [InlineKeyboardButton(text="📖 Доступные команды", callback_data="user_cmds")]
+        [InlineKeyboardButton(text="📖 Доступные команды", callback_data="user_cmds")],
+        [InlineKeyboardButton(text="🔇 Управление мутами", callback_data="user_mutes"),
+         InlineKeyboardButton(text="🗑 Удалённые и изменения", callback_data="deleted_menu")],
+        [InlineKeyboardButton(text="👤 Мой статус", callback_data="user_status"),
+         InlineKeyboardButton(text="💱 Валюты", callback_data="currency_settings")],
+        [afk_btn],
     ])
 
 
@@ -971,12 +968,7 @@ async def get_user_main_kb(user_id: int):
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     with suppress(Exception):
-        await users_collection.update_one(
-            {"user_id": message.from_user.id},
-            {"$set": {"user_id": message.from_user.id}},
-            upsert=True
-        )
-
+        await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"user_id": message.from_user.id}}, upsert=True)
     if not await is_bot_connected(message.from_user.id):
         kb = get_connect_kb()
         text = get_connect_text()
@@ -985,7 +977,6 @@ async def cmd_start(message: Message, state: FSMContext):
         except Exception:
             await message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
-
     kb = await get_user_main_kb(message.from_user.id)
     text = "👋 <b>Твой личный бот-секретарь.</b>\nУправляй статусом и настройками ниже:"
     try:
@@ -1021,6 +1012,367 @@ async def user_main_handler(call: CallbackQuery, state: FSMContext):
 
 
 # ==========================================
+# АВТООТВЕТЧИК
+# ==========================================
+async def get_afk_settings_kb(user_id: int):
+    user_data = await users_collection.find_one({"user_id": user_id}) or {}
+    auto_afk = user_data.get("auto_afk", False)
+    start_h = user_data.get("afk_start", 23)
+    end_h = user_data.get("afk_end", 7)
+    auto_status = "ВКЛ" if auto_afk else "ВЫКЛ"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Изменить текст", callback_data="afk_set_text")],
+        [InlineKeyboardButton(text=f"🕒 Авто-включение: {auto_status}", callback_data="toggle_auto_afk")],
+        [InlineKeyboardButton(text=f"⏰ Время: {start_h}:00 - {end_h}:00", callback_data="afk_set_time")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="afk_menu")],
+    ])
+
+
+@dp.callback_query(F.data == "afk_menu")
+async def afk_menu_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        kb = get_connect_kb()
+        await show_menu(call, get_connect_text(), kb, with_photo=True)
+        return
+    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    is_afk = user_data.get("is_afk", False)
+    toggle_btn = InlineKeyboardButton(
+        text="🟢 Выключить автоответчик" if is_afk else "🔴 Включить автоответчик",
+        callback_data="toggle_afk"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [toggle_btn],
+        [InlineKeyboardButton(text="⚙️ Настройки автоответчика", callback_data="afk_settings")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="user_main")],
+    ])
+    state = "🟢 ВКЛЮЧЕН" if is_afk else "🔴 ВЫКЛЮЧЕН"
+    await show_menu(call, f"💤 <b>Автоответчик</b>\n\nТекущий статус: <b>{state}</b>", kb, with_photo=True)
+
+
+@dp.callback_query(F.data == "afk_settings")
+async def afk_settings_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        kb = get_connect_kb()
+        await show_menu(call, get_connect_text(), kb, with_photo=True)
+        return
+    kb = await get_afk_settings_kb(call.from_user.id)
+    await show_menu(call, "⚙️ <b>Настройки автоответчика:</b>", kb, with_photo=True)
+
+
+@dp.callback_query(F.data == "toggle_afk")
+async def toggle_afk_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        return
+    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    new_status = not user_data.get("is_afk", False)
+    await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"is_afk": new_status}}, upsert=True)
+    await afk_menu_handler(call)
+
+
+@dp.callback_query(F.data == "toggle_auto_afk")
+async def toggle_auto_afk(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        return
+    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    new_status = not user_data.get("auto_afk", False)
+    await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"auto_afk": new_status}}, upsert=True)
+    kb = await get_afk_settings_kb(call.from_user.id)
+    await show_menu(call, "⚙️ <b>Настройки автоответчика:</b>", kb, with_photo=True)
+
+
+@dp.callback_query(F.data == "afk_set_text")
+async def afk_set_text(call: CallbackQuery, state: FSMContext):
+    if not await is_bot_connected(call.from_user.id):
+        return
+    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    current = user_data.get("afk_text", "Владелец занят. 💤")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Отмена", callback_data="afk_settings")
+    await show_menu(call, f"Текущий текст:\n<i>{html.escape(current)}</i>\n\nОтправь новый:", builder.as_markup(), with_photo=True)
+    await state.set_state(UserStates.waiting_for_afk_text)
+
+
+@dp.message(UserStates.waiting_for_afk_text)
+async def save_afk_text(message: Message, state: FSMContext):
+    await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"afk_text": message.text}})
+    kb = await get_afk_settings_kb(message.from_user.id)
+    await message.answer("✅ Сохранено!", reply_markup=kb)
+    await state.clear()
+
+
+@dp.callback_query(F.data == "afk_set_time")
+async def afk_set_time(call: CallbackQuery, state: FSMContext):
+    if not await is_bot_connected(call.from_user.id):
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Отмена", callback_data="afk_settings")
+    await show_menu(call, "Формат: <code>23 7</code> (с 23:00 до 07:00)", builder.as_markup(), with_photo=True)
+    await state.set_state(UserStates.waiting_for_afk_time)
+
+
+@dp.message(UserStates.waiting_for_afk_time)
+async def save_afk_time(message: Message, state: FSMContext):
+    try:
+        parts = message.text.replace("-", " ").split()
+        start_h, end_h = int(parts[0]), int(parts[1])
+        if 0 <= start_h <= 23 and 0 <= end_h <= 23:
+            await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"afk_start": start_h, "afk_end": end_h}})
+            kb = await get_afk_settings_kb(message.from_user.id)
+            await message.answer("✅ Сохранено!", reply_markup=kb)
+            await state.clear()
+        else:
+            await message.answer("⚠ Часы от 0 до 23")
+    except Exception:
+        await message.answer("⚠ Формат: <code>23 7</code>", parse_mode="HTML")
+
+
+# ==========================================
+# МОЙ СТАТУС + РАСПИСАНИЯ
+# ==========================================
+@dp.callback_query(F.data == "user_status")
+async def user_status_handler(call: CallbackQuery):
+    if not await is_bot_connected(call.from_user.id):
+        kb = get_connect_kb()
+        await show_menu(call, get_connect_text(), kb, with_photo=True)
+        return
+
+    owner_id = call.from_user.id
+    conns = await connections_collection.find({"user_id": owner_id}).to_list(length=None)
+    if not conns:
+        # Единственный аккаунт — берём первый попавшийся conn_id из контекста
+        conn_id = None
+    else:
+        conn_id = conns[0]["business_connection_id"]
+
+    # Проверяем права
+    if conn_id:
+        ok, missing = await has_profile_edit_rights(conn_id)
+    else:
+        ok, missing = False, REQUIRED_PROFILE_RIGHTS
+
+    if not ok:
+        text = get_profile_rights_instruction(missing)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📖 Как подключить права", callback_data="profile_rights_help")],
+            [InlineKeyboardButton(text="🔄 Проверить снова", callback_data="user_status")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="user_main")],
+        ])
+        await show_menu(call, text, kb, with_photo=True)
+        return
+
+    # Права есть — показываем расписания
+    await show_schedules_menu(call, conn_id)
+
+
+@dp.callback_query(F.data == "profile_rights_help")
+async def profile_rights_help(call: CallbackQuery):
+    owner_id = call.from_user.id
+    conns = await connections_collection.find({"user_id": owner_id}).to_list(length=None)
+    conn_id = conns[0]["business_connection_id"] if conns else None
+    if not conn_id:
+        await call.answer("Сначала подключите бота", show_alert=True)
+        return
+    ok, missing = await has_profile_edit_rights(conn_id)
+    text = get_profile_rights_instruction(missing if not ok else [])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Проверить снова", callback_data="user_status")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="user_main")],
+    ])
+    await show_menu(call, text, kb, with_photo=True)
+
+
+async def show_schedules_menu(call: CallbackQuery, conn_id: str):
+    """Показывает список расписаний и кнопки управления."""
+    owner_id = call.from_user.id
+    scheds = await schedules_collection.find({"owner_id": owner_id, "conn_id": conn_id}).to_list(length=50)
+
+    builder = InlineKeyboardBuilder()
+    if not scheds:
+        builder.button(text="➕ Создать расписание", callback_data="sched_create")
+        builder.button(text="🔙 Назад", callback_data="user_main")
+        builder.adjust(1)
+        await show_menu(
+            call,
+            "📋 <b>Расписания профиля</b>\n\nПока нет ни одного расписания.\n\n"
+            "Создай первое — бот будет автоматически менять твой профиль по времени.",
+            builder.as_markup(), with_photo=True
+        )
+        return
+
+    for s in scheds:
+        target_label = {"bio": "📝 Bio", "name": "👤 Имя", "username": "🏷 Username"}.get(s.get("target"), s.get("target"))
+        state = "🟢" if s.get("enabled") else "⚪"
+        label = f"{state} {target_label}: {s.get('start', '?')}–{s.get('end', '?')} → {s.get('value', '')[:20]}"
+        builder.button(text=label[:60], callback_data=f"sched_view|{s['_id']}")
+
+    builder.button(text="➕ Создать расписание", callback_data="sched_create")
+    builder.button(text="🔙 Назад", callback_data="user_main")
+    builder.adjust(1)
+    await show_menu(call, "📋 <b>Расписания профиля:</b>", builder.as_markup(), with_photo=True)
+
+
+@dp.callback_query(F.data == "sched_create")
+async def sched_create(call: CallbackQuery, state: FSMContext):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Отмена", callback_data="user_status")
+    await show_menu(
+        call,
+        "📋 <b>Создание расписания</b>\n\n"
+        "Шаг 1/3: выбери, что менять.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Bio (описание)", callback_data="sched_target|bio")],
+            [InlineKeyboardButton(text="👤 Имя", callback_data="sched_target|name")],
+            [InlineKeyboardButton(text="🏷 Username", callback_data="sched_target|username")],
+            [InlineKeyboardButton(text="🔙 Отмена", callback_data="user_status")],
+        ]),
+        with_photo=True
+    )
+
+
+@dp.callback_query(F.data.startswith("sched_target|"))
+async def sched_target(call: CallbackQuery, state: FSMContext):
+    target = call.data.split("|")[1]
+    await state.update_data(sched_target=target)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Отмена", callback_data="user_status")
+    await show_menu(
+        call,
+        f"📋 Цель: <b>{target}</b>\n\n"
+        "Шаг 2/3: отправь период в формате <code>HH:MM-HH:MM</code>\n"
+        "Например: <code>23:00-07:30</code>",
+        builder.as_markup(), with_photo=True
+    )
+    await state.set_state(UserStates.waiting_sched_start)
+
+
+@dp.message(UserStates.waiting_sched_start)
+async def sched_start_input(message: Message, state: FSMContext):
+    text = message.text.strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})$", text)
+    if not m:
+        await message.answer("⚠ Формат: <code>23:00-07:30</code>", parse_mode="HTML")
+        return
+    sh, sm, eh, em = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= eh <= 23 and 0 <= em <= 59):
+        await message.answer("⚠ Некорректное время")
+        return
+    await state.update_data(sched_start=f"{sh:02d}:{sm:02d}", sched_end=f"{eh:02d}:{em:02d}",
+                            sched_start_min=sh*60+sm, sched_end_min=eh*60+em)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Отмена", callback_data="user_status")
+    await message.answer(
+        f"📋 Период: <b>{sh:02d}:{sm:02d}–{eh:02d}:{em:02d}</b>\n\n"
+        "Шаг 3/3: отправь значение, которое ставить в этот период.\n"
+        "Например: <code>сплю</code>",
+        reply_markup=builder.as_markup(), parse_mode="HTML"
+    )
+    await state.set_state(UserStates.waiting_sched_value)
+
+
+@dp.message(UserStates.waiting_sched_value)
+async def sched_value_input(message: Message, state: FSMContext):
+    value = message.text.strip()[:200]
+    data = await state.get_data()
+    owner_id = message.from_user.id
+    conns = await connections_collection.find({"user_id": owner_id}).to_list(length=None)
+    if not conns:
+        await message.answer("⚠ Нет подключённых аккаунтов")
+        await state.clear()
+        return
+    conn_id = conns[0]["business_connection_id"]
+
+    sched = {
+        "owner_id": owner_id,
+        "conn_id": conn_id,
+        "target": data.get("sched_target"),
+        "start": data.get("sched_start"),
+        "end": data.get("sched_end"),
+        "start_minutes": data.get("sched_start_min"),
+        "end_minutes": data.get("sched_end_min"),
+        "value": value,
+        "default_value": "",
+        "enabled": True,
+        "last_applied_state": None,
+        "created_at": datetime.now(timezone.utc),
+    }
+    result = await schedules_collection.insert_one(sched)
+    sched["_id"] = result.inserted_id
+
+    await message.answer(
+        f"✅ Расписание создано!\n\n"
+        f"🎯 Цель: <b>{sched['target']}</b>\n"
+        f"⏰ Период: <b>{sched['start']}–{sched['end']}</b>\n"
+        f"💬 Значение: <b>{html.escape(value)}</b>",
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+    # Переходим в меню расписаний
+    class _FakeCall:
+        def __init__(self, msg, user):
+            self.message = msg
+            self.from_user = user
+    fake = _FakeCall(message, message.from_user)
+    await show_schedules_menu(fake, conn_id)
+
+
+@dp.callback_query(F.data.startswith("sched_view|"))
+async def sched_view(call: CallbackQuery):
+    sched_id = call.data.split("|")[1]
+    from bson import ObjectId
+    try:
+        sched = await schedules_collection.find_one({"_id": ObjectId(sched_id)})
+    except Exception:
+        await call.answer("Не найдено", show_alert=True)
+        return
+    if not sched:
+        await call.answer("Не найдено", show_alert=True)
+        return
+
+    target_label = {"bio": "📝 Bio", "name": "👤 Имя", "username": "🏷 Username"}.get(sched.get("target"), sched.get("target"))
+    state = "🟢 ВКЛ" if sched.get("enabled") else "⚪ ВЫКЛ"
+
+    text = (
+        f"📋 <b>Расписание</b>\n\n"
+        f"🎯 {target_label}\n"
+        f"⏰ {sched['start']}–{sched['end']}\n"
+        f"💬 <i>{html.escape(sched.get('value', ''))}</i>\n"
+        f"📊 Статус: {state}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Вкл/Выкл", callback_data=f"sched_toggle|{sched_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"sched_delete|{sched_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="user_status")],
+    ])
+    await show_menu(call, text, kb, with_photo=True)
+
+
+@dp.callback_query(F.data.startswith("sched_toggle|"))
+async def sched_toggle(call: CallbackQuery):
+    sched_id = call.data.split("|")[1]
+    from bson import ObjectId
+    sched = await schedules_collection.find_one({"_id": ObjectId(sched_id)})
+    if not sched:
+        await call.answer("Не найдено", show_alert=True)
+        return
+    new_state = not sched.get("enabled", True)
+    await schedules_collection.update_one({"_id": ObjectId(sched_id)}, {"$set": {"enabled": new_state, "last_applied_state": None}})
+    await call.answer("✅ Обновлено")
+    await sched_view(call)
+
+
+@dp.callback_query(F.data.startswith("sched_delete|"))
+async def sched_delete(call: CallbackQuery):
+    sched_id = call.data.split("|")[1]
+    from bson import ObjectId
+    await schedules_collection.delete_one({"_id": ObjectId(sched_id)})
+    await call.answer("🗑 Удалено", show_alert=True)
+    conns = await connections_collection.find({"user_id": call.from_user.id}).to_list(length=None)
+    if conns:
+        await show_schedules_menu(call, conns[0]["business_connection_id"])
+
+
+# ==========================================
 # МЕНЮ УДАЛЁНОК
 # ==========================================
 @dp.callback_query(F.data == "deleted_menu")
@@ -1029,14 +1381,9 @@ async def deleted_menu_handler(call: CallbackQuery):
         kb = get_connect_kb()
         await show_menu(call, get_connect_text(), kb, with_photo=True)
         return
-
     owner_id = call.from_user.id
-
     pipeline = [
-        {"$match": {
-            "owner_id": owner_id,
-            "$or": [{"is_deleted": True}, {"is_edited": True}]
-        }},
+        {"$match": {"owner_id": owner_id, "$or": [{"is_deleted": True}, {"is_edited": True}]}},
         {"$group": {
             "_id": {"conn_id": "$conn_id", "chat_id": "$chat_id"},
             "del_count": {"$sum": {"$cond": [{"$eq": ["$is_deleted", True]}, 1, 0]}},
@@ -1047,13 +1394,11 @@ async def deleted_menu_handler(call: CallbackQuery):
         {"$sort": {"del_count": -1, "edit_count": -1}},
     ]
     chats = await archive_collection.aggregate(pipeline).to_list(length=None)
-
     builder = InlineKeyboardBuilder()
     if not chats:
         builder.button(text="🔙 Назад", callback_data="user_main")
         await show_menu(call, "🗑 <b>Удалённые и изменения</b>\n\nПока пусто.", builder.as_markup(), with_photo=True)
         return
-
     for ch in chats:
         conn_id = ch["_id"]["conn_id"]
         chat_id = ch["_id"]["chat_id"]
@@ -1061,13 +1406,11 @@ async def deleted_menu_handler(call: CallbackQuery):
         uname = f"@{ch['username']}" if ch.get("username") else ""
         del_c = ch.get("del_count", 0)
         edit_c = ch.get("edit_count", 0)
-
         parts_label = []
         if del_c: parts_label.append(f"🗑{del_c}")
         if edit_c: parts_label.append(f"✏️{edit_c}")
         label = f"{name} {uname} · {' '.join(parts_label)}"
         builder.button(text=label[:60], callback_data=f"delchat|{conn_id}|{chat_id}")
-
     builder.button(text="🔙 Назад", callback_data="user_main")
     builder.adjust(1)
     await show_menu(call, "🗑 <b>Собеседники (удалённые / изменения):</b>", builder.as_markup(), with_photo=True)
@@ -1084,11 +1427,9 @@ async def deleted_chat_handler(call: CallbackQuery):
     _, conn_id, chat_id_str = parts
     chat_id = int(chat_id_str)
     owner_id = call.from_user.id
-
     base = {"owner_id": owner_id, "conn_id": conn_id, "chat_id": chat_id}
     del_total = await archive_collection.count_documents({**base, "is_deleted": True})
     edit_total = await archive_collection.count_documents({**base, "is_edited": True})
-
     builder = InlineKeyboardBuilder()
     if del_total:
         builder.button(text=f"📋 Все удалённые ({del_total})", callback_data=f"delshow|{conn_id}|{chat_id}|del|0")
@@ -1098,14 +1439,7 @@ async def deleted_chat_handler(call: CallbackQuery):
         builder.button(text="📥 Скачать архивом", callback_data=f"deldl|{conn_id}|{chat_id}")
     builder.button(text="🔙 Назад", callback_data="deleted_menu")
     builder.adjust(1)
-
-    await show_menu(
-        call,
-        f"🗑 <b>Активность собеседника</b>\n\n"
-        f"Удалено: <b>{del_total}</b>\n"
-        f"Изменено: <b>{edit_total}</b>",
-        builder.as_markup(), with_photo=True
-    )
+    await show_menu(call, f"🗑 <b>Активность собеседника</b>\n\nУдалено: <b>{del_total}</b>\nИзменено: <b>{edit_total}</b>", builder.as_markup(), with_photo=True)
 
 
 PAGE_SIZE = 10
@@ -1121,29 +1455,23 @@ async def _render_page(conn_id: str, chat_id: int, owner_id: int, mode: str, off
         sort_field = "edited_at"
     else:
         return None, 0, 0, False
-
     total = await archive_collection.count_documents(query)
     msgs = await archive_collection.find(query).sort(sort_field, -1).skip(offset).limit(PAGE_SIZE).to_list(length=PAGE_SIZE)
     msgs.reverse()
-
     if not msgs:
         return None, 0, total, False
-
     lines = []
     for m in msgs:
         ts = m.get("created_at")
         ts_str = ts.strftime("%d.%m %H:%M") if isinstance(ts, datetime) else "?"
         author = m.get("first_name") or "Без имени"
         is_owner = m.get("is_owner", False)
-
         prefix = ""
         if m.get("is_deleted") and not m.get("is_edited"):
             prefix = "🗑 "
         elif m.get("is_edited"):
             prefix = "✏️ "
-
         sender = "Я" if is_owner else html.escape(author)
-
         if m.get("is_edited"):
             old_t = html.escape(m.get("old_text") or "[не сохранено]")
             new_t = html.escape(m.get("text") or "")
@@ -1154,15 +1482,11 @@ async def _render_page(conn_id: str, chat_id: int, owner_id: int, mode: str, off
                 body += f'\n📎 <a href="{m["drive_link"]}">[{m["media_type"]}]</a>'
             elif m.get("media_type"):
                 body += f'\n📎 [{m["media_type"]}] (загрузка...)'
-
         lines.append(f"{prefix}<b>{ts_str} · {sender}</b>\n{body}\n{'─' * 18}")
-
     header = f"<b>📄 Показано {offset + 1}–{offset + len(msgs)} из {total}</b>\n\n"
     text = header + "\n".join(lines)
-
     if len(text) > 3800:
         text = text[:3800] + "\n<i>...обрезано</i>"
-
     has_more = (offset + len(msgs)) < total
     return text, len(msgs), total, has_more
 
@@ -1177,24 +1501,17 @@ async def show_deleted_messages(call: CallbackQuery):
     chat_id = int(chat_id_str)
     offset = int(offset_str)
     owner_id = call.from_user.id
-
     text, shown, total, has_more = await _render_page(conn_id, chat_id, owner_id, mode, offset)
     if not text:
         await call.answer("Пусто", show_alert=True)
         return
-
     builder = InlineKeyboardBuilder()
     if has_more:
-        builder.button(
-            text=f"⬇️ Показать ещё {min(PAGE_SIZE, total - offset - shown)}",
-            callback_data=f"delshow|{conn_id}|{chat_id}|{mode}|{offset + shown}"
-        )
+        builder.button(text=f"⬇️ Показать ещё {min(PAGE_SIZE, total - offset - shown)}", callback_data=f"delshow|{conn_id}|{chat_id}|{mode}|{offset + shown}")
     builder.button(text="🔙 К собеседнику", callback_data=f"delchat|{conn_id}|{chat_id}")
     builder.adjust(1)
-
     with suppress(Exception):
         await call.message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup(), disable_web_page_preview=True)
-
     with suppress(TelegramBadRequest):
         await call.answer()
 
@@ -1220,18 +1537,14 @@ def _build_archive_html(msgs: list, chat_title: str) -> str:
         if m.get("is_owner"):
             author = "Я"
         cls = "m"
-        if m.get("is_deleted"):
-            cls += " del"
-        if m.get("is_edited"):
-            cls += " edit"
-
+        if m.get("is_deleted"): cls += " del"
+        if m.get("is_edited"): cls += " edit"
         if m.get("is_edited") and m.get("old_text"):
             body = f'<div class="o">{html.escape(m.get("old_text"))}</div><div class="t">{html.escape(m.get("text") or "")}</div>'
         else:
             body = f'<div class="t">{html.escape(m.get("text") or "[медиа]")}</div>'
         if m.get("drive_link"):
             body += f'<div><a href="{m["drive_link"]}" style="color:#5eb5f7;">📎 {m.get("media_type")}</a></div>'
-
         parts.append(f'<div class="{cls}"><div class="h">{ts_str} · {author}</div>{body}</div>')
     parts.append('</body></html>')
     return "".join(parts)
@@ -1246,24 +1559,18 @@ async def download_archive(call: CallbackQuery):
     _, conn_id, chat_id_str = parts
     chat_id = int(chat_id_str)
     owner_id = call.from_user.id
-
     msgs = await archive_collection.find(
-        {"owner_id": owner_id, "conn_id": conn_id, "chat_id": chat_id,
-         "$or": [{"is_deleted": True}, {"is_edited": True}]}
+        {"owner_id": owner_id, "conn_id": conn_id, "chat_id": chat_id, "$or": [{"is_deleted": True}, {"is_edited": True}]}
     ).sort("created_at", 1).to_list(length=5000)
-
     if not msgs:
         await call.answer("Пусто", show_alert=True)
         return
-
     chat_title = msgs[0].get("peer_first_name") or msgs[0].get("first_name") or f"chat_{chat_id}"
     content = _build_archive_html(msgs, chat_title).encode("utf-8")
     filename = f"archive_{chat_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
-
     input_file = BufferedInputFile(content, filename=filename)
     with suppress(Exception):
-        await bot.send_document(chat_id=owner_id, document=input_file,
-                                caption=f"📥 Архив: {len(msgs)} событий")
+        await bot.send_document(chat_id=owner_id, document=input_file, caption=f"📥 Архив: {len(msgs)} событий")
     with suppress(TelegramBadRequest):
         await call.answer("Отправлено в личку")
 
@@ -1300,15 +1607,12 @@ async def admin_twinks(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID:
         await call.answer("Нет доступа", show_alert=True)
         return
-
     conns = await connections_collection.find({}).to_list(length=100)
-
     builder = InlineKeyboardBuilder()
     if not conns:
         builder.button(text="🔙 Назад", callback_data="admin_main")
         await show_menu(call, "Нет подключённых аккаунтов.", builder.as_markup(), with_photo=True)
         return
-
     for c in conns:
         name = c.get("first_name", "Без имени")
         uname = f"@{c.get('username', '')}" if c.get("username") else ""
@@ -1331,7 +1635,6 @@ async def twink_chats(call: CallbackQuery):
         await call.answer("Ошибка", show_alert=True)
         return
     _, conn_id = parts
-
     pipeline = [
         {"$match": {"conn_id": conn_id}},
         {"$group": {
@@ -1344,13 +1647,11 @@ async def twink_chats(call: CallbackQuery):
         {"$sort": {"count": -1}},
     ]
     chats = await archive_collection.aggregate(pipeline).to_list(length=None)
-
     builder = InlineKeyboardBuilder()
     if not chats:
         builder.button(text="🔙 Назад", callback_data="admin_twinks")
         await show_menu(call, "У этого аккаунта пока нет переписок.", builder.as_markup(), with_photo=True)
         return
-
     for ch in chats:
         chat_id = ch["_id"]["chat_id"]
         name = ch.get("first_name") or "Без имени"
@@ -1375,17 +1676,13 @@ async def twink_full_chat(call: CallbackQuery):
         return
     _, conn_id, chat_id_str = parts
     chat_id = int(chat_id_str)
-
     total = await archive_collection.count_documents({"conn_id": conn_id, "chat_id": chat_id})
     deleted = await archive_collection.count_documents({"conn_id": conn_id, "chat_id": chat_id, "is_deleted": True})
-
     msgs = await archive_collection.find({"conn_id": conn_id, "chat_id": chat_id}).sort("created_at", -1).limit(50).to_list(length=50)
     msgs.reverse()
-
     if not msgs:
         await call.answer("Пусто", show_alert=True)
         return
-
     lines = []
     for m in msgs:
         ts = m.get("created_at")
@@ -1400,19 +1697,15 @@ async def twink_full_chat(call: CallbackQuery):
         if m.get("media_type") and m.get("drive_link"):
             text_body += f'\n📎 <a href="{m["drive_link"]}">[{m["media_type"]}]</a>'
         lines.append(f"{prefix} <b>{ts_str} · {author}</b>\n{text_body}\n{'─' * 15}")
-
     peer_name = msgs[-1].get("peer_first_name") or "Собеседник"
     peer_uname = msgs[-1].get("peer_username") or ""
     peer_str = f"{peer_name} @{peer_uname}" if peer_uname else peer_name
-
     header = f"<b>💬 Переписка с {html.escape(peer_str)}</b>\nВсего: {total} · Удалено: {deleted}\nПоказано: последние {len(msgs)}\n{'━' * 18}\n\n"
     full_text = header + "\n".join(lines)
     if len(full_text) > 3900:
         full_text = full_text[:3900] + "\n<i>...обрезано</i>"
-
     with suppress(Exception):
         await call.message.answer(full_text, parse_mode="HTML", disable_web_page_preview=True)
-
     with suppress(TelegramBadRequest):
         await call.answer()
 
@@ -1424,21 +1717,11 @@ async def admin_stats(call: CallbackQuery):
         return
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="admin_main")
-
     total_archive = await archive_collection.count_documents({})
     total_deleted = await archive_collection.count_documents({"is_deleted": True})
     total_edited = await archive_collection.count_documents({"is_edited": True})
     total_conns = await connections_collection.count_documents({})
-
-    await show_menu(
-        call,
-        f"📊 <b>Статистика:</b>\n\n"
-        f"Бизнесов: {total_conns}\n"
-        f"Сообщений в архиве: {total_archive}\n"
-        f"Удалённых: {total_deleted}\n"
-        f"Изменённых: {total_edited}",
-        builder.as_markup(), with_photo=True
-    )
+    await show_menu(call, f"📊 <b>Статистика:</b>\n\nБизнесов: {total_conns}\nСообщений в архиве: {total_archive}\nУдалённых: {total_deleted}\nИзменённых: {total_edited}", builder.as_markup(), with_photo=True)
 
 
 @dp.callback_query(F.data == "admin_mutes")
@@ -1481,154 +1764,6 @@ async def force_unmute(call: CallbackQuery):
 
 
 # ==========================================
-# АВТООТВЕТЧИК
-# ==========================================
-async def get_afk_settings_kb(user_id: int):
-    user_data = await users_collection.find_one({"user_id": user_id}) or {}
-    auto_afk = user_data.get("auto_afk", False)
-    start_h = user_data.get("afk_start", 23)
-    end_h = user_data.get("afk_end", 7)
-    auto_status = "ВКЛ" if auto_afk else "ВЫКЛ"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Изменить текст", callback_data="afk_set_text")],
-        [InlineKeyboardButton(text=f"🕒 Авто-включение: {auto_status}", callback_data="toggle_auto_afk")],
-        [InlineKeyboardButton(text=f"⏰ Время: {start_h}:00 - {end_h}:00", callback_data="afk_set_time")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="user_main")]
-    ])
-
-
-@dp.callback_query(F.data == "afk_settings")
-async def afk_settings_handler(call: CallbackQuery):
-    if not await is_bot_connected(call.from_user.id):
-        kb = get_connect_kb()
-        await show_menu(call, get_connect_text(), kb, with_photo=True)
-        return
-    kb = await get_afk_settings_kb(call.from_user.id)
-    await show_menu(call, "⚙️ <b>Настройки автоответчика:</b>", kb, with_photo=True)
-
-
-@dp.callback_query(F.data == "toggle_afk")
-async def toggle_afk_handler(call: CallbackQuery):
-    if not await is_bot_connected(call.from_user.id):
-        return
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
-    new_status = not user_data.get("is_afk", False)
-    await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"is_afk": new_status}}, upsert=True)
-    kb = await get_user_main_kb(call.from_user.id)
-    await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
-
-
-@dp.callback_query(F.data == "toggle_auto_afk")
-async def toggle_auto_afk(call: CallbackQuery):
-    if not await is_bot_connected(call.from_user.id):
-        return
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
-    new_status = not user_data.get("auto_afk", False)
-    await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"auto_afk": new_status}}, upsert=True)
-    kb = await get_afk_settings_kb(call.from_user.id)
-    await show_menu(call, "⚙️ <b>Настройки автоответчика:</b>", kb, with_photo=True)
-
-
-@dp.callback_query(F.data == "afk_set_text")
-async def afk_set_text(call: CallbackQuery, state: FSMContext):
-    if not await is_bot_connected(call.from_user.id):
-        return
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
-    current = user_data.get("afk_text", "Владелец занят. 💤")
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 Отмена", callback_data="afk_settings")
-    await show_menu(
-        call,
-        f"Текущий текст:\n<i>{html.escape(current)}</i>\n\nОтправь новый:",
-        builder.as_markup(), with_photo=True
-    )
-    await state.set_state(UserStates.waiting_for_afk_text)
-
-
-@dp.message(UserStates.waiting_for_afk_text)
-async def save_afk_text(message: Message, state: FSMContext):
-    await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"afk_text": message.text}})
-    kb = await get_afk_settings_kb(message.from_user.id)
-    await message.answer("✅ Сохранено!", reply_markup=kb)
-    await state.clear()
-
-
-@dp.callback_query(F.data == "afk_set_time")
-async def afk_set_time(call: CallbackQuery, state: FSMContext):
-    if not await is_bot_connected(call.from_user.id):
-        return
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 Отмена", callback_data="afk_settings")
-    await show_menu(
-        call,
-        "Формат: <code>23 7</code> (с 23:00 до 07:00)",
-        builder.as_markup(), with_photo=True
-    )
-    await state.set_state(UserStates.waiting_for_afk_time)
-
-
-@dp.message(UserStates.waiting_for_afk_time)
-async def save_afk_time(message: Message, state: FSMContext):
-    try:
-        parts = message.text.replace("-", " ").split()
-        start_h, end_h = int(parts[0]), int(parts[1])
-        if 0 <= start_h <= 23 and 0 <= end_h <= 23:
-            await users_collection.update_one(
-                {"user_id": message.from_user.id},
-                {"$set": {"afk_start": start_h, "afk_end": end_h}}
-            )
-            kb = await get_afk_settings_kb(message.from_user.id)
-            await message.answer("✅ Сохранено!", reply_markup=kb)
-            await state.clear()
-        else:
-            await message.answer("⚠ Часы от 0 до 23")
-    except Exception:
-        await message.answer("⚠ Формат: <code>23 7</code>", parse_mode="HTML")
-
-
-# ==========================================
-# ВАЛЮТЫ
-# ==========================================
-@dp.callback_query(F.data == "currency_settings")
-async def currency_settings_handler(call: CallbackQuery):
-    if not await is_bot_connected(call.from_user.id):
-        kb = get_connect_kb()
-        await show_menu(call, get_connect_text(), kb, with_photo=True)
-        return
-    owner_settings = await users_collection.find_one({"user_id": call.from_user.id}) or {}
-    display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
-    builder = InlineKeyboardBuilder()
-    for cur in ALL_CURRENCIES:
-        check = "✅" if cur in display else "⬜"
-        builder.button(text=f"{check} {cur}", callback_data=f"cur_toggle|{cur}")
-    builder.button(text="🔙 Назад", callback_data="user_main")
-    builder.adjust(2)
-    await show_menu(call, "💱 <b>Выбери валюты:</b>", builder.as_markup(), with_photo=True)
-
-
-@dp.callback_query(F.data.startswith("cur_toggle|"))
-async def currency_toggle_handler(call: CallbackQuery):
-    if not await is_bot_connected(call.from_user.id):
-        return
-    parts = call.data.split("|")
-    if len(parts) != 2:
-        return
-    cur = parts[1]
-    owner_settings = await users_collection.find_one({"user_id": call.from_user.id}) or {}
-    display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
-    if cur in display:
-        display.remove(cur)
-    else:
-        display.append(cur)
-    await users_collection.update_one(
-        {"user_id": call.from_user.id},
-        {"$set": {"display_currencies": display}},
-        upsert=True
-    )
-    await currency_settings_handler(call)
-
-
-# ==========================================
 # МУТЫ
 # ==========================================
 @dp.callback_query(F.data == "user_mutes")
@@ -1665,17 +1800,13 @@ async def user_unmute_callback(call: CallbackQuery):
     mute_key = parts[1]
     try:
         conn, chat = mute_key.rsplit("_", 1)
-        owner_conn = await connections_collection.find_one({
-            "business_connection_id": conn,
-            "user_id": call.from_user.id
-        })
+        owner_conn = await connections_collection.find_one({"business_connection_id": conn, "user_id": call.from_user.id})
         if not owner_conn and call.from_user.id != SUPERADMIN_ID:
             await call.answer("Нет доступа", show_alert=True)
             return
     except Exception:
         await call.answer("Ошибка", show_alert=True)
         return
-
     if mute_key in muted_chats:
         muted_chats.remove(mute_key)
         await call.answer("✅ Снят!", show_alert=True)
@@ -1698,7 +1829,8 @@ async def show_cmds(call: CallbackQuery):
         "🎭 <code>.п1</code>, <code>.п2</code>, <code>.п3</code> — анимации печати\n"
         "🧮 <code>5+3</code>, <code>5 баксов</code> — математика и валюты\n"
         "🎁 <code>t.me/nft/...</code> — карточка подарка\n"
-        "🗑 <b>Удалённые и изменения</b> — в главном меню"
+        "🗑 <b>Удалённые и изменения</b> — в главном меню\n"
+        "👤 <b>Мой статус</b> — расписания профиля"
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="user_main")
@@ -1711,26 +1843,43 @@ async def show_cmds(call: CallbackQuery):
 @dp.business_connection()
 async def on_business_connection(connection: BusinessConnection):
     if connection.is_enabled:
+        rights_dict = {}
+        if connection.rights:
+            rights_dict = {
+                "can_reply": connection.rights.can_reply,
+                "can_read_messages": connection.rights.can_read_messages,
+                "can_delete_sent_messages": connection.rights.can_delete_sent_messages,
+                "can_delete_all_messages": connection.rights.can_delete_all_messages,
+                "can_edit_name": connection.rights.can_edit_name,
+                "can_edit_bio": connection.rights.can_edit_bio,
+                "can_edit_profile_photo": connection.rights.can_edit_profile_photo,
+                "can_edit_username": connection.rights.can_edit_username,
+            }
         await ensure_connection(
             connection.id,
             connection.user.id,
             connection.user.first_name,
-            connection.user.username or ""
+            connection.user.username or "",
+            rights=rights_dict
         )
-        with suppress(Exception):
-            await bot.send_message(
-                chat_id=connection.user.id,
-                text=(
-                    "✅ <b>Бот успешно подключён!</b>\n\n"
-                    "Теперь можешь пользоваться меню — открой /start\n\n"
-                    "💡 В бизнес-чатах доступны команды:\n"
-                    "• <code>.мут</code> — мут собеседника\n"
-                    "• <code>.п1</code>, <code>.п2</code>, <code>.п3</code> — анимации\n"
-                    "• <code>5+3</code>, <code>5 баксов</code> — математика и валюты\n"
-                    "• <code>t.me/nft/...</code> — карточка подарка"
-                ),
-                parse_mode="HTML"
-            )
+        # Уведомляем только если это не первый раз (по флагу в БД)
+        doc = await connections_collection.find_one({"business_connection_id": connection.id})
+        if doc and not doc.get("welcomed"):
+            with suppress(Exception):
+                await bot.send_message(
+                    chat_id=connection.user.id,
+                    text=(
+                        "✅ <b>Бот успешно подключён!</b>\n\n"
+                        "Теперь можешь пользоваться меню — открой /start\n\n"
+                        "💡 В бизнес-чатах доступны команды:\n"
+                        "• <code>.мут</code> — мут собеседника\n"
+                        "• <code>.п1</code>, <code>.п2</code>, <code>.п3</code> — анимации\n"
+                        "• <code>5+3</code>, <code>5 баксов</code> — математика и валюты\n"
+                        "• <code>t.me/nft/...</code> — карточка подарка"
+                    ),
+                    parse_mode="HTML"
+                )
+            await connections_collection.update_one({"business_connection_id": connection.id}, {"$set": {"welcomed": True}})
     else:
         with suppress(Exception):
             await connections_collection.delete_one({"business_connection_id": connection.id})
@@ -1745,7 +1894,6 @@ async def auto_save_replied_media(message: Message):
         return
     if not getattr(reply, "has_protected_content", False):
         return
-
     file_id, filename = None, "saved"
     if reply.photo: file_id, filename = reply.photo[-1].file_id, "saved.jpg"
     elif reply.video: file_id, filename = reply.video.file_id, "saved.mp4"
@@ -1754,7 +1902,6 @@ async def auto_save_replied_media(message: Message):
     elif reply.document: file_id, filename = reply.document.file_id, reply.document.file_name or "saved.bin"
     if not file_id:
         return
-
     owner_id = message.from_user.id
     try:
         file = await bot.get_file(file_id)
@@ -1773,7 +1920,6 @@ async def mute_user(message: Message):
         return
     owner_id = owner_data["user_id"]
     peer_id = message.chat.id
-
     if message.from_user.id != owner_id:
         with suppress(Exception):
             await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
@@ -1904,12 +2050,10 @@ async def process_gift_link_auto(message: Message):
     if not tg_match:
         return
     slug = tg_match.group(1)
-
     if conn_id:
         owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
         if owner_data and message.from_user.id == owner_data["user_id"]:
             return
-
     loading_msg = None
     with suppress(Exception):
         loading_msg = await bot.send_message(chat_id=message.chat.id, text="🔍 Анализирую...", business_connection_id=conn_id)
@@ -1917,13 +2061,7 @@ async def process_gift_link_auto(message: Message):
     result_text = format_gift_card(data)
     if loading_msg:
         with suppress(Exception):
-            await bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=loading_msg.message_id,
-                text=result_text,
-                parse_mode="HTML",
-                business_connection_id=conn_id
-            )
+            await bot.edit_message_text(chat_id=message.chat.id, message_id=loading_msg.message_id, text=result_text, parse_mode="HTML", business_connection_id=conn_id)
 
 
 # ==========================================
@@ -1940,7 +2078,6 @@ async def auto_math_and_currency(message: Message):
         return
     if message.text.lstrip().startswith("."):
         return
-
     peer_id = message.chat.id
     match_curr = re.match(AUTO_MATH_CURRENCY_PATTERN, message.text)
     if match_curr:
@@ -1981,17 +2118,13 @@ async def auto_math_and_currency(message: Message):
 @dp.business_message()
 async def handle_messages(message: Message):
     conn_id = message.business_connection_id
-
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
-
     owner_id = owner_data["user_id"]
     owner_name = owner_data.get("first_name", "owner")
     peer_id = message.chat.id
-
     is_owner = (message.from_user.id == owner_id)
-
     if not is_owner:
         with suppress(Exception):
             await messages_collection.insert_one({
@@ -2004,10 +2137,8 @@ async def handle_messages(message: Message):
                 "text": message.text or message.caption or "[Без текста]",
                 "created_at": datetime.now(timezone.utc)
             })
-
     with suppress(Exception):
         await save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner)
-
     if is_owner:
         owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
         manual_afk = owner_settings.get("is_afk", False)
@@ -2021,7 +2152,6 @@ async def handle_messages(message: Message):
                     await bot.send_message(chat_id=peer_id, text=afk_text, business_connection_id=conn_id)
                 afk_cooldowns[(owner_id, peer_id)] = now
         return
-
     mute_key = f"{conn_id}_{peer_id}"
     if mute_key in muted_chats:
         with suppress(Exception):
@@ -2034,64 +2164,37 @@ async def handle_messages(message: Message):
 @dp.edited_business_message()
 async def catch_edits(message: Message):
     conn_id = message.business_connection_id
-
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
-
     peer_id = message.chat.id
     is_owner = (message.from_user.id == owner_id)
-
     new_text = message.text or message.caption or "[Без текста]"
-
-    old_doc = await archive_collection.find_one({
-        "conn_id": conn_id,
-        "chat_id": peer_id,
-        "message_id": message.message_id
-    })
+    old_doc = await archive_collection.find_one({"conn_id": conn_id, "chat_id": peer_id, "message_id": message.message_id})
     if not old_doc:
         return
-
     old_text = old_doc.get("text", "")
     edited_at = datetime.now(timezone.utc)
-
     with suppress(Exception):
         await archive_collection.update_one(
             {"_id": old_doc["_id"]},
-            {"$set": {
-                "text": new_text,
-                "old_text": old_text,
-                "is_edited": True,
-                "is_viewed": False,
-                "edited_at": edited_at
-            }}
+            {"$set": {"text": new_text, "old_text": old_text, "is_edited": True, "is_viewed": False, "edited_at": edited_at}}
         )
-
     with suppress(Exception):
         await messages_collection.update_one(
             {"business_connection_id": conn_id, "message_id": message.message_id, "chat_id": peer_id},
             {"$set": {"text": new_text}}
         )
-
     if not is_owner:
         sender_name = old_doc.get("first_name") or message.from_user.first_name or "Неизвестный"
         sender_username = old_doc.get("username") or message.from_user.username or ""
         await notify_owner_about_edit(owner_id, sender_name, sender_username, old_text, new_text, edited_at)
-
         with suppress(Exception):
             await deleted_users_collection.update_one(
                 {"conn_id": conn_id, "chat_id": peer_id},
                 {
-                    "$set": {
-                        "conn_id": conn_id,
-                        "chat_id": peer_id,
-                        "owner_id": owner_id,
-                        "user_id": message.from_user.id,
-                        "first_name": old_doc.get("first_name", "Без имени"),
-                        "username": old_doc.get("username", ""),
-                        "last_edited_at": edited_at
-                    },
+                    "$set": {"conn_id": conn_id, "chat_id": peer_id, "owner_id": owner_id, "user_id": message.from_user.id, "first_name": old_doc.get("first_name", "Без имени"), "username": old_doc.get("username", ""), "last_edited_at": edited_at},
                     "$inc": {"edit_count": 1}
                 },
                 upsert=True
@@ -2102,57 +2205,28 @@ async def catch_edits(message: Message):
 async def catch_deletions(deleted: BusinessMessagesDeleted):
     conn_id = deleted.business_connection_id
     peer_id = deleted.chat.id
-
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
-
     for msg_id in deleted.message_ids:
-        old_msg = await archive_collection.find_one({
-            "conn_id": conn_id,
-            "chat_id": peer_id,
-            "message_id": msg_id
-        })
-
+        old_msg = await archive_collection.find_one({"conn_id": conn_id, "chat_id": peer_id, "message_id": msg_id})
         deleted_at = datetime.now(timezone.utc)
-
         if old_msg:
             with suppress(Exception):
-                await archive_collection.update_one(
-                    {"_id": old_msg["_id"]},
-                    {"$set": {
-                        "is_deleted": True,
-                        "is_viewed": False,
-                        "deleted_at": deleted_at
-                    }}
-                )
-
+                await archive_collection.update_one({"_id": old_msg["_id"]}, {"$set": {"is_deleted": True, "is_viewed": False, "deleted_at": deleted_at}})
             if not old_msg.get("is_owner"):
                 sender_name = old_msg.get("first_name") or "Неизвестный"
                 sender_username = old_msg.get("username", "")
                 text = old_msg.get("text") or ""
                 media_type = old_msg.get("media_type")
                 drive_link = old_msg.get("drive_link")
-
-                await notify_owner_about_deletion(
-                    owner_id, sender_name, sender_username,
-                    text, media_type, drive_link, deleted_at
-                )
-
+                await notify_owner_about_deletion(owner_id, sender_name, sender_username, text, media_type, drive_link, deleted_at)
                 with suppress(Exception):
                     await deleted_users_collection.update_one(
                         {"conn_id": conn_id, "chat_id": peer_id},
                         {
-                            "$set": {
-                                "conn_id": conn_id,
-                                "chat_id": peer_id,
-                                "owner_id": owner_id,
-                                "user_id": old_msg.get("user_id"),
-                                "first_name": old_msg.get("first_name", "Без имени"),
-                                "username": old_msg.get("username", ""),
-                                "last_deleted_at": deleted_at
-                            },
+                            "$set": {"conn_id": conn_id, "chat_id": peer_id, "owner_id": owner_id, "user_id": old_msg.get("user_id"), "first_name": old_msg.get("first_name", "Без имени"), "username": old_msg.get("username", ""), "last_deleted_at": deleted_at},
                             "$inc": {"delete_count": 1}
                         },
                         upsert=True
@@ -2161,11 +2235,7 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
             with suppress(Exception):
                 await bot.send_message(
                     chat_id=owner_id,
-                    text=(
-                        f"🗑 <b>Удалено сообщение</b>\n"
-                        f"🕐 {deleted_at.strftime('%d.%m %H:%M')}\n"
-                        f"<i>Сообщение отсутствует в архиве (не успело сохраниться)</i>"
-                    ),
+                    text=f"🗑 <b>Удалено сообщение</b>\n🕐 {deleted_at.strftime('%d.%m %H:%M')}\n<i>Сообщение отсутствует в архиве (не успело сохраниться)</i>",
                     parse_mode="HTML"
                 )
 
@@ -2184,17 +2254,14 @@ async def unmute_user(call: CallbackQuery):
         return
     conn_id = call.message.business_connection_id
     mute_key = f"{conn_id}_{peer_id}"
-
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
-
     if call.from_user.id != owner_id and call.from_user.id != SUPERADMIN_ID:
         with suppress(TelegramBadRequest):
             await call.answer("Нельзя", show_alert=True)
         return
-
     if mute_key in muted_chats:
         muted_chats.remove(mute_key)
     with suppress(TelegramBadRequest):
