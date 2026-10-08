@@ -63,9 +63,11 @@ try:
     history_collection = db['history']
     archive_collection = db['chat_archive']
     deleted_users_collection = db['deleted_users']
+    mutes_collection = db['mutes']
 except Exception as e:
     print(f"Ошибка БД: {e}")
 
+# Быстрый локальный кэш (синхронизируется с MongoDB)
 muted_chats = set()
 afk_cooldowns = TTLCache(maxsize=2000, ttl=300)
 active_amute = TTLCache(maxsize=1000, ttl=15)  # key: "{conn_id}_{peer_id}"
@@ -135,7 +137,6 @@ def get_profile_access_text() -> str:
 async def show_menu(call: CallbackQuery, caption: str, kb, with_photo: bool = True):
     msg = call.message
 
-    # Защита: если caption длиннее лимита — показываем без фото
     if len(caption) > CAPTION_LIMIT:
         with_photo = False
 
@@ -338,7 +339,7 @@ async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_
         peer_name = _sanitize(peer_name_raw or f"peer_{peer_id}")
         owner_folder = _sanitize(owner_name)
         folder_path = f"{ROOT_FOLDER_NAME}/{owner_folder}/{peer_name} ({peer_id})/media"
-        
+
         folder_id = await async_get_or_create_folder(folder_path)
         if not folder_id:
             return
@@ -900,6 +901,17 @@ async def on_startup():
         await archive_collection.create_index([("conn_id", 1), ("chat_id", 1), ("is_owner", 1), ("created_at", -1)])
     with suppress(Exception):
         await deleted_users_collection.create_index([("conn_id", 1), ("chat_id", 1)])
+    with suppress(Exception):
+        await mutes_collection.create_index([("mute_key", 1)], unique=True)
+
+    # ════ ВОССТАНОВЛЕНИЕ ВЕЧНЫХ МУТОВ ИЗ MONGODB ════
+    try:
+        stored_mutes = await mutes_collection.find({}).to_list(length=None)
+        for m in stored_mutes:
+            muted_chats.add(m["mute_key"])
+        print(f"✅ Загружено активных мутов из базы: {len(muted_chats)}")
+    except Exception as e:
+        print(f"Ошибка загрузки мутов: {e}")
 
     asyncio.create_task(update_rates_loop())
     _init_drive()
@@ -1518,6 +1530,11 @@ async def force_unmute(call: CallbackQuery):
     mute_key = parts[1]
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 К мутам", callback_data="admin_mutes", style="primary")
+    
+    # ════ СНЯТИЕ ИЗ БД И ИЗ ПАМЯТИ ════
+    with suppress(Exception):
+        await mutes_collection.delete_one({"mute_key": mute_key})
+
     if mute_key in muted_chats:
         muted_chats.remove(mute_key)
         await show_menu(call, "✅ Мут снят.", builder.as_markup(), with_photo=True)
@@ -1694,14 +1711,12 @@ async def currency_settings_handler(call: CallbackQuery):
     builder = InlineKeyboardBuilder()
     for cur in ALL_CURRENCIES:
         if cur in display:
-            # Выбрана — зелёная с галочкой
             builder.button(
                 text=f"✅ {cur}",
                 callback_data=f"cur_toggle|{cur}",
                 style="success"
             )
         else:
-            # Не выбрана — обычная (без style)
             builder.button(
                 text=cur,
                 callback_data=f"cur_toggle|{cur}"
@@ -1783,6 +1798,10 @@ async def user_unmute_callback(call: CallbackQuery):
     except Exception:
         await call.answer("Ошибка", show_alert=True)
         return
+
+    # ════ СНЯТИЕ ИЗ БД И ИЗ ПАМЯТИ ════
+    with suppress(Exception):
+        await mutes_collection.delete_one({"mute_key": mute_key})
 
     if mute_key in muted_chats:
         muted_chats.remove(mute_key)
@@ -1988,6 +2007,9 @@ async def auto_save_replied_media(message: Message):
         print(f"save_replied_media error: {e}")
 
 
+# ==========================================
+# ВЕЧНЫЙ МУТ (СОХРАНЯЕТСЯ В MONGODB)
+# ==========================================
 @dp.business_message(F.text.lower().startswith(".мут"))
 async def mute_user(message: Message):
     conn_id = message.business_connection_id
@@ -2006,6 +2028,20 @@ async def mute_user(message: Message):
         await bot.delete_business_messages(
             business_connection_id=conn_id, 
             message_ids=[message.message_id]
+        )
+
+    # ════ ЗАПИСЬ В БАЗУ ДАННЫХ ════
+    with suppress(Exception):
+        await mutes_collection.update_one(
+            {"mute_key": mute_key},
+            {"$set": {
+                "mute_key": mute_key,
+                "conn_id": conn_id,
+                "peer_id": peer_id,
+                "owner_id": owner_id,
+                "created_at": datetime.now(timezone.utc)
+            }},
+            upsert=True
         )
 
     if mute_key in muted_chats:
@@ -2390,7 +2426,7 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
     owner_id = owner_data["user_id"]
 
     for msg_id in deleted.message_ids:
-        # ════ ФИКС: АМУТ — переотправка + пропуск обычной обработки ════
+        # ════ АМУТ — переотправка ════
         key = f"{conn_id}_{peer_id}"
         session = active_amute.get(key)
         if session and session.get("message_id") == msg_id:
@@ -2481,6 +2517,10 @@ async def unmute_user(call: CallbackQuery):
         with suppress(TelegramBadRequest):
             await call.answer("Нельзя", show_alert=True)
         return
+
+    # ════ СНЯТИЕ ИЗ БД И ИЗ ПАМЯТИ ════
+    with suppress(Exception):
+        await mutes_collection.delete_one({"mute_key": mute_key})
 
     if mute_key in muted_chats:
         muted_chats.remove(mute_key)
