@@ -67,30 +67,18 @@ try:
 except Exception as e:
     print(f"Ошибка БД: {e}")
 
-# Быстрый локальный кэш (синхронизируется с MongoDB)
 muted_chats = set()
 afk_cooldowns = TTLCache(maxsize=2000, ttl=300)
-active_amute = TTLCache(maxsize=1000, ttl=15)  # key: "{conn_id}_{peer_id}"
+active_amute = TTLCache(maxsize=1000, ttl=15)
 
 BOT_USERNAME = "your_bot_username"
 
 # ==========================================
-# ПОДКЛЮЧЕНИЕ БИЗНЕС-БОТА (ДВА ЭТАПА)
+# ПОДКЛЮЧЕНИЕ БИЗНЕС-БОТА
 # ==========================================
 async def is_bot_connected(user_id: int) -> bool:
     conn = await connections_collection.find_one({"user_id": user_id})
     return bool(conn)
-
-
-async def has_profile_access(user_id: int) -> bool:
-    if user_id == SUPERADMIN_ID:
-        return True
-    conns = await connections_collection.find({"user_id": user_id}).to_list(length=None)
-    for c in conns:
-        rights = c.get("rights") or {}
-        if rights.get("can_edit_name") or rights.get("can_edit_bio"):
-            return True
-    return False
 
 
 def get_connect_kb():
@@ -102,37 +90,15 @@ def get_connect_kb():
 
 def get_connect_text() -> str:
     return (
-        "🔌 <b>Подключение бота</b>\n\n"
-        "Настройки профиля — <a href=\"tg://settings/edit\">открыть</a>\n\n"
-        "Дальше пролистай вниз до <b>«Автоматизация чатов»</b>\n\n"
-        f"В поиск введи <code>@{BOT_USERNAME}</code> и добавь\n\n"
-        "Дай <b>все права на сообщения</b>\n\n"
-        "После подключения нажми <b>«Я подключил — проверить»</b>"
-    )
-
-
-def get_profile_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Открыть настройки Telegram", url="tg://settings/edit", style="primary")],
-        [InlineKeyboardButton(text="✅ Проверить доступ", callback_data="check_profile", style="success")]
-    ])
-
-
-def get_profile_access_text() -> str:
-    return (
-        "🔌 <b>Доступ к профилю</b>\n\n"
-        "Нужно дать боту доступ только к:\n\n"
-        "• <b>Имя</b>\n"
-        "• <b>Описание (bio)</b>\n\n"
-        "Настройки профиля — <a href=\"tg://settings/edit\">открыть</a>\n\n"
-        f"Дальше <b>«Автоматизация чатов»</b> → <code>@{BOT_USERNAME}</code>\n\n"
-        "Включи <b>«Управление профилем»</b>\n\n"
-        "И нажми <b>«Проверить доступ»</b>"
+        "1. Настройки профиля - <a href=\"tg://settings/edit\">tg://settings/edit</a>\n\n"
+        "2. «Автоматизация чатов»\n\n"
+        f"3. В поиск <code>{BOT_USERNAME}</code> - добавить\n\n"
+        "4. Дайте все права на сообщения"
     )
 
 
 # ==========================================
-# ПОКАЗ МЕНЮ С ФОТО (С ЗАЩИТОЙ ОТ ДЛИННОГО ТЕКСТА)
+# ПОКАЗ МЕНЮ С ФОТО
 # ==========================================
 async def show_menu(call: CallbackQuery, caption: str, kb, with_photo: bool = True):
     msg = call.message
@@ -180,7 +146,7 @@ async def show_menu(call: CallbackQuery, caption: str, kb, with_photo: bool = Tr
 
 
 # ==========================================
-# GOOGLE DRIVE (ОПТИМИЗИРОВАНО)
+# GOOGLE DRIVE
 # ==========================================
 _drive_service = None
 _folder_cache = TTLCache(maxsize=1000, ttl=86400)
@@ -398,6 +364,7 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
         "text": text,
         "is_owner": is_owner,
         "media_type": media_type,
+        "media_file_id": file_id,
         "drive_link": None,
         "drive_file_id": None,
         "is_deleted": False,
@@ -426,9 +393,43 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
 # ==========================================
 # УВЕДОМЛЕНИЯ
 # ==========================================
-async def notify_owner_about_deletion(owner_id, sender_name, sender_username, text, media_type=None, drive_link=None, deleted_at=None):
+async def notify_owner_about_deletion(
+    owner_id, sender_name, sender_username, text,
+    media_type=None, drive_link=None, deleted_at=None, file_id=None
+):
     time_str = deleted_at.strftime("%d.%m %H:%M") if deleted_at else datetime.now().strftime("%d.%m %H:%M")
     uname = f" @{sender_username}" if sender_username else ""
+
+    media_sent = False
+    if file_id and media_type:
+        caption = f"🗑 Удалено · {sender_name}{uname}"
+        try:
+            if media_type == "photo":
+                await bot.send_photo(chat_id=owner_id, photo=file_id, caption=caption)
+                media_sent = True
+            elif media_type == "video":
+                await bot.send_video(chat_id=owner_id, video=file_id, caption=caption)
+                media_sent = True
+            elif media_type == "video_note":
+                await bot.send_video_note(chat_id=owner_id, video_note=file_id)
+                media_sent = True
+            elif media_type == "animation":
+                await bot.send_animation(chat_id=owner_id, animation=file_id, caption=caption)
+                media_sent = True
+            elif media_type == "voice":
+                await bot.send_voice(chat_id=owner_id, voice=file_id)
+                media_sent = True
+            elif media_type == "audio":
+                await bot.send_audio(chat_id=owner_id, audio=file_id, caption=caption)
+                media_sent = True
+            elif media_type == "document":
+                await bot.send_document(chat_id=owner_id, document=file_id, caption=caption)
+                media_sent = True
+            elif media_type == "sticker":
+                await bot.send_sticker(chat_id=owner_id, sticker=file_id)
+                media_sent = True
+        except Exception as e:
+            print(f"notify send_media error: {e}")
 
     parts = ["🗑 <b>Удалено сообщение</b>"]
     parts.append(f"👤 От: <b>{html.escape(sender_name)}</b>{html.escape(uname)}")
@@ -440,10 +441,12 @@ async def notify_owner_about_deletion(owner_id, sender_name, sender_username, te
         parts.append(f"💬 {html.escape(preview)}")
 
     if media_type:
-        if drive_link:
-            parts.append(f'📎 <a href="{drive_link}">[{media_type}]</a>')
+        if media_sent:
+            parts.append(f"📎 [{media_type}] — отправлено выше")
+        elif drive_link:
+            parts.append(f'📎 <a href="{drive_link}">[{media_type} · Drive]</a>')
         else:
-            parts.append(f"📎 [{media_type}] (размер превышен или загрузка...)")
+            parts.append(f"📎 [{media_type}] — нет доступа к файлу")
 
     with suppress(Exception):
         await bot.send_message(
@@ -904,7 +907,6 @@ async def on_startup():
     with suppress(Exception):
         await mutes_collection.create_index([("mute_key", 1)], unique=True)
 
-    # ════ ВОССТАНОВЛЕНИЕ ВЕЧНЫХ МУТОВ ИЗ MONGODB ════
     try:
         stored_mutes = await mutes_collection.find({}).to_list(length=None)
         for m in stored_mutes:
@@ -998,13 +1000,6 @@ async def cmd_start(message: Message, state: FSMContext):
             await message.answer(get_connect_text(), reply_markup=get_connect_kb(), parse_mode="HTML")
         return
 
-    if not await has_profile_access(message.from_user.id):
-        try:
-            await message.answer_photo(photo=MENU_PHOTO, caption=get_profile_access_text(), reply_markup=get_profile_kb(), parse_mode="HTML")
-        except Exception:
-            await message.answer(get_profile_access_text(), reply_markup=get_profile_kb(), parse_mode="HTML")
-        return
-
     kb = await get_user_main_kb(message.from_user.id)
     text = "👋 <b>Твой личный бот-секретарь.</b>\nУправляй настройками ниже:"
     try:
@@ -1026,34 +1021,9 @@ async def check_connection_handler(call: CallbackQuery):
         )
         return
 
-    if not await has_profile_access(call.from_user.id):
-        await call.answer("⚠️ Нужен доступ к профилю", show_alert=True)
-        with suppress(Exception):
-            await call.message.answer(
-                get_profile_access_text(),
-                reply_markup=get_profile_kb(),
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-        return
-
     await call.answer("✅ Подключено!", show_alert=True)
     kb = await get_user_main_kb(call.from_user.id)
     await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
-
-
-@dp.callback_query(F.data == "check_profile")
-async def check_profile_handler(call: CallbackQuery):
-    if await has_profile_access(call.from_user.id):
-        await call.answer("✅ Доступ к профилю получен!", show_alert=True)
-        kb = await get_user_main_kb(call.from_user.id)
-        await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
-    else:
-        await call.answer(
-            "❌ Доступ ещё не выдан.\n\n"
-            "Включи «Управление профилем» в настройках Автоматизации чатов",
-            show_alert=True
-        )
 
 
 @dp.callback_query(F.data == "user_main")
@@ -1064,10 +1034,6 @@ async def user_main_handler(call: CallbackQuery, state: FSMContext):
         if not await is_bot_connected(call.from_user.id):
             kb = get_connect_kb()
             await show_menu(call, get_connect_text(), kb, with_photo=True)
-            return
-        if not await has_profile_access(call.from_user.id):
-            kb = get_profile_kb()
-            await show_menu(call, get_profile_access_text(), kb, with_photo=True)
             return
 
     kb = await get_user_main_kb(call.from_user.id)
@@ -1530,8 +1496,7 @@ async def force_unmute(call: CallbackQuery):
     mute_key = parts[1]
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 К мутам", callback_data="admin_mutes", style="primary")
-    
-    # ════ СНЯТИЕ ИЗ БД И ИЗ ПАМЯТИ ════
+
     with suppress(Exception):
         await mutes_collection.delete_one({"mute_key": mute_key})
 
@@ -1695,7 +1660,7 @@ async def save_afk_time(message: Message, state: FSMContext):
 
 
 # ==========================================
-# ВАЛЮТЫ (серые / зелёные)
+# ВАЛЮТЫ
 # ==========================================
 @dp.callback_query(F.data == "currency_settings")
 async def currency_settings_handler(call: CallbackQuery):
@@ -1799,7 +1764,6 @@ async def user_unmute_callback(call: CallbackQuery):
         await call.answer("Ошибка", show_alert=True)
         return
 
-    # ════ СНЯТИЕ ИЗ БД И ИЗ ПАМЯТИ ════
     with suppress(Exception):
         await mutes_collection.delete_one({"mute_key": mute_key})
 
@@ -1812,7 +1776,7 @@ async def user_unmute_callback(call: CallbackQuery):
 
 
 # ==========================================
-# СТАТУС (ФИКС: РАБОТАЕТ ДЛЯ ВСЕХ, ПОЛНАЯ ИНФА)
+# СТАТУС
 # ==========================================
 @dp.callback_query(F.data == "user_status")
 async def user_status_handler(call: CallbackQuery):
@@ -1952,27 +1916,15 @@ async def on_business_connection(connection: BusinessConnection):
             upsert=True
         )
 
-        has_profile = rights_dict.get("can_edit_name") or rights_dict.get("can_edit_bio")
-
-        if not has_profile and connection.user.id != SUPERADMIN_ID:
-            with suppress(Exception):
-                await bot.send_message(
-                    chat_id=connection.user.id,
-                    text=get_profile_access_text(),
-                    reply_markup=get_profile_kb(),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
-        else:
-            with suppress(Exception):
-                await bot.send_message(
-                    chat_id=connection.user.id,
-                    text=(
-                        "✅ <b>Бот успешно подключён!</b>\n\n"
-                        "Открой /start, чтобы пользоваться меню."
-                    ),
-                    parse_mode="HTML"
-                )
+        with suppress(Exception):
+            await bot.send_message(
+                chat_id=connection.user.id,
+                text=(
+                    "✅ <b>Бот успешно подключён!</b>\n\n"
+                    "Открой /start, чтобы пользоваться меню."
+                ),
+                parse_mode="HTML"
+            )
     else:
         with suppress(Exception):
             await connections_collection.delete_one({"business_connection_id": connection.id})
@@ -2008,7 +1960,7 @@ async def auto_save_replied_media(message: Message):
 
 
 # ==========================================
-# ВЕЧНЫЙ МУТ (СОХРАНЯЕТСЯ В MONGODB)
+# ВЕЧНЫЙ МУТ
 # ==========================================
 @dp.business_message(F.text.lower().startswith(".мут"))
 async def mute_user(message: Message):
@@ -2020,17 +1972,16 @@ async def mute_user(message: Message):
 
     if message.from_user.id != owner_id:
         return
-        
+
     peer_id = message.chat.id
     mute_key = f"{conn_id}_{peer_id}"
 
     with suppress(Exception):
         await bot.delete_business_messages(
-            business_connection_id=conn_id, 
+            business_connection_id=conn_id,
             message_ids=[message.message_id]
         )
 
-    # ════ ЗАПИСЬ В БАЗУ ДАННЫХ ════
     with suppress(Exception):
         await mutes_collection.update_one(
             {"mute_key": mute_key},
@@ -2046,14 +1997,14 @@ async def mute_user(message: Message):
 
     if mute_key in muted_chats:
         return
-        
+
     muted_chats.add(mute_key)
     markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute|{peer_id}", style="danger")]])
     with suppress(Exception):
         await bot.send_message(
-            chat_id=peer_id, 
-            text="🔇 Собеседник замьючен.", 
-            reply_markup=markup, 
+            chat_id=peer_id,
+            text="🔇 Собеседник замьючен.",
+            reply_markup=markup,
             business_connection_id=conn_id
         )
 
@@ -2247,7 +2198,7 @@ async def process_gift_link_auto(message: Message):
 async def auto_math_and_currency(message: Message):
     if len(message.text) > 150:
         return
-        
+
     conn_id = message.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
@@ -2329,7 +2280,7 @@ async def handle_messages(message: Message):
         owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
         manual_afk = owner_settings.get("is_afk", False)
         in_schedule = check_auto_afk(owner_settings.get("afk_start", 23), owner_settings.get("afk_end", 7)) if owner_settings.get("auto_afk", False) else False
-        
+
         if manual_afk or in_schedule:
             if (owner_id, peer_id) not in afk_cooldowns:
                 afk_text = owner_settings.get("afk_text", "Владелец сейчас занят. 💤")
@@ -2346,7 +2297,7 @@ async def handle_messages(message: Message):
 
 
 # ==========================================
-# РЕДАКТИРОВАНИЯ И УДАЛЕНИЯ (С ФИКСОМ АМУТА)
+# РЕДАКТИРОВАНИЯ И УДАЛЕНИЯ
 # ==========================================
 @dp.edited_business_message()
 async def catch_edits(message: Message):
@@ -2426,7 +2377,6 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
     owner_id = owner_data["user_id"]
 
     for msg_id in deleted.message_ids:
-        # ════ АМУТ — переотправка ════
         key = f"{conn_id}_{peer_id}"
         session = active_amute.get(key)
         if session and session.get("message_id") == msg_id:
@@ -2442,7 +2392,6 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                 print(f"🔁 Амут: переотправлено в {key}")
             continue
 
-        # ════ ОБЫЧНАЯ ОБРАБОТКА ════
         old_msg = await archive_collection.find_one({
             "conn_id": conn_id,
             "chat_id": peer_id,
@@ -2468,10 +2417,12 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                 text = old_msg.get("text") or ""
                 media_type = old_msg.get("media_type")
                 drive_link = old_msg.get("drive_link")
+                file_id = old_msg.get("media_file_id")
 
                 await notify_owner_about_deletion(
                     owner_id, sender_name, sender_username,
-                    text, media_type, drive_link, deleted_at
+                    text, media_type, drive_link, deleted_at,
+                    file_id=file_id
                 )
 
                 with suppress(Exception):
@@ -2518,7 +2469,6 @@ async def unmute_user(call: CallbackQuery):
             await call.answer("Нельзя", show_alert=True)
         return
 
-    # ════ СНЯТИЕ ИЗ БД И ИЗ ПАМЯТИ ════
     with suppress(Exception):
         await mutes_collection.delete_one({"mute_key": mute_key})
 
