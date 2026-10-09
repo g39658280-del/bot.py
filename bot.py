@@ -670,8 +670,10 @@ _NUM_WORDS = "|".join(WORD_NUMBERS.keys())
 _NUM = rf"(?:\d+[.,]?\d*|{_NUM_WORDS})"
 _OPS = r"[+\-*/xх^]"
 _WORDS = r"(?:плюс|минус|умножить на|разделить на|поделить на|умножить|разделить|поделить|сложить|вычесть|делить|степень|в степени|х)"
-AUTO_MATH_PATTERN = rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})+\s*$"
-AUTO_MATH_CURRENCY_PATTERN = rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$"
+
+# ИСПОЛЬЗУЕМ re.compile с флагом re.IGNORECASE для игнорирования регистра букв
+AUTO_MATH_PATTERN = re.compile(rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})+\s*$", re.IGNORECASE)
+AUTO_MATH_CURRENCY_PATTERN = re.compile(rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$", re.IGNORECASE)
 
 OPERATORS = {
     "умножить на": "*", "разделить на": "/", "поделить на": "/", "в степени": "**",
@@ -1000,6 +1002,13 @@ async def cmd_start(message: Message, state: FSMContext):
             await message.answer(get_connect_text(), reply_markup=get_connect_kb(), parse_mode="HTML")
         return
 
+    if not await has_profile_access(message.from_user.id):
+        try:
+            await message.answer_photo(photo=MENU_PHOTO, caption=get_profile_access_text(), reply_markup=get_profile_kb(), parse_mode="HTML")
+        except Exception:
+            await message.answer(get_profile_access_text(), reply_markup=get_profile_kb(), parse_mode="HTML")
+        return
+
     kb = await get_user_main_kb(message.from_user.id)
     text = "👋 <b>Твой личный бот-секретарь.</b>\nУправляй настройками ниже:"
     try:
@@ -1021,9 +1030,34 @@ async def check_connection_handler(call: CallbackQuery):
         )
         return
 
+    if not await has_profile_access(call.from_user.id):
+        await call.answer("⚠️ Нужен доступ к профилю", show_alert=True)
+        with suppress(Exception):
+            await call.message.answer(
+                get_profile_access_text(),
+                reply_markup=get_profile_kb(),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        return
+
     await call.answer("✅ Подключено!", show_alert=True)
     kb = await get_user_main_kb(call.from_user.id)
     await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
+
+
+@dp.callback_query(F.data == "check_profile")
+async def check_profile_handler(call: CallbackQuery):
+    if await has_profile_access(call.from_user.id):
+        await call.answer("✅ Доступ к профилю получен!", show_alert=True)
+        kb = await get_user_main_kb(call.from_user.id)
+        await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
+    else:
+        await call.answer(
+            "❌ Доступ ещё не выдан.\n\n"
+            "Включи «Управление профилем» в настройках Автоматизации чатов",
+            show_alert=True
+        )
 
 
 @dp.callback_query(F.data == "user_main")
@@ -1034,6 +1068,10 @@ async def user_main_handler(call: CallbackQuery, state: FSMContext):
         if not await is_bot_connected(call.from_user.id):
             kb = get_connect_kb()
             await show_menu(call, get_connect_text(), kb, with_photo=True)
+            return
+        if not await has_profile_access(call.from_user.id):
+            kb = get_profile_kb()
+            await show_menu(call, get_profile_access_text(), kb, with_photo=True)
             return
 
     kb = await get_user_main_kb(call.from_user.id)
@@ -2210,7 +2248,7 @@ async def auto_math_and_currency(message: Message):
         return
 
     peer_id = message.chat.id
-    match_curr = re.match(AUTO_MATH_CURRENCY_PATTERN, message.text)
+    match_curr = AUTO_MATH_CURRENCY_PATTERN.match(message.text)
     if match_curr:
         math_expr = match_curr.group(1).strip()
         tail = match_curr.group(2).lower()
@@ -2218,7 +2256,8 @@ async def auto_math_and_currency(message: Message):
         if not code:
             return
         if math_expr:
-            raw = normalize_math_input(math_expr)
+            # Переводим текст в нижний регистр для расчетов (чтобы искать "Два")
+            raw = normalize_math_input(math_expr.lower())
             parsed = parse_math_expression(raw)
             try:
                 amount = float(simple_eval(parsed))
@@ -2227,7 +2266,8 @@ async def auto_math_and_currency(message: Message):
             except Exception:
                 return
     else:
-        raw = normalize_math_input(message.text)
+        # Аналогично переводим в нижний регистр для обычной математики
+        raw = normalize_math_input(message.text.lower())
         parsed = parse_math_expression(raw)
         if not parsed or len(parsed.split()) < 3:
             return
@@ -2291,7 +2331,9 @@ async def handle_messages(message: Message):
 
     mute_key = f"{conn_id}_{peer_id}"
     if mute_key in muted_chats:
-        if not is_owner:
+        # УДАЛЕНИЕ ДЛЯ МУТА: Игнорируем владельца и САМОГО БОТА (чтобы не удалять ответы бота)
+        # но удаляем любые другие сообщения, включая сторонних юзерботов собеседника!
+        if message.from_user.id != owner_id and message.from_user.id != bot.id:
             with suppress(Exception):
                 await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
