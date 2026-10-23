@@ -31,7 +31,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # ==========================================
-# КОНФИГ (Рекомендуется хранить ключи в переменных окружения Render)
+# КОНФИГ
 # ==========================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8855259798:AAEw-jiTxWh2k0n9WjjbG7tPX64S4g5WUXU")
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:xgHbZ5HMU2XDj6KZ@cluster0.6q3omrb.mongodb.net/?appName=Cluster0")
@@ -67,6 +67,12 @@ except Exception as e:
 muted_chats: dict[str, float | None] = {}
 afk_cooldowns = TTLCache(maxsize=2000, ttl=300)
 active_amute = TTLCache(maxsize=1000, ttl=15)
+# Защита от двойной отправки (математика/валюты/NFT), когда бот подключен у обоих собеседников
+action_dedup = TTLCache(maxsize=2000, ttl=4)
+# Временный список ID сообщений, которые бот сам удаляет в конце анимаций (чтобы не слать лог удаления)
+self_destruct_ids = TTLCache(maxsize=1000, ttl=30)
+# Активные задачи фейк-действий: key "{conn_id}_{peer_id}" -> asyncio.Task
+active_fakes: dict[str, asyncio.Task] = {}
 copied_messages_cache = {}
 
 BOT_USERNAME = "your_bot_username"
@@ -370,7 +376,6 @@ def _extract_media_info(message: Message):
 
 
 async def check_and_save_protected_media(message: Message, owner_id: int):
-    """Сохраняет одноразовые / защищённые медиа при ответе владельца, не блокируя остальные обработчики."""
     reply = message.reply_to_message
     if not reply or not getattr(reply, "has_protected_content", False):
         return
@@ -1829,7 +1834,7 @@ async def currency_toggle_handler(call: CallbackQuery):
 
 
 # ==========================================
-# МУТЫ В МЕНЮ (С РЕАЛЬНЫМИ ИМЕНАМИ И ВРЕМЕНЕМ)
+# МУТЫ В МЕНЮ
 # ==========================================
 @dp.callback_query(F.data == "user_mutes")
 async def user_mutes_handler(call: CallbackQuery):
@@ -1949,61 +1954,103 @@ async def user_status_handler(call: CallbackQuery):
 
 
 # ==========================================
-# ПОМОЩЬ (ОБНОВЛЁННЫЙ СПИСОК КОМАНД)
+# КАТАЛОГ КОМАНД (РАЗБИТЫЙ НА ПОДКАТАЛОГИ)
 # ==========================================
+def get_cmds_catalog_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡 Модерация и Утилиты", callback_data="cmds_cat|mod")],
+        [InlineKeyboardButton(text="🎬 Анимации и Эффекты", callback_data="cmds_cat|anim")],
+        [InlineKeyboardButton(text="🧮 Валюты, Математика и NFT", callback_data="cmds_cat|auto")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="user_main")],
+    ])
+
+
+def get_cmds_back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 К разделам команд", callback_data="user_cmds")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="user_main")],
+    ])
+
+
 @dp.callback_query(F.data == "user_cmds")
 async def show_cmds(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
         return
 
-    admin_block = ""
-    if call.from_user.id == SUPERADMIN_ID:
-        admin_block = (
-            "<b>📋 .коп / .вст</b> (Только Супер-Админ)\n"
-            "Ответь <code>.коп</code> на любое сообщение (текст, стикер, ГС, кружок, видео), затем напиши <code>.вст</code> для вставки\n\n"
+    text = (
+        "📖 <b>Справочник команд</b>\n\n"
+        "Все команды вводятся в бизнес-чатах с точкой в начале.\n"
+        "Выбери нужный раздел ниже:"
+    )
+    await show_menu(call, text, get_cmds_catalog_kb(), with_photo=True)
+
+
+@dp.callback_query(F.data.startswith("cmds_cat|"))
+async def show_cmds_category(call: CallbackQuery):
+    if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
+        return
+
+    cat = call.data.split("|")[1]
+
+    if cat == "mod":
+        admin_block = ""
+        if call.from_user.id == SUPERADMIN_ID:
+            admin_block = (
+                "<b>📋 .коп / .вст</b> (Супер-Админ)\n"
+                "Ответь <code>.коп</code> на любое сообщение (текст, стикер, ГС, кружок, видео), затем напиши <code>.вст</code> для вставки.\n\n"
+            )
+        text = (
+            "🛡 <b>Модерация и Утилиты</b>\n\n"
+            "<b>🔇 .мут [время]</b>\n"
+            "Удаляет все сообщения собеседника (навсегда или по таймеру).\n"
+            "Примеры: <code>.мут</code> · <code>.мут 10м</code> · <code>.мут 2ч</code> · <code>.мут 1д</code>\n\n"
+            "<b>🔁 .амут [текст]</b>\n"
+            "Антимут. Отправляет текст от лица бота в обход чужих мутов и защищает его 15 сек.\n"
+            "Пример: <code>.амут привет</code>\n\n"
+            "<b>🎭 .фейк [тип] [секунды]</b>\n"
+            "Имитирует активность в шапке чата (до 120 сек).\n"
+            "• <code>.фейк печать 30</code> — <i>печатает...</i>\n"
+            "• <code>.фейк гс 40</code> — <i>записывает ГС...</i>\n"
+            "• <code>.фейк кружок 20</code> — <i>записывает кружок...</i>\n"
+            "• <code>.фейк видео 20</code> / <code>.фейк фото 15</code>\n"
+            "• <code>.фейк стоп</code> — остановить имитацию\n\n"
+            f"{admin_block}"
+            "<b>💣 .[N] [текст]</b>\n"
+            "Отправляет сообщение N раз подряд (до 50).\n"
+            "Пример: <code>.10 привет</code>"
+        )
+    elif cat == "anim":
+        text = (
+            "🎬 <b>Анимации и Эффекты</b>\n\n"
+            "<b>🔥 Алгоритмические спецэффекты:</b>\n"
+            "• <code>.танос [текст]</code> — текст рассыпается в пыль и исчезает 💨\n"
+            "• <code>.пак [текст]</code> — Пакман ᗧ съедает блоки и открывает текст\n"
+            "• <code>.брут [текст]</code> — скоростной подбор пароля по буквам 🔐\n"
+            "• <code>.глитч [текст]</code> — Zalgo-помехи и стабилизация сигнала ⚡\n"
+            "• <code>.табло [текст]</code> — бегущая неоновая LED-строка 📟\n\n"
+            "<b>⌨️ Классическая печать:</b>\n"
+            "• <code>.п1 [текст]</code> — плавная печать по буквам\n"
+            "• <code>.п2 [текст]</code> — печать с мигающим курсором ▌\n"
+            "• <code>.п3 [текст]</code> — сборка из случайных символов"
+        )
+    else:
+        text = (
+            "🧮 <b>Валюты, Математика и NFT</b>\n\n"
+            "<b>💱 Конвертер валют (на лету)</b>\n"
+            "Пиши сумму или пример с валютой — бот мгновенно переведёт её:\n"
+            "• <code>6 тон</code>\n"
+            "• <code>100 баксов</code>\n"
+            "• <code>500 звезд</code>\n"
+            "• <code>10 тон + 5 тон</code>\n\n"
+            "<b>🧮 Умный калькулятор</b>\n"
+            "Считает примеры цифрами и словами:\n"
+            "• <code>25 * 4</code> → <code>25 * 4 = 100</code>\n"
+            "• <code>пять плюс пять</code> → <code>5 + 5 = 10</code>\n\n"
+            "<b>🎁 Парсер NFT-подарков</b>\n"
+            "Отправь ссылку вида <code>t.me/nft/PlushPepe-274</code> — бот выведет карточку с редкостью, Floor-ценой и дешёвыми офферами."
         )
 
-    text = (
-        "📖 <b>Команды бота</b>\n"
-        "<i>Все команды пишутся в бизнес-чатах с префиксом точки</i>\n\n"
-
-        "<b>🚫 .мут [время]</b>\n"
-        "Мутит собеседника навсегда или на время (с/м/ч/д) — все его сообщения удаляются\n"
-        "Примеры: <code>.мут</code> · <code>.мут 10м</code> · <code>.мут 2ч</code> · <code>.мут 1д</code>\n\n"
-
-        "<b>🔁 .амут [текст]</b>\n"
-        "Антимут. Отправляет сообщение от лица бота и переотправляет 15 сек при удалении\n"
-        "Пример: <code>.амут привет</code>\n\n"
-
-        f"{admin_block}"
-
-        "<b>💣 .[N] [текст]</b>\n"
-        "Спам. Отправляет текст N раз (максимум 50)\n"
-        "Пример: <code>.10 привет</code>\n\n"
-
-        "<b>⌨️ Печатные анимации:</b>\n"
-        "• <code>.п1 [текст]</code> — посимвольная печать\n"
-        "• <code>.п2 [текст]</code> — печать с курсором ▌\n"
-        "• <code>.п3 [текст]</code> — сборка текста из матрицы символов\n\n"
-
-        "<b>✨ Символьные спецэффекты:</b>\n"
-        "• <code>.хак [текст]</code> (или <code>.п4</code>) — кибер-взлом терминала 💻\n"
-        "• <code>.бомба [текст]</code> (или <code>.п5</code>) — горящий фитиль и взрыв 💣\n"
-        "• <code>.неон [текст]</code> (или <code>.п6</code>) — эквалайзер и неоновая вывеска ⚡\n"
-        "• <code>.магия [текст]</code> (или <code>.п7</code>) — каст заклинания и портал 🔮\n"
-        "• <code>.лав [текст]</code> (или <code>.сердце</code>) — выстрел Купидона и сердце 💘\n\n"
-
-        "<b>🧮 Математика и 💱 Валюты</b>\n"
-        "Считает примеры цифрами и словами, конвертирует валюты на лету:\n"
-        "Примеры: <code>пять плюс пять</code> · <code>100 баксов</code> · <code>5 тон</code>\n\n"
-
-        "<b>🎁 Подарки Telegram</b>\n"
-        "Кидай ссылку <code>t.me/nft/...</code> — бот покажет модель, фон, floor и офферы"
-    )
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 Назад", callback_data="user_main")
-    await show_menu(call, text, builder.as_markup(), with_photo=True)
+    await show_menu(call, text, get_cmds_back_kb(), with_photo=True)
 
 
 # ==========================================
@@ -2238,6 +2285,77 @@ async def amute_command(message: Message):
     print(f"🔁 Амут-сессия на 15с: {key} → {text[:50]}")
 
 
+# ==========================================
+# ФЕЙК-АКТИВНОСТИ (.фейк [тип] [секунды])
+# ==========================================
+FAKE_ACTION_MAP = {
+    "печать": "typing", "текст": "typing", "т": "typing",
+    "гс": "record_voice", "войс": "record_voice", "голос": "record_voice",
+    "кружок": "record_video_note", "к": "record_video_note",
+    "видео": "upload_video", "в": "upload_video",
+    "фото": "upload_photo", "ф": "upload_photo",
+    "док": "upload_document", "файл": "upload_document",
+    "стикер": "choose_sticker", "игра": "choose_sticker",
+}
+
+
+@dp.business_message(F.text.lower().startswith(".фейк"))
+async def fake_action_command(message: Message):
+    conn_id = message.business_connection_id
+    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    if not owner_data or message.from_user.id != owner_data["user_id"]:
+        return
+
+    peer_id = message.chat.id
+    owner_id = owner_data["user_id"]
+    await handle_owner_activity(owner_id, peer_id)
+
+    with suppress(Exception):
+        await bot.delete_business_messages(
+            business_connection_id=conn_id,
+            message_ids=[message.message_id]
+        )
+
+    key = f"{conn_id}_{peer_id}"
+    # Если уже запущена фейк-активность в этом чате — отменяем старую
+    old_task = active_fakes.pop(key, None)
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    args = message.text[5:].strip().lower().split()
+    if args and args[0] in ("стоп", "stop", "выкл", "off"):
+        return
+
+    action = "typing"
+    duration = 25
+
+    for arg in args:
+        if arg.isdigit():
+            duration = min(max(int(arg), 5), 120)
+        elif arg in FAKE_ACTION_MAP:
+            action = FAKE_ACTION_MAP[arg]
+
+    async def _run_fake():
+        end_time = datetime.now(timezone.utc).timestamp() + duration
+        try:
+            while datetime.now(timezone.utc).timestamp() < end_time:
+                with suppress(Exception):
+                    await bot.send_chat_action(
+                        chat_id=peer_id,
+                        action=action,
+                        business_connection_id=conn_id
+                    )
+                await asyncio.sleep(4.3)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if active_fakes.get(key) is task:
+                active_fakes.pop(key, None)
+
+    task = asyncio.create_task(_run_fake())
+    active_fakes[key] = task
+
+
 @dp.business_message(F.text.regexp(r"^\.(\d+)\s+"))
 async def spam_command(message: Message):
     conn_id = message.business_connection_id
@@ -2262,7 +2380,7 @@ async def spam_command(message: Message):
 
 
 # ==========================================
-# АНИМАЦИИ ПЕЧАТИ И СИМВОЛЬНЫЕ СПЕЦЭФФЕКТЫ
+# АНИМАЦИИ ПЕЧАТИ И ДИНАМИЧЕСКИЕ АЛГОРИТМИЧЕСКИЕ ЭФФЕКТЫ
 # ==========================================
 @dp.business_message(F.text.lower().startswith(".п1"))
 async def type_animation_p1(message: Message):
@@ -2280,10 +2398,10 @@ async def type_animation_p1(message: Message):
     sent_msg = await bot.send_message(chat_id=peer_id, text=full_text[0], business_connection_id=conn_id)
     if not sent_msg:
         return
-    current = full_text[0]
-    for char in full_text[1:]:
-        current += char
-        await asyncio.sleep(0.27)
+    step = max(1, len(full_text) // 12)
+    for i in range(step, len(full_text) + step, step):
+        current = full_text[:i]
+        await asyncio.sleep(0.25)
         with suppress(Exception):
             await bot.edit_message_text(chat_id=peer_id, message_id=sent_msg.message_id, text=current, business_connection_id=conn_id)
 
@@ -2304,15 +2422,15 @@ async def type_animation_p2(message: Message):
     sent_msg = await bot.send_message(chat_id=peer_id, text=full_text[0] + "▌", business_connection_id=conn_id)
     if not sent_msg:
         return
-    current = full_text[0]
-    for char in full_text[1:]:
-        current += char
-        await asyncio.sleep(0.27)
+    step = max(1, len(full_text) // 12)
+    for i in range(step, len(full_text) + step, step):
+        current = full_text[:i]
+        await asyncio.sleep(0.25)
         with suppress(Exception):
             await bot.edit_message_text(chat_id=peer_id, message_id=sent_msg.message_id, text=current + "▌", business_connection_id=conn_id)
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.25)
     with suppress(Exception):
-        await bot.edit_message_text(chat_id=peer_id, message_id=sent_msg.message_id, text=current, business_connection_id=conn_id)
+        await bot.edit_message_text(chat_id=peer_id, message_id=sent_msg.message_id, text=full_text, business_connection_id=conn_id)
 
 
 @dp.business_message(F.text.lower().startswith(".п3"))
@@ -2332,203 +2450,336 @@ async def type_animation_p3(message: Message):
     sent_msg = await bot.send_message(chat_id=peer_id, text="...", business_connection_id=conn_id)
     if not sent_msg:
         return
-    for i in range(len(full_text) + 1):
-        await asyncio.sleep(0.2)
-        correct = full_text[:i]
-        rnd = "".join(random.choice(alphabet) for _ in range(len(full_text) - i))
+    step = max(1, len(full_text) // 12)
+    for i in range(step, len(full_text) + step, step):
+        idx = min(i, len(full_text))
+        await asyncio.sleep(0.22)
+        correct = full_text[:idx]
+        rnd = "".join(random.choice(alphabet) for _ in range(len(full_text) - idx))
         with suppress(Exception):
             await bot.edit_message_text(chat_id=peer_id, message_id=sent_msg.message_id, text=correct + rnd, business_connection_id=conn_id)
 
 
-@dp.business_message(F.text.lower().startswith((".хак", ".п4")))
-async def anim_hack(message: Message):
+# 1. ЭФФЕКТ ТАНОСА (.танос [текст]) — распад текста в пыль и исчезновение
+@dp.business_message(F.text.lower().startswith(".танос"))
+async def anim_thanos(message: Message):
     conn_id = message.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
     parts = message.text.split(maxsplit=1)
-    payload = html.escape(parts[1].strip()) if len(parts) > 1 else "СИСТЕМА ВЗЛОМАНА"
+    if len(parts) < 2 or not parts[1].strip():
+        return
+    raw_text = parts[1].strip()
     peer_id = message.chat.id
     await handle_owner_activity(owner_data["user_id"], peer_id)
 
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    frames = [
-        "💻 <code>[░░░░░░░░░░] 0%</code>\n⚡ <i>Инициализация эксплойта...</i>",
-        "💻 <code>[██░░░░░░░░] 24%</code>\n🔍 <i>Перехват пакетов: 0x7F9A...</i>",
-        "💻 <code>[█████░░░░░] 51%</code>\n🧬 <i>Обход шифрования: ▓▓▒░░▒▓...</i>",
-        "💻 <code>[████████░░] 83%</code>\n🔓 <i>Взлом корневого доступа...</i>",
-        "💻 <code>[██████████] 100%</code>\n✅ <b>ДОСТУП ПОЛУЧЕН!</b>",
-        (
-            "╔══════════════════════╗\n"
-            "   ⚡ <b>TERMINAL OVERRIDE</b> ⚡\n"
-            "╚══════════════════════╝\n"
-            f"🟢 <code>&gt;&gt; {payload}</code>"
-        )
-    ]
-
-    sent = await bot.send_message(chat_id=peer_id, text=frames[0], parse_mode="HTML", business_connection_id=conn_id)
+    sent = await bot.send_message(
+        chat_id=peer_id,
+        text=f"<code>{html.escape(raw_text)}</code>",
+        parse_mode="HTML",
+        business_connection_id=conn_id
+    )
     if not sent:
         return
-    for frame in frames[1:]:
-        await asyncio.sleep(0.45)
+
+    self_destruct_ids[f"{conn_id}_{sent.message_id}"] = True
+    await asyncio.sleep(1.5)  # Даём собеседнику прочитать текст
+
+    chars = list(raw_text)
+    indices = [i for i, c in enumerate(chars) if c != " "]
+    random.shuffle(indices)
+
+    dust_particles = ["░", "▒", "·", "˙", "˚"]
+    steps = 7
+    chunk_size = max(1, (len(indices) + steps - 1) // steps)
+    turning_to_space = []
+
+    for s in range(steps):
+        for idx in turning_to_space:
+            chars[idx] = " "
+        batch = indices[s * chunk_size:(s + 1) * chunk_size]
+        for idx in batch:
+            chars[idx] = random.choice(dust_particles)
+        turning_to_space = batch
+
+        current_str = "".join(chars)
+        if not current_str.strip():
+            break
+
+        await asyncio.sleep(0.32)
         with suppress(Exception):
-            await bot.edit_message_text(chat_id=peer_id, message_id=sent.message_id, text=frame, parse_mode="HTML", business_connection_id=conn_id)
+            await bot.edit_message_text(
+                chat_id=peer_id,
+                message_id=sent.message_id,
+                text=f"<code>{html.escape(current_str)}</code>",
+                parse_mode="HTML",
+                business_connection_id=conn_id
+            )
+
+    await asyncio.sleep(0.3)
+    with suppress(Exception):
+        await bot.edit_message_text(
+            chat_id=peer_id,
+            message_id=sent.message_id,
+            text="💨 <i>*испарилось*</i>",
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
+    await asyncio.sleep(0.7)
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[sent.message_id])
 
 
-@dp.business_message(F.text.lower().startswith((".бомба", ".п5")))
-async def anim_bomb(message: Message):
+# 2. ПАКМАН (.пак [текст]) — пожирает шифровку слева направо, открывая текст
+@dp.business_message(F.text.lower().startswith(".пак"))
+async def anim_pacman(message: Message):
     conn_id = message.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
     parts = message.text.split(maxsplit=1)
-    payload = html.escape(parts[1].strip()) if len(parts) > 1 else "БАБАХ!"
+    if len(parts) < 2 or not parts[1].strip():
+        return
+    raw_text = parts[1].strip()
     peer_id = message.chat.id
     await handle_owner_activity(owner_data["user_id"], peer_id)
 
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    frames = [
-        "💣════════════✨ <code>[00:04]</code>",
-        "💣═════════✨ <code>[00:03]</code>",
-        "💣══════✨ <code>[00:02]</code>",
-        "💣═══✨ <code>[00:01]</code>",
-        "💣💥 <code>[00:00]</code>",
-        "░░▒▒▓▓██ 💥 <b>Б У М !</b> 💥 ██▓▓▒▒░░",
-        "🌪️🔥💨 <i>Дым рассеивается...</i>",
-        (
-            "💥 <b>ВЗРЫВНОЕ СООБЩЕНИЕ:</b>\n"
-            "┏━━━━━━━━━━━━━━━━━━━━┓\n"
-            f"   🔥 <b>{payload}</b>\n"
-            "┗━━━━━━━━━━━━━━━━━━━━┛"
-        )
-    ]
-
-    sent = await bot.send_message(chat_id=peer_id, text=frames[0], parse_mode="HTML", business_connection_id=conn_id)
+    n = len(raw_text)
+    step = max(1, n // 9)
+    init_dots = "•" * min(n, 24)
+    sent = await bot.send_message(
+        chat_id=peer_id,
+        text=f"<code>ᗧ{init_dots}</code>",
+        parse_mode="HTML",
+        business_connection_id=conn_id
+    )
     if not sent:
         return
-    for frame in frames[1:]:
-        await asyncio.sleep(0.4)
+
+    frame_num = 0
+    for pos in range(step, n, step):
+        frame_num += 1
+        pac = "ᗤ" if frame_num % 2 == 1 else "ᗧ"
+        revealed = html.escape(raw_text[:pos])
+        dots_left = "•" * min(n - pos, 20)
+        frame = f"<code>{revealed}</code> {pac}<code>{dots_left}</code>"
+        await asyncio.sleep(0.28)
         with suppress(Exception):
-            await bot.edit_message_text(chat_id=peer_id, message_id=sent.message_id, text=frame, parse_mode="HTML", business_connection_id=conn_id)
+            await bot.edit_message_text(
+                chat_id=peer_id,
+                message_id=sent.message_id,
+                text=frame,
+                parse_mode="HTML",
+                business_connection_id=conn_id
+            )
+
+    await asyncio.sleep(0.28)
+    with suppress(Exception):
+        await bot.edit_message_text(
+            chat_id=peer_id,
+            message_id=sent.message_id,
+            text=html.escape(raw_text),
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
 
 
-@dp.business_message(F.text.lower().startswith((".неон", ".п6")))
-async def anim_neon(message: Message):
+# 3. БРУТФОРС (.брут [текст]) — скоростной взломщик замка по символам
+@dp.business_message(F.text.lower().startswith(".брут"))
+async def anim_brute(message: Message):
     conn_id = message.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
     parts = message.text.split(maxsplit=1)
-    payload = html.escape(parts[1].strip()) if len(parts) > 1 else "NEON VIBE"
+    if len(parts) < 2 or not parts[1].strip():
+        return
+    raw_text = parts[1].strip()
     peer_id = message.chat.id
     await handle_owner_activity(owner_data["user_id"], peer_id)
 
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    frames = [
-        f"<code>▂▃▅▆▇█▇▆▅▃▂</code>\n✨ <i>{payload}</i>",
-        f"<code>▆▇█▅▃▂▃▅█▇▆</code>\n⚡ <b>{payload}</b>",
-        f"<code>▃▂▅▇█▆▃▂▆█</code>\n🌟 <i>{payload}</i>",
-        f"<code>█▇▆▅▃▂▃▅▆▇█</code>\n🔥 <b>{payload}</b>",
-        (
-            "✦•······················•✦•······················•✦\n"
-            f"       ⚡ <b>{payload}</b> ⚡\n"
-            "✦•······················•✦•······················•✦"
-        )
-    ]
+    hex_chars = "0123456789ABCDEF#$%&*@!?"
+    n = len(raw_text)
+    step = max(1, n // 8)
 
-    sent = await bot.send_message(chat_id=peer_id, text=frames[0], parse_mode="HTML", business_connection_id=conn_id)
+    sent = await bot.send_message(
+        chat_id=peer_id,
+        text=f"🔐 <code>[{'█' * min(n, 20)}] 0%</code>",
+        parse_mode="HTML",
+        business_connection_id=conn_id
+    )
     if not sent:
         return
-    for frame in frames[1:]:
-        await asyncio.sleep(0.38)
+
+    for pos in range(0, n, step):
+        locked = html.escape(raw_text[:pos])
+        rem_len = min(n - pos, 16)
+        spinning = "".join(random.choice(hex_chars) for _ in range(rem_len))
+        pct = int((pos / n) * 100)
+        frame = f"🔐 <code>{locked}{spinning}</code> <b>[{pct}%]</b>"
+        await asyncio.sleep(0.26)
         with suppress(Exception):
-            await bot.edit_message_text(chat_id=peer_id, message_id=sent.message_id, text=frame, parse_mode="HTML", business_connection_id=conn_id)
+            await bot.edit_message_text(
+                chat_id=peer_id,
+                message_id=sent.message_id,
+                text=frame,
+                parse_mode="HTML",
+                business_connection_id=conn_id
+            )
+
+    await asyncio.sleep(0.26)
+    with suppress(Exception):
+        await bot.edit_message_text(
+            chat_id=peer_id,
+            message_id=sent.message_id,
+            text=f"🔓 <code>{html.escape(raw_text)}</code>",
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
 
 
-@dp.business_message(F.text.lower().startswith((".магия", ".п7")))
-async def anim_magic(message: Message):
+# 4. ZALGO-ГЛИТЧ (.глитч [текст]) — диакритические помехи и стабилизация
+ZALGO_MARKS = [chr(code) for code in range(0x0300, 0x0338)]
+
+
+def _zalgoify(text: str, intensity: int) -> str:
+    out = []
+    for ch in text:
+        out.append(ch)
+        if ch != " " and intensity > 0:
+            for _ in range(random.randint(1, intensity)):
+                out.append(random.choice(ZALGO_MARKS))
+    return "".join(out)
+
+
+@dp.business_message(F.text.lower().startswith(".глитч"))
+async def anim_glitch(message: Message):
     conn_id = message.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
     parts = message.text.split(maxsplit=1)
-    payload = html.escape(parts[1].strip()) if len(parts) > 1 else "Абракадабра!"
+    if len(parts) < 2 or not parts[1].strip():
+        return
+    raw_text = parts[1].strip()
     peer_id = message.chat.id
     await handle_owner_activity(owner_data["user_id"], peer_id)
 
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    frames = [
-        "<code>( ˘▽˘)っ🔮</code> <i>Чтение древнего свитка...</i>",
-        "<code>(∩^o^)⊃━☆ﾟ.*･｡ﾟ</code>",
-        "<code>(∩^o^)⊃━☆ﾟ.*･｡ﾟ ✨ ҉ ҉ ҉</code>",
-        "🌌 <code>✦ ✧ ✩ ✪ ✫ ✬ ✭ ✮ ✯</code> 🌌",
-        (
-            "╭─━━━━━━━━━━━━━━─╮\n"
-            f"   🔮 <b>{payload}</b> ✨\n"
-            "╰─━━━━━━━━━━━━━━─╯"
-        )
-    ]
-
-    sent = await bot.send_message(chat_id=peer_id, text=frames[0], parse_mode="HTML", business_connection_id=conn_id)
+    intensities = [5, 3, 6, 2, 4, 1]
+    sent = await bot.send_message(
+        chat_id=peer_id,
+        text=f"⚡ {html.escape(_zalgoify(raw_text, 6))}",
+        parse_mode="HTML",
+        business_connection_id=conn_id
+    )
     if not sent:
         return
-    for frame in frames[1:]:
-        await asyncio.sleep(0.42)
+
+    for lvl in intensities:
+        await asyncio.sleep(0.28)
+        glitched = html.escape(_zalgoify(raw_text, lvl))
+        prefix = random.choice(["⚡", "⚠️", "📡", "🔌"])
         with suppress(Exception):
-            await bot.edit_message_text(chat_id=peer_id, message_id=sent.message_id, text=frame, parse_mode="HTML", business_connection_id=conn_id)
+            await bot.edit_message_text(
+                chat_id=peer_id,
+                message_id=sent.message_id,
+                text=f"{prefix} {glitched}",
+                parse_mode="HTML",
+                business_connection_id=conn_id
+            )
+
+    await asyncio.sleep(0.28)
+    with suppress(Exception):
+        await bot.edit_message_text(
+            chat_id=peer_id,
+            message_id=sent.message_id,
+            text=html.escape(raw_text),
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
 
 
-@dp.business_message(F.text.lower().startswith((".лав", ".сердце")))
-async def anim_love(message: Message):
+# 5. БЕГУЩЕЕ LED-ТАБЛО (.табло [текст])
+@dp.business_message(F.text.lower().startswith(".табло"))
+async def anim_ticker(message: Message):
     conn_id = message.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
     parts = message.text.split(maxsplit=1)
-    payload = html.escape(parts[1].strip()) if len(parts) > 1 else "Ты в моём сердечке ❤️"
+    if len(parts) < 2 or not parts[1].strip():
+        return
+    raw_text = parts[1].strip()
     peer_id = message.chat.id
     await handle_owner_activity(owner_data["user_id"], peer_id)
 
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    frames = [
-        "🏹 <code>───────────&gt;</code> ❤️",
-        "🏹 <code>────────&gt;</code> ❤️",
-        "🏹 <code>─────&gt;</code> ❤️",
-        "🏹 <code>──&gt;</code> 💓",
-        "💘 <b>ПРЯМО В СЕРДЦЕ!</b> 💘",
-        (
-            "❤️•°*”˜˜”*°•.¸❤️¸.•°*”˜˜”*°•❤️\n"
-            f"      💖 <b>{payload}</b> 💖\n"
-            "❤️•°*”˜˜”*°•.¸❤️¸.•°*”˜˜”*°•❤️"
-        )
-    ]
+    width = 18
+    padded = (" " * width) + raw_text + (" " * width)
+    total_shifts = len(padded) - width
+    step = max(1, total_shifts // 9)
 
-    sent = await bot.send_message(chat_id=peer_id, text=frames[0], parse_mode="HTML", business_connection_id=conn_id)
+    def _box(content: str) -> str:
+        return (
+            f"<code>┏{'━' * (width + 2)}┓\n"
+            f"┃ {html.escape(content)} ┃\n"
+            f"┗{'━' * (width + 2)}┛</code>"
+        )
+
+    sent = await bot.send_message(
+        chat_id=peer_id,
+        text=_box(padded[:width]),
+        parse_mode="HTML",
+        business_connection_id=conn_id
+    )
     if not sent:
         return
-    for frame in frames[1:]:
-        await asyncio.sleep(0.38)
+
+    for pos in range(step, total_shifts + 1, step):
+        window = padded[pos:pos + width].ljust(width)
+        await asyncio.sleep(0.28)
         with suppress(Exception):
-            await bot.edit_message_text(chat_id=peer_id, message_id=sent.message_id, text=frame, parse_mode="HTML", business_connection_id=conn_id)
+            await bot.edit_message_text(
+                chat_id=peer_id,
+                message_id=sent.message_id,
+                text=_box(window),
+                parse_mode="HTML",
+                business_connection_id=conn_id
+            )
+
+    await asyncio.sleep(0.3)
+    with suppress(Exception):
+        await bot.edit_message_text(
+            chat_id=peer_id,
+            message_id=sent.message_id,
+            text=f"📟 <b>{html.escape(raw_text)}</b>",
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
 
 
 # ==========================================
-# ПАРСЕР ПОДАРКОВ (С ЗАЩИТОЙ ОТ ОБХОДА МУТА)
+# ПАРСЕР ПОДАРКОВ (БЕЗ ДУБЛИРОВАНИЯ И С ЗАЩИТОЙ ОТ МУТА)
 # ==========================================
 NFT_LINK_PATTERN = r"(t\.me/nft/[a-zA-Z0-9_-]+)"
 
@@ -2562,7 +2813,15 @@ async def process_gift_link_auto(message: Message):
 
         if is_owner:
             await handle_owner_activity(owner_id, peer_id)
+        else:
+            # Если отправитель тоже подключил нашего бота — отвечает его подключение, а наше молчит
+            if await is_bot_connected(message.from_user.id):
+                return
+
+        dedup_key = ("nft", frozenset({owner_id, peer_id}), slug.lower())
+        if dedup_key in action_dedup:
             return
+        action_dedup[dedup_key] = True
 
     loading_msg = None
     with suppress(Exception):
@@ -2581,7 +2840,7 @@ async def process_gift_link_auto(message: Message):
 
 
 # ==========================================
-# МАТЕМАТИКА И ВАЛЮТЫ (С ЗАЩИТОЙ ОТ ОБХОДА МУТА)
+# МАТЕМАТИКА И ВАЛЮТЫ (БЕЗ ДУБЛИРОВАНИЯ МЕЖДУ ДВУМЯ БОТАМИ)
 # ==========================================
 @dp.business_message(F.text.regexp(AUTO_MATH_CURRENCY_PATTERN) | F.text.regexp(AUTO_MATH_PATTERN))
 async def auto_math_and_currency(message: Message):
@@ -2598,7 +2857,7 @@ async def auto_math_and_currency(message: Message):
     peer_id = message.chat.id
     is_owner = (message.from_user.id == owner_id)
 
-    # Если собеседник в муте — удаляем его сообщение и не считаем математику/валюту
+    # 1. Защита от обхода мута
     if not is_owner and await is_chat_muted(conn_id, peer_id):
         if message.from_user.id != bot.id:
             with suppress(Exception):
@@ -2612,6 +2871,16 @@ async def auto_math_and_currency(message: Message):
     if is_owner:
         await check_and_save_protected_media(message, owner_id)
         await handle_owner_activity(owner_id, peer_id)
+    else:
+        # 2. Если у отправителя тоже подключён наш бот — не дублируем ответ от второго лица!
+        if await is_bot_connected(message.from_user.id):
+            return
+
+    # 3. Замок-дедупликатор диалога (гарантия 1 ответа даже при гонке запросов)
+    dedup_key = ("calc", frozenset({owner_id, peer_id}), message.text.strip().lower())
+    if dedup_key in action_dedup:
+        return
+    action_dedup[dedup_key] = True
 
     match_curr = AUTO_MATH_CURRENCY_PATTERN.match(message.text)
     if match_curr:
@@ -2765,6 +3034,10 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
     owner_id = owner_data["user_id"]
 
     for msg_id in deleted.message_ids:
+        # Игнорируем самоудаление анимации .танос
+        if f"{conn_id}_{msg_id}" in self_destruct_ids:
+            continue
+
         key = f"{conn_id}_{peer_id}"
         session = active_amute.get(key)
         if session and session.get("message_id") == msg_id:
