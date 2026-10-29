@@ -74,8 +74,6 @@ self_destruct_ids = TTLCache(maxsize=1000, ttl=30)
 active_fakes: dict[str, asyncio.Task] = {}
 copied_messages_cache = {}
 bot_formatted_ids = TTLCache(maxsize=3000, ttl=60)
-# Список сообщений, которые бот сам удалил для форматирования (чтобы не спамить лог удалёнок)
-ignore_deletion_ids = TTLCache(maxsize=1000, ttl=30)
 
 
 # ==========================================
@@ -531,7 +529,7 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
         return None
 
     if media_type and file_id:
-        # ИСПРАВЛЕНИЕ БАГА: передаем имя собеседника (peer_info), а не отправителя (from_user)
+        # ИСПРАВЛЕНО: Теперь передаем имя СОБЕСЕДНИКА (peer_info), а не отправителя
         asyncio.create_task(upload_media_bg(
             doc["_id"], file_id, media_type, ext, mime,
             peer_info["first_name"], peer_id, owner_name, file_size
@@ -3161,77 +3159,46 @@ async def handle_messages(message: Message):
     is_owner = (message.from_user.id == owner_id)
 
     if is_owner:
-        # Защищённые медиа сохраняем в любом случае
+        # Сохраняем защищенные медиа
         await check_and_save_protected_media(message, owner_id)
 
-        # --- Форматирование ---
-        format_key = f"{conn_id}_{message.message_id}"
-        is_bot_formatted = format_key in bot_formatted_ids
-
+        # Получаем настройки форматирования
         owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
         mode = owner_settings.get("format_mode", [])
+        
+        # Сначала сохраняем сообщение в архив (в исходном виде)
+        doc = await save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner)
+
+        # Проверяем, нужно ли форматирование
         should_format = (
-            not is_bot_formatted
-            and isinstance(mode, list) and mode
+            isinstance(mode, list) and mode
             and message.text
             and not message.text.startswith(".")
+            and not message.text.startswith("<") # Грубая проверка, что текст еще не отформатирован
         )
 
         if should_format:
             formatted = apply_format(message.text, mode)
             if formatted and formatted != message.text:
-                sent = None
-                with suppress(Exception):
-                    sent = await bot.send_message(
+                try:
+                    # ИСПОЛЬЗУЕМ EDIT_MESSAGE_TEXT ВМЕСТО УДАЛЕНИЯ
+                    await bot.edit_message_text(
                         chat_id=peer_id,
+                        message_id=message.message_id,
                         text=formatted,
                         parse_mode="HTML",
                         business_connection_id=conn_id
                     )
-                if sent:
-                    # Помечаем, что новое сообщение отправлено нами (чтобы не форматировать его снова)
-                    bot_formatted_ids[f"{conn_id}_{sent.message_id}"] = True
-                    # Помечаем оригинал для игнорирования в логах удалёнок
-                    ignore_deletion_ids[f"{conn_id}_{message.message_id}"] = True
-                    
-                    # Сохраняем в базу отформатированное сообщение (как исходящее от пользователя)
-                    # Нам нужно получить peer_info, чтобы правильно сохранить его
-                    peer_info = await get_peer_info(conn_id, peer_id)
-                    await archive_collection.insert_one({
-                        "conn_id": conn_id,
-                        "chat_id": peer_id,
-                        "owner_id": owner_id,
-                        "message_id": sent.message_id,
-                        "user_id": owner_id,
-                        "first_name": message.from_user.first_name or "Без имени",
-                        "username": message.from_user.username or "",
-                        "peer_first_name": peer_info["first_name"],
-                        "peer_username": peer_info["username"],
-                        "text": formatted,
-                        "is_owner": True,
-                        "media_type": None,
-                        "media_file_id": None,
-                        "drive_link": None,
-                        "drive_file_id": None,
-                        "is_deleted": False,
-                        "is_edited": False,
-                        "old_text": None,
-                        "is_viewed": False,
-                        "created_at": datetime.now(timezone.utc),
-                    })
-
-                    # Удаляем старое (оригинальное) сообщение
-                    with suppress(Exception):
-                        await bot.delete_business_messages(
-                            business_connection_id=conn_id,
-                            message_ids=[message.message_id]
+                    # Обновляем текст в базе данных, если редактирование прошло успешно
+                    if doc:
+                        await archive_collection.update_one(
+                            {"_id": doc["_id"]},
+                            {"$set": {"text": formatted}}
                         )
-                    return
-                # если отправка не удалась — проваливаемся в обычную обработку
+                except Exception as e:
+                    print(f"❌ Ошибка форматирования (edit_message_text): {e}")
+                    # Если не удалось отредактировать, сообщение остается в исходном виде
 
-        # Обычная ветка владельца
-        with suppress(Exception):
-            await save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner)
         await handle_owner_activity(owner_id, peer_id)
         return
 
@@ -3320,8 +3287,6 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
 
     for msg_id in deleted.message_ids:
         if f"{conn_id}_{msg_id}" in self_destruct_ids:
-            continue
-        if f"{conn_id}_{msg_id}" in ignore_deletion_ids:
             continue
 
         key = f"{conn_id}_{peer_id}"
