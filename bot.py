@@ -53,7 +53,7 @@ CAPTION_LIMIT = 1024
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-BOT_ID: int | None = None   # выставляется в on_startup
+BOT_ID: int | None = None
 BOT_USERNAME = "your_bot_username"
 
 try:
@@ -66,7 +66,6 @@ try:
 except Exception as e:
     print(f"Ошибка БД: {e}")
 
-# mute_key -> float (timestamp окончания) или None (бессрочно)
 muted_chats: dict[str, float | None] = {}
 afk_cooldowns = TTLCache(maxsize=2000, ttl=300)
 active_amute = TTLCache(maxsize=1000, ttl=15)
@@ -74,8 +73,9 @@ action_dedup = TTLCache(maxsize=2000, ttl=4)
 self_destruct_ids = TTLCache(maxsize=1000, ttl=30)
 active_fakes: dict[str, asyncio.Task] = {}
 copied_messages_cache = {}
-# ID сообщений, отправленных ботом в рамках авто-форматирования (чтоб не форматировать их повторно)
 bot_formatted_ids = TTLCache(maxsize=3000, ttl=60)
+# Список сообщений, которые бот сам удалил для форматирования (чтобы не спамить лог удалёнок)
+ignore_deletion_ids = TTLCache(maxsize=1000, ttl=30)
 
 
 # ==========================================
@@ -135,7 +135,6 @@ async def is_chat_muted(conn_id: str, peer_id: int) -> bool:
 
 
 async def handle_owner_activity(owner_id: int, peer_id: int):
-    """Ставит паузу на AFK для чата и атомарно выключает ручной AFK (без двойных сообщений)."""
     afk_cooldowns[(owner_id, peer_id)] = True
     try:
         result = await users_collection.update_one(
@@ -227,7 +226,6 @@ async def show_menu(call: CallbackQuery, caption: str, kb, with_photo: bool = Tr
 # ФОРМАТИРОВАНИЕ ТЕКСТА (КАПС / ЖИРНЫЙ / КУРСИВ)
 # ==========================================
 def apply_format(text: str, mode: list) -> str:
-    """Применяет стили к тексту. mode — список из 'caps', 'bold', 'italic'."""
     if not mode or not isinstance(mode, list):
         return text
 
@@ -244,7 +242,6 @@ def apply_format(text: str, mode: list) -> str:
     if len(result) <= 4096:
         return result
 
-    # Бинарный поиск максимального префикса, влезающего в лимит
     low, high = 0, len(text)
     while low < high:
         mid = (low + high + 1) // 2
@@ -274,7 +271,7 @@ ROOT_FOLDER_NAME = "TelegramArchiveBot"
 def _init_drive():
     global _drive_service
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
-        print("⚠️ Google Drive: ключи не заданы")
+        print("⚠️ Google Drive: ключи не заданы в переменных окружения")
         return None
     try:
         creds = Credentials(
@@ -483,7 +480,7 @@ async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_
             )
             print(f"✅ Медиа загружено: {media_type} для {peer_id}")
     except Exception as e:
-        print(f"upload_media_bg error: {e}")
+        print(f"❌ upload_media_bg error: {e}")
     finally:
         if tmp_path:
             with suppress(Exception):
@@ -534,9 +531,10 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
         return None
 
     if media_type and file_id:
+        # ИСПРАВЛЕНИЕ БАГА: передаем имя собеседника (peer_info), а не отправителя (from_user)
         asyncio.create_task(upload_media_bg(
             doc["_id"], file_id, media_type, ext, mime,
-            message.from_user.first_name, peer_id, owner_name, file_size
+            peer_info["first_name"], peer_id, owner_name, file_size
         ))
 
     return doc
@@ -730,72 +728,38 @@ EXCHANGE_CACHE = {}
 STARS_USD_RATE = 0.015
 
 CURRENCY_ALIASES = {
-    "usd": "USDT", "usdt": "USDT",
-    "доллар": "USDT", "доллары": "USDT", "долларов": "USDT", "доллара": "USDT",
-    "долл": "USDT", "долл.": "USDT",
-    "бакс": "USDT", "баксы": "USDT", "баксов": "USDT", "бакса": "USDT",
-    "бачей": "USDT", "бач": "USDT", "бач.": "USDT",
-    "баксик": "USDT", "баксиков": "USDT", "баксика": "USDT",
-    "зеленый": "USDT", "зелёный": "USDT", "зеленых": "USDT", "зелёных": "USDT",
-    "зелень": "USDT", "зелени": "USDT",
-    "юсд": "USDT", "юсдт": "USDT", "усд": "USDT", "усдт": "USDT",
-    "тетер": "USDT", "тетеры": "USDT", "тетеров": "USDT", "тетера": "USDT",
-    "тезер": "USDT", "тезеры": "USDT", "тезеров": "USDT", "тезера": "USDT",
-    "юста": "USDT", "юст": "USDT",
-    "$": "USDT", "💵": "USDT", "💰": "USDT", "💲": "USDT",
-
-    "rub": "RUB", "руб": "RUB", "руб.": "RUB",
-    "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "рубля": "RUB", "рублю": "RUB",
-    "рубас": "RUB", "рубасов": "RUB", "рубаса": "RUB", "рубасы": "RUB",
-    "рубчик": "RUB", "рубчики": "RUB", "рубчиков": "RUB",
-    "деревянный": "RUB", "деревянных": "RUB", "деревянные": "RUB",
-    "р": "RUB", "р.": "RUB", "₽": "RUB",
-
-    "eur": "EUR", "евро": "EUR", "еврик": "EUR", "еврики": "EUR",
-    "евриков": "EUR", "еврика": "EUR", "евра": "EUR", "евров": "EUR", "€": "EUR",
-
-    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "юаня": "CNY",
-    "юан": "CNY", "yuan": "CNY", "юанчики": "CNY",
-    "женьминьби": "CNY", "жэньминьби": "CNY", "¥": "CNY",
-
-    "btc": "BTC", "биткоин": "BTC", "биткоины": "BTC", "биткоинов": "BTC",
-    "биткоина": "BTC", "биткойн": "BTC", "биткойны": "BTC", "биткойнов": "BTC",
-    "биток": "BTC", "битки": "BTC", "битков": "BTC", "битка": "BTC",
+    "usd": "USDT", "usdt": "USDT", "доллар": "USDT", "доллары": "USDT", "долларов": "USDT", "доллара": "USDT",
+    "долл": "USDT", "долл.": "USDT", "бакс": "USDT", "баксы": "USDT", "баксов": "USDT", "бакса": "USDT",
+    "бачей": "USDT", "бач": "USDT", "бач.": "USDT", "баксик": "USDT", "баксиков": "USDT", "баксика": "USDT",
+    "зеленый": "USDT", "зелёный": "USDT", "зеленых": "USDT", "зелёных": "USDT", "зелень": "USDT", "зелени": "USDT",
+    "юсд": "USDT", "юсдт": "USDT", "усд": "USDT", "усдт": "USDT", "тетер": "USDT", "тетеры": "USDT", 
+    "тетеров": "USDT", "тетера": "USDT", "тезер": "USDT", "тезеры": "USDT", "тезеров": "USDT", "тезера": "USDT",
+    "юста": "USDT", "юст": "USDT", "$": "USDT", "💵": "USDT", "💰": "USDT", "💲": "USDT",
+    "rub": "RUB", "руб": "RUB", "руб.": "RUB", "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "рубля": "RUB", "рублю": "RUB",
+    "рубас": "RUB", "рубасов": "RUB", "рубаса": "RUB", "рубасы": "RUB", "рубчик": "RUB", "рубчики": "RUB", "рубчиков": "RUB",
+    "деревянный": "RUB", "деревянных": "RUB", "деревянные": "RUB", "р": "RUB", "р.": "RUB", "₽": "RUB",
+    "eur": "EUR", "евро": "EUR", "еврик": "EUR", "еврики": "EUR", "евриков": "EUR", "еврика": "EUR", "евра": "EUR", "евров": "EUR", "€": "EUR",
+    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "юаня": "CNY", "юан": "CNY", "yuan": "CNY", 
+    "юанчики": "CNY", "женьминьби": "CNY", "жэньминьби": "CNY", "¥": "CNY",
+    "btc": "BTC", "биткоин": "BTC", "биткоины": "BTC", "биткоинов": "BTC", "биткоина": "BTC", "биткойн": "BTC", 
+    "биткойны": "BTC", "биткойнов": "BTC", "биток": "BTC", "битки": "BTC", "битков": "BTC", "битка": "BTC", 
     "бит": "BTC", "биты": "BTC", "битов": "BTC", "₿": "BTC",
-
-    "ton": "TON", "тон": "TON", "тона": "TON", "тонов": "TON", "тоны": "TON",
-    "тоник": "TON", "тоника": "TON", "тоников": "TON", "тонику": "TON",
-    "грам": "TON", "грама": "TON", "грамов": "TON", "граммы": "TON",
-    "грамм": "TON", "gram": "TON", "grams": "TON",
-    "павлуша": "TON", "дуров": "TON", "💎": "TON",
-
-    "stars": "STARS", "star": "STARS",
-    "звезда": "STARS", "звёзда": "STARS", "звезды": "STARS", "звёзды": "STARS",
-    "звезд": "STARS", "звёзд": "STARS", "звезде": "STARS", "звёзде": "STARS",
-    "звездочка": "STARS", "звёздочка": "STARS",
-    "звездочки": "STARS", "звёздочки": "STARS",
-    "звездочек": "STARS", "звёздочек": "STARS",
-    "зв": "STARS", "зв.": "STARS",
-    "звездулька": "STARS", "звездульки": "STARS",
-    "starчик": "STARS", "стар": "STARS", "стары": "STARS", "старов": "STARS",
+    "ton": "TON", "тон": "TON", "тона": "TON", "тонов": "TON", "тоны": "TON", "тоник": "TON", "тоника": "TON", 
+    "тоников": "TON", "тонику": "TON", "грам": "TON", "грама": "TON", "грамов": "TON", "граммы": "TON", 
+    "грамм": "TON", "gram": "TON", "grams": "TON", "павлуша": "TON", "дуров": "TON", "💎": "TON",
+    "stars": "STARS", "star": "STARS", "звезда": "STARS", "звёзда": "STARS", "звезды": "STARS", "звёзды": "STARS",
+    "звезд": "STARS", "звёзд": "STARS", "звезде": "STARS", "звёзде": "STARS", "звездочка": "STARS", "звёздочка": "STARS",
+    "звездочки": "STARS", "звёздочки": "STARS", "звездочек": "STARS", "звёздочек": "STARS", "зв": "STARS", "зв.": "STARS",
+    "звездулька": "STARS", "звездульки": "STARS", "starчик": "STARS", "стар": "STARS", "стары": "STARS", "старов": "STARS",
     "⭐": "STARS", "🌟": "STARS", "✨": "STARS",
-
-    "eth": "ETH", "эфир": "ETH", "эфира": "ETH", "эфиров": "ETH", "эфиры": "ETH",
-    "эфириум": "ETH", "эфирка": "ETH", "эфирки": "ETH", "эфирок": "ETH",
-    "эфирчик": "ETH", "эфирчика": "ETH", "Ξ": "ETH",
-
-    "kzt": "KZT", "тенге": "KZT", "теньге": "KZT", "теньга": "KZT",
-    "тг": "KZT", "тг.": "KZT", "₸": "KZT",
-
-    "uah": "UAH", "гривна": "UAH", "гривны": "UAH", "гривен": "UAH",
-    "гривне": "UAH", "гривня": "UAH", "гривню": "UAH",
+    "eth": "ETH", "эфир": "ETH", "эфира": "ETH", "эфиров": "ETH", "эфиры": "ETH", "эфириум": "ETH", "эфирка": "ETH", 
+    "эфирки": "ETH", "эфирок": "ETH", "эфирчик": "ETH", "эфирчика": "ETH", "Ξ": "ETH",
+    "kzt": "KZT", "тенге": "KZT", "теньге": "KZT", "теньга": "KZT", "тг": "KZT", "тг.": "KZT", "₸": "KZT",
+    "uah": "UAH", "гривна": "UAH", "гривны": "UAH", "гривен": "UAH", "гривне": "UAH", "гривня": "UAH", "гривню": "UAH",
     "грн": "UAH", "грн.": "UAH", "₴": "UAH",
-
-    "gbp": "GBP", "фунт": "GBP", "фунты": "GBP", "фунтов": "GBP", "фунта": "GBP",
-    "стерлинг": "GBP", "стерлинги": "GBP", "стерлингов": "GBP", "£": "GBP",
-
-    "jpy": "JPY", "иена": "JPY", "иены": "JPY", "иен": "JPY",
-    "йена": "JPY", "йены": "JPY", "йен": "JPY",
+    "gbp": "GBP", "фунт": "GBP", "фунты": "GBP", "фунтов": "GBP", "фунта": "GBP", "стерлинг": "GBP", "стерлинги": "GBP", 
+    "стерлингов": "GBP", "£": "GBP",
+    "jpy": "JPY", "иена": "JPY", "иены": "JPY", "иен": "JPY", "йена": "JPY", "йены": "JPY", "йен": "JPY",
 }
 
 ALL_CURRENCIES = ["RUB", "USDT", "EUR", "CNY", "KZT", "UAH", "GBP", "JPY", "BTC", "ETH", "TON", "STARS"]
@@ -820,7 +784,6 @@ _WORDS = r"(?:плюс|минус|умножить на|разделить на|
 AUTO_MATH_PATTERN = re.compile(rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})+\s*$", re.IGNORECASE)
 AUTO_MATH_CURRENCY_PATTERN = re.compile(rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$", re.IGNORECASE)
 
-# Смешанные валюты: "5 тон + 7 баксов" или "10 usdt - 3 ton + 2 stars"
 MIXED_CURRENCY_FULL = re.compile(
     rf"^\s*{_SINGLE_NUM}\s*(?:{_CURRENCY_ALT})(?:\s*[+\-]\s*{_SINGLE_NUM}\s*(?:{_CURRENCY_ALT}))+\s*$",
     re.IGNORECASE
@@ -1033,9 +996,7 @@ async def send_currency_conversion(message: Message, amount: float, from_cur: st
         )
 
 
-# ---- Смешанные валюты ----
 def parse_mixed_currency(text: str):
-    """Возвращает [{'num': float, 'cur': code}, '+', {'num': float, 'cur': code}, ...] или None."""
     text = text.strip()
     parsed = []
     pos = 0
@@ -1076,7 +1037,6 @@ def parse_mixed_currency(text: str):
 
 
 async def eval_mixed_currency(parsed):
-    """Складывает/вычитает, приводя всё к USDT. Возвращает итог в USDT или None."""
     if not EXCHANGE_CACHE:
         await force_update_all_rates()
 
@@ -2023,7 +1983,6 @@ async def save_afk_time(message: Message, state: FSMContext):
         await message.answer("⚠ Формат: <code>23 7</code>", parse_mode="HTML")
 
 
-# ---- Часовой пояс ----
 @dp.callback_query(F.data == "afk_set_tz")
 async def afk_set_tz(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
@@ -2543,7 +2502,7 @@ async def amute_command(message: Message):
 
 
 # ==========================================
-# ФЕЙК-АКТИВНОСТИ (.фейк) — ИСПРАВЛЕНО
+# ФЕЙК-АКТИВНОСТИ (.фейк) 
 # ==========================================
 FAKE_ACTION_MAP = {
     "печать": "typing", "текст": "typing", "т": "typing",
@@ -2590,38 +2549,17 @@ async def fake_action_command(message: Message):
 
     async def _run_fake():
         end_time = datetime.now(timezone.utc).timestamp() + duration
-        use_business_param = True
-        first_fail_logged = False
-        try:
-            while datetime.now(timezone.utc).timestamp() < end_time:
-                try:
-                    if use_business_param:
-                        await bot.send_chat_action(
-                            chat_id=peer_id,
-                            action=action,
-                            business_connection_id=conn_id
-                        )
-                    else:
-                        await bot.send_chat_action(chat_id=peer_id, action=action)
-                except TypeError as te:
-                    if use_business_param:
-                        print(f"⚠️ .фейк: aiogram не поддерживает business_connection_id в send_chat_action ({te}). Использую fallback. Обнови aiogram для корректного отображения 'владелец печатает'.")
-                        use_business_param = False
-                        continue
-                    print(f"⚠️ .фейк: TypeError: {te}")
-                    return
-                except Exception as e:
-                    if not first_fail_logged:
-                        print(f"⚠️ .фейк: send_chat_action error: {e}")
-                        first_fail_logged = True
-                    await asyncio.sleep(2)
-                    continue
-                await asyncio.sleep(4.3)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            if active_fakes.get(key) is task:
-                active_fakes.pop(key, None)
+        while datetime.now(timezone.utc).timestamp() < end_time:
+            try:
+                await bot.send_chat_action(
+                    chat_id=peer_id,
+                    action=action,
+                    business_connection_id=conn_id
+                )
+            except Exception as e:
+                print(f"❌ Ошибка .фейк (send_chat_action): {e}")
+                break
+            await asyncio.sleep(4.3)
 
     task = asyncio.create_task(_run_fake())
     active_fakes[key] = task
@@ -3107,7 +3045,7 @@ async def process_gift_link_auto(message: Message):
 
 
 # ==========================================
-# МАТЕМАТИКА И ВАЛЮТЫ — ИСПРАВЛЕНО
+# МАТЕМАТИКА И ВАЛЮТЫ
 # ==========================================
 @dp.business_message(
     F.text.regexp(AUTO_MATH_CURRENCY_PATTERN)
@@ -3150,7 +3088,6 @@ async def auto_math_and_currency(message: Message):
         return
     action_dedup[dedup_key] = True
 
-    # 1) Смешанные валюты (5 тон + 7 баксов)
     if MIXED_CURRENCY_FULL.match(message.text):
         parsed = parse_mixed_currency(message.text)
         if parsed:
@@ -3159,7 +3096,6 @@ async def auto_math_and_currency(message: Message):
                 await send_mixed_currency_conversion(message, parsed, result_usdt, owner_id)
                 return
 
-    # 2) Одна валюта (5 тон / 100 баксов / 10 тон + 5 тон)
     match_curr = AUTO_MATH_CURRENCY_PATTERN.match(message.text)
     if match_curr:
         math_expr = match_curr.group(1).strip()
@@ -3186,7 +3122,6 @@ async def auto_math_and_currency(message: Message):
             return
         return
 
-    # 3) Чистая математика
     raw = normalize_math_input(message.text.lower())
     parsed = parse_math_expression(raw)
     if not parsed:
@@ -3254,7 +3189,38 @@ async def handle_messages(message: Message):
                         business_connection_id=conn_id
                     )
                 if sent:
+                    # Помечаем, что новое сообщение отправлено нами (чтобы не форматировать его снова)
                     bot_formatted_ids[f"{conn_id}_{sent.message_id}"] = True
+                    # Помечаем оригинал для игнорирования в логах удалёнок
+                    ignore_deletion_ids[f"{conn_id}_{message.message_id}"] = True
+                    
+                    # Сохраняем в базу отформатированное сообщение (как исходящее от пользователя)
+                    # Нам нужно получить peer_info, чтобы правильно сохранить его
+                    peer_info = await get_peer_info(conn_id, peer_id)
+                    await archive_collection.insert_one({
+                        "conn_id": conn_id,
+                        "chat_id": peer_id,
+                        "owner_id": owner_id,
+                        "message_id": sent.message_id,
+                        "user_id": owner_id,
+                        "first_name": message.from_user.first_name or "Без имени",
+                        "username": message.from_user.username or "",
+                        "peer_first_name": peer_info["first_name"],
+                        "peer_username": peer_info["username"],
+                        "text": formatted,
+                        "is_owner": True,
+                        "media_type": None,
+                        "media_file_id": None,
+                        "drive_link": None,
+                        "drive_file_id": None,
+                        "is_deleted": False,
+                        "is_edited": False,
+                        "old_text": None,
+                        "is_viewed": False,
+                        "created_at": datetime.now(timezone.utc),
+                    })
+
+                    # Удаляем старое (оригинальное) сообщение
                     with suppress(Exception):
                         await bot.delete_business_messages(
                             business_connection_id=conn_id,
@@ -3354,6 +3320,8 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
 
     for msg_id in deleted.message_ids:
         if f"{conn_id}_{msg_id}" in self_destruct_ids:
+            continue
+        if f"{conn_id}_{msg_id}" in ignore_deletion_ids:
             continue
 
         key = f"{conn_id}_{peer_id}"
