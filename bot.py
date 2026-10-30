@@ -785,20 +785,46 @@ async def handle_nft_price_command(message: Message):
     conn_id = message.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data: return
+    
+    owner_id = owner_data["user_id"]
+    is_owner = (message.from_user.id == owner_id)
+    
+    # ЗАЩИТА ОТ ДУБЛИРОВАНИЯ: Если пишет собеседник и у него тоже есть наш бот — молчим, ответит его бот
+    if not is_owner and await is_bot_connected(message.from_user.id):
+        return
+
     reply = message.reply_to_message
     if not reply or not reply.text:
-        await bot.send_message(message.chat.id, "⚠️ Ответь этой командой на сообщение со ссылкой на NFT.", business_connection_id=conn_id)
+        if is_owner:
+            await bot.send_message(message.chat.id, "⚠️ Ответь этой командой на сообщение со ссылкой на NFT.", business_connection_id=conn_id)
         return
+        
     tg_match = re.search(r"t\.me/nft/([a-zA-Z0-9_-]+)", reply.text)
     if not tg_match:
-        await bot.send_message(message.chat.id, "⚠️ В сообщении нет ссылки на NFT (t.me/nft/...).", business_connection_id=conn_id)
+        if is_owner:
+            await bot.send_message(message.chat.id, "⚠️ В сообщении нет ссылки на NFT (t.me/nft/...).", business_connection_id=conn_id)
         return
+        
     slug = tg_match.group(1)
+    
+    # ЗАЩИТА ОТ СПАМА (дедупликация)
+    dedup_key = ("nft_cmd", frozenset({owner_id, message.from_user.id}), slug)
+    if dedup_key in action_dedup:
+        return
+    action_dedup[dedup_key] = True
+
     loading_msg = await bot.send_message(message.chat.id, "🔍 Анализирую...", business_connection_id=conn_id)
     data = await get_gift_card_data(slug)
-    result_text = await format_gift_card(data, owner_data["user_id"])
+    result_text = await format_gift_card(data, owner_id)
+    
     with suppress(Exception):
-        await bot.edit_message_text(chat_id=message.chat.id, message_id=loading_msg.message_id, text=result_text, parse_mode="HTML", business_connection_id=conn_id)
+        await bot.edit_message_text(
+            chat_id=message.chat.id, 
+            message_id=loading_msg.message_id, 
+            text=result_text, 
+            parse_mode="HTML", 
+            business_connection_id=conn_id
+        )
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
