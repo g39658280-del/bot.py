@@ -76,7 +76,10 @@ action_dedup = TTLCache(maxsize=2000, ttl=4)
 self_destruct_ids = TTLCache(maxsize=1000, ttl=30)
 active_fakes: dict[str, asyncio.Task] = {}
 copied_messages_cache = {}
-bot_formatted_ids = TTLCache(maxsize=3000, ttl=60)
+# Блокировка для race condition в active_amute при конкурентных удалениях
+_amute_lock: dict[str, asyncio.Lock] = {}
+# message_id-ы уже обработанные специализированными хендлерами — catch-all их пропускает
+_handled_msg_ids: TTLCache = TTLCache(maxsize=5000, ttl=30)
 
 
 # ==========================================
@@ -533,10 +536,13 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
 
     if media_type and file_id:
         # ИСПРАВЛЕНО: Теперь передаем имя СОБЕСЕДНИКА (peer_info), а не отправителя
-        asyncio.create_task(upload_media_bg(
+        task = asyncio.create_task(upload_media_bg(
             doc["_id"], file_id, media_type, ext, mime,
             peer_info["first_name"], peer_id, owner_name, file_size
         ))
+        task.add_done_callback(
+            lambda t: print(f"❌ upload_media_bg error: {t.exception()}") if not t.cancelled() and t.exception() else None
+        )
 
     return doc
 
@@ -679,29 +685,6 @@ async def fetch_nftmatch(endpoint: str, params: dict = None, retry: int = 2):
     return None
 
 
-def _ton_to_currencies(ton: float) -> dict[str, float | None]:
-    """Конвертирует TON во все нужные валюты через EXCHANGE_CACHE."""
-    rates = EXCHANGE_CACHE
-    r_ton = rates.get("TON")
-    if not r_ton:
-        return {}
-    usdt = ton * r_ton
-    result = {"TON": ton, "USDT": usdt}
-    for cur in ("RUB", "STARS"):
-        r = rates.get(cur)
-        if r:
-            result[cur] = usdt / r
-    return result
-
-
-def _fmt_price(val: float, cur: str) -> str:
-    if cur in ("BTC", "ETH", "TON"):
-        return f"{val:.2f}"
-    if cur == "STARS":
-        return f"{int(round(val))}"
-    if cur in ("RUB", "KZT", "UAH", "JPY"):
-        return f"{val:.2f}"
-    return f"{val:.2f}"
 
 
 async def get_gift_card_data(slug: str) -> dict:
@@ -1322,7 +1305,8 @@ async def on_startup():
         print(f"Ошибка загрузки мутов: {e}")
 
     asyncio.create_task(update_rates_loop())
-    _init_drive()
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _init_drive)
 
     try:
         me = await bot.get_me()
@@ -2610,7 +2594,7 @@ async def mute_user(message: Message):
         )
 
     muted_chats[mute_key] = until_ts
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute|{peer_id}")]])
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute|{conn_id}|{peer_id}")]])
     with suppress(Exception):
         await bot.send_message(
             chat_id=peer_id,
@@ -3166,6 +3150,8 @@ async def process_gift_link_auto(message: Message):
 
         with suppress(Exception):
             await save_message_quick(message, conn_id, peer_id, owner_id, owner_data.get("first_name", "owner"), is_owner)
+        # Помечаем: catch-all handle_messages не должен сохранять это сообщение повторно
+        _handled_msg_ids[(conn_id, message.message_id)] = True
 
         if is_owner:
             await handle_owner_activity(owner_id, peer_id)
@@ -3231,6 +3217,8 @@ async def auto_math_and_currency(message: Message):
     owner_name = owner_data.get("first_name", "owner")
     with suppress(Exception):
         await save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner)
+    # Помечаем: catch-all handle_messages не должен сохранять это сообщение повторно
+    _handled_msg_ids[(conn_id, message.message_id)] = True
 
     if is_owner:
         await check_and_save_protected_media(message, owner_id)
@@ -3307,6 +3295,10 @@ async def auto_math_and_currency(message: Message):
 async def handle_messages(message: Message):
     conn_id = message.business_connection_id
 
+    # Пропускаем сообщения, уже обработанные специализированным хендлером (NFT, калькулятор)
+    if _handled_msg_ids.get((conn_id, message.message_id)):
+        return
+
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
@@ -3332,7 +3324,6 @@ async def handle_messages(message: Message):
             isinstance(mode, list) and mode
             and message.text
             and not message.text.startswith(".")
-            and not message.text.startswith("<") # Грубая проверка, что текст еще не отформатирован
         )
 
         if should_format:
@@ -3450,15 +3441,23 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
         key = f"{conn_id}_{peer_id}"
         session = active_amute.get(key)
         if session and session.get("message_id") == msg_id:
-            new_sent = None
-            with suppress(Exception):
-                new_sent = await bot.send_message(
-                    chat_id=peer_id,
-                    text=session["text"],
-                    business_connection_id=conn_id
-                )
-            if new_sent:
-                session["message_id"] = new_sent.message_id
+            # Блокировка от race condition — два одновременных удаления не должны слать два сообщения
+            if key not in _amute_lock:
+                _amute_lock[key] = asyncio.Lock()
+            async with _amute_lock[key]:
+                # Перепроверяем после получения блокировки
+                session = active_amute.get(key)
+                if not session or session.get("message_id") != msg_id:
+                    continue
+                new_sent = None
+                with suppress(Exception):
+                    new_sent = await bot.send_message(
+                        chat_id=peer_id,
+                        text=session["text"],
+                        business_connection_id=conn_id
+                    )
+                if new_sent:
+                    session["message_id"] = new_sent.message_id
             continue
 
         old_msg = await archive_collection.find_one({
@@ -3499,13 +3498,13 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
 @dp.callback_query(F.data.startswith("unmute|"))
 async def unmute_user(call: CallbackQuery):
     parts = call.data.split("|")
-    if len(parts) != 2:
+    if len(parts) != 3:
         return
+    _, conn_id, peer_id_str = parts
     try:
-        peer_id = int(parts[1])
+        peer_id = int(peer_id_str)
     except ValueError:
         return
-    conn_id = call.message.business_connection_id
     mute_key = f"{conn_id}_{peer_id}"
 
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
