@@ -33,6 +33,9 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 
+MENU_PHOTO = "https://files.catbox.moe/bph5iz.webp"
+CAPTION_LIMIT = 1024
+
 bot = Bot(token=BOT_TOKEN)
 BOT_ID: int | None = None
 BOT_USERNAME = "your_bot_username"
@@ -57,6 +60,9 @@ action_dedup = TTLCache(maxsize=2000, ttl=4)
 self_destruct_ids = TTLCache(maxsize=1000, ttl=30)
 copied_messages_cache = {}
 bot_formatted_ids = TTLCache(maxsize=3000, ttl=60)
+
+# ВОТ ЭТА ПЕРЕМЕННАЯ БЫЛА ЗАБЫТА
+active_fakes: dict[str, asyncio.Task] = {}
 
 # ==========================================
 # МУТЫ И АВТООТВЕТЧИК
@@ -247,7 +253,6 @@ async def check_and_save_protected_media(message, owner_id: int):
     try:
         file = await bot.get_file(file_id)
         buffer = await bot.download_file(file.file_path)
-        input_file = io.BufferedInputFile(buffer.read(), filename=filename) if hasattr(io, 'BufferedInputFile') else None
         from aiogram.types import BufferedInputFile
         await bot.send_document(owner_id, BufferedInputFile(buffer.read(), filename=filename), caption="🕵️ Сохранено из исчезающего сообщения")
     except Exception as e: print(f"save_media error: {e}")
