@@ -60,7 +60,7 @@ copied_messages_cache = {}
 bot_formatted_ids = TTLCache(maxsize=3000, ttl=60)
 
 # ==========================================
-# УТИЛИТЫ
+# УТИЛИТЫ МУТОВ И АВТООТВЕТЧИКА
 # ==========================================
 def parse_mute_duration(text: str) -> tuple[int | None, str]:
     rest = text[4:].strip().lower()
@@ -102,6 +102,9 @@ async def handle_owner_activity(owner_id: int, peer_id: int):
                 await bot.send_message(owner_id, "🌅 <b>Автоответчик автоматически выключен</b>, так как вы написали сообщение в чате.", parse_mode="HTML")
     except Exception as e: print(f"handle_owner_activity error: {e}")
 
+# ==========================================
+# ПОДКЛЮЧЕНИЕ И МЕНЮ
+# ==========================================
 async def is_bot_connected(user_id: int) -> bool:
     return bool(await connections_collection.find_one({"user_id": user_id}))
 
@@ -131,6 +134,9 @@ async def show_menu(call, caption: str, kb, with_photo: bool = True):
                 with suppress(Exception): await msg.edit_text(caption, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e: print(f"show_menu error: {e}")
 
+# ==========================================
+# ФОРМАТИРОВАНИЕ
+# ==========================================
 def apply_format(text: str, mode: list) -> str:
     if not mode or not isinstance(mode, list): return text
     def _do(t: str) -> str:
@@ -325,7 +331,7 @@ async def notify_owner_about_edit(owner_id, sender_name, sender_username, old_te
     with suppress(Exception): await bot.send_message(owner_id, text=body, parse_mode="HTML")
 
 # ==========================================
-# NFT API
+# NFT API (Gift Satellite + NFTMatch)
 # ==========================================
 async def fetch_gift_satellite(endpoint: str, retry: int = 2):
     if not GIFT_SATELLITE_TOKEN: return None
@@ -344,14 +350,10 @@ async def fetch_gift_satellite(endpoint: str, retry: int = 2):
     return None
 
 async def get_nftmatch_floor(collection_name: str) -> dict:
-    if not NFTMATCH_API_KEY:
-        print("⚠️ NFTMATCH_API_KEY не задан в Render! Используем резервный Gift Satellite.")
-        return {}
-    
+    if not NFTMATCH_API_KEY: return {}
     headers = {"Authorization": NFTMATCH_API_KEY}
     clean_name = re.sub(r'[^a-zA-Z0-9]', '', collection_name)
     result = {}
-    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get("https://nftmatch.pro/api/ListGifts/AllGiftNamesWithFloor", headers=headers, timeout=10) as resp:
@@ -361,58 +363,38 @@ async def get_nftmatch_floor(collection_name: str) -> dict:
                         if item.get("name") == collection_name:
                             result["collection_floor_ton"] = item.get("floorPrice") or item.get("floor")
                             break
-                else:
-                    print(f"❌ NFTMatch вернул статус {resp.status}")
-            
             async with session.get(f"https://nftmatch.pro/api/ListGifts/{clean_name}/AllModelNames", headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    prices = []
-                    for item in data:
-                        p = item.get("price") or item.get("floorPrice")
-                        if p:
-                            try: prices.append(float(p))
-                            except: pass
+                    prices = [float(i.get("price") or i.get("floorPrice")) for i in data if (i.get("price") or i.get("floorPrice"))]
                     if prices: result["floor_ton"] = min(prices)
-    except Exception as e: 
-        print(f"❌ Ошибка NFTMatch API: {e}")
+    except Exception as e: print(f"❌ NFTMatch API error: {e}")
     return result
 
 async def get_gift_card_data(slug: str) -> dict:
     result = {"slug": slug}
     gift_info = await fetch_gift_satellite(f"/gift/by-slug/{slug}")
-    if not gift_info:
-        return result
-        
+    if not gift_info: return result
     result["collection_name"] = gift_info.get("collectionName", "")
     result["model"] = gift_info.get("modelName", "")
     result["backdrop"] = gift_info.get("backdropName", "")
     result["symbol"] = gift_info.get("symbolName", "")
     result["number"] = gift_info.get("number")
     
-    collection = result["collection_name"]
-    if not collection:
-        return result
+    if result.get("collection_name"):
+        nft_data = await get_nftmatch_floor(result["collection_name"])
+        result.update(nft_data)
 
-    # 1. Пытаемся получить цены с NFTMatch (если задан ключ)
-    result.update(await get_nftmatch_floor(collection))
-    
-    # 2. Если NFTMatch не дал цен (или нет ключа), берем данные из Gift Satellite
-    if not result.get("floor_ton"):
-        await asyncio.sleep(0.3)
-        offers = await fetch_gift_satellite(f"/search/tg/{collection}")
-        if offers and isinstance(offers, list):
-            result["all_offers"] = offers
-            model = result["model"]
-            same_model = [o for o in offers if o.get("modelName") == model]
-            if same_model:
-                prices = [o.get("normalizedPrice", 0) for o in same_model if o.get("normalizedPrice")]
-                if prices:
-                    result["floor_ton"] = min(prices)
-            all_prices = [o.get("normalizedPrice", 0) for o in offers if o.get("normalizedPrice")]
-            if all_prices:
-                result["collection_floor_ton"] = min(all_prices)
-                
+        if not result.get("floor_ton"):
+            await asyncio.sleep(0.3)
+            offers = await fetch_gift_satellite(f"/search/tg/{result['collection_name']}")
+            if offers and isinstance(offers, list):
+                same_model = [o for o in offers if o.get("modelName") == result["model"]]
+                if same_model:
+                    prices = [o.get("normalizedPrice", 0) for o in same_model if o.get("normalizedPrice")]
+                    if prices: result["floor_ton"] = min(prices)
+                all_prices = [o.get("normalizedPrice", 0) for o in offers if o.get("normalizedPrice")]
+                if all_prices: result["collection_floor_ton"] = min(all_prices)
     return result
 
 async def format_gift_card(data: dict, owner_id: int) -> str:
@@ -422,12 +404,15 @@ async def format_gift_card(data: dict, owner_id: int) -> str:
     slug = data.get("slug", "")
     owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
     currencies = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
+    
     title = f'<a href="https://t.me/nft/{slug}">{collection} #{number}</a>' if slug else f"{collection} #{number}"
     lines = [f"🎁 <b>{title}</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    
     mono = data.get("monochrome_percent") or data.get("monochromePercentage")
     if mono:
         lines.append(f"⚫️ <b>Монохромность:</b> {mono}%")
         lines.append("")
+        
     def fmt_price(ton_val):
         if not ton_val: return "—"
         ton_rate = EXCHANGE_CACHE.get("TON", 0)
@@ -439,16 +424,19 @@ async def format_gift_card(data: dict, owner_id: int) -> str:
             val = (ton_val * ton_rate) / rate
             parts.append(f"{val:.6f} {cur}" if cur in ("BTC", "ETH") else (f"{val:.0f} {cur}" if cur == "STARS" else f"{val:.2f} {cur}"))
         return " | ".join(parts)
+        
     floor_ton = data.get("floor_ton")
     coll_floor = data.get("collection_floor_ton")
+    
     if floor_ton or coll_floor:
         lines.append("💎 <b>Рыночные данные:</b>")
         if floor_ton: lines.append(f"├ Floor (модель): {fmt_price(floor_ton)}")
         if coll_floor and coll_floor != floor_ton: lines.append(f"└ Floor (коллекция): {fmt_price(coll_floor)}")
+    
     return "\n".join(lines)
 
 # ==========================================
-# ВАЛЮТЫ И МАТЕМАТИКА
+# КУРСЫ И МАТЕМАТИКА
 # ==========================================
 EXCHANGE_CACHE = {}
 STARS_USD_RATE = 0.015
