@@ -4,7 +4,6 @@ import asyncio
 import random
 import html
 import re
-import json
 import aiohttp
 import tempfile
 from datetime import datetime, timezone
@@ -17,6 +16,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ==========================================
 # КОНФИГ
@@ -40,9 +40,6 @@ bot = Bot(token=BOT_TOKEN)
 BOT_ID: int | None = None
 BOT_USERNAME = "your_bot_username"
 
-# ==========================================
-# БАЗА ДАННЫХ И КЭШИ
-# ==========================================
 try:
     client = AsyncIOMotorClient(MONGO_URI)
     db = client['telegram_multi_bot']
@@ -58,22 +55,19 @@ afk_cooldowns = TTLCache(maxsize=2000, ttl=300)
 active_amute = TTLCache(maxsize=1000, ttl=15)
 action_dedup = TTLCache(maxsize=2000, ttl=4)
 self_destruct_ids = TTLCache(maxsize=1000, ttl=30)
-copied_messages_cache = {}
+active_fakes: dict[str, asyncio.Task] = {}
+copied_messages_cache = {} 
 bot_formatted_ids = TTLCache(maxsize=3000, ttl=60)
 
-# ВОТ ЭТА ПЕРЕМЕННАЯ БЫЛА ЗАБЫТА
-active_fakes: dict[str, asyncio.Task] = {}
-
 # ==========================================
-# МУТЫ И АВТООТВЕТЧИК
+# УТИЛИТЫ
 # ==========================================
 def parse_mute_duration(text: str) -> tuple[int | None, str]:
     rest = text[4:].strip().lower()
     if not rest: return None, "навсегда"
     match = re.match(r"^(\d+)\s*(с|сек|s|м|мин|m|ч|час|h|д|дн|d)?", rest)
     if not match: return None, "навсегда"
-    val = int(match.group(1))
-    unit = match.group(2) or "м"
+    val, unit = int(match.group(1)), (match.group(2) or "м")
     if val <= 0: return None, "навсегда"
     if unit.startswith(("с", "s")): return val, f"{val} сек."
     if unit.startswith(("ч", "h")): return val * 3600, f"{val} ч."
@@ -108,13 +102,35 @@ async def handle_owner_activity(owner_id: int, peer_id: int):
                 await bot.send_message(owner_id, "🌅 <b>Автоответчик автоматически выключен</b>, так как вы написали сообщение в чате.", parse_mode="HTML")
     except Exception as e: print(f"handle_owner_activity error: {e}")
 
-def check_auto_afk(start_h: int, end_h: int, tz_offset: int = 3) -> bool:
-    local_hour = (datetime.now(timezone.utc).hour + tz_offset) % 24
-    return (start_h <= local_hour < end_h) if start_h < end_h else (local_hour >= start_h or local_hour < end_h)
+async def is_bot_connected(user_id: int) -> bool:
+    return bool(await connections_collection.find_one({"user_id": user_id}))
 
-# ==========================================
-# ФОРМАТИРОВАНИЕ
-# ==========================================
+def get_connect_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Открыть настройки Telegram", url="tg://settings/edit")],
+        [InlineKeyboardButton(text="✅ Я подключил — проверить", callback_data="check_connection")]
+    ])
+
+def get_connect_text() -> str:
+    return f"1. Настройки профиля - <a href=\"tg://settings/edit\">tg://settings/edit</a>\n\n2. «Автоматизация чатов»\n\n3. В поиск <code>{BOT_USERNAME}</code> - добавить\n\n4. Дайте все права на сообщения"
+
+async def show_menu(call, caption: str, kb, with_photo: bool = True):
+    msg = call.message
+    if len(caption) > CAPTION_LIMIT: with_photo = False
+    try:
+        if with_photo:
+            if msg.photo: await msg.edit_caption(caption=caption, reply_markup=kb, parse_mode="HTML")
+            else:
+                with suppress(Exception): await msg.delete()
+                await bot.send_photo(call.from_user.id, photo=MENU_PHOTO, caption=caption, reply_markup=kb, parse_mode="HTML")
+        else:
+            if msg.photo:
+                with suppress(Exception): await msg.delete()
+                await bot.send_message(call.from_user.id, text=caption, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+            else:
+                with suppress(Exception): await msg.edit_text(caption, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e: print(f"show_menu error: {e}")
+
 def apply_format(text: str, mode: list) -> str:
     if not mode or not isinstance(mode, list): return text
     def _do(t: str) -> str:
@@ -151,8 +167,7 @@ def _init_drive():
         print("⚠️ Google Drive: ключи не заданы")
         return None
     try:
-        creds = Credentials(token=None, refresh_token=GOOGLE_REFRESH_TOKEN, token_uri="https://oauth2.googleapis.com/token",
-                            client_id=GOOGLE_CLIENT_ID, client_secret=GOOGLE_CLIENT_SECRET, scopes=["https://www.googleapis.com/auth/drive.file"])
+        creds = Credentials(token=None, refresh_token=GOOGLE_REFRESH_TOKEN, token_uri="https://oauth2.googleapis.com/token", client_id=GOOGLE_CLIENT_ID, client_secret=GOOGLE_CLIENT_SECRET, scopes=["https://www.googleapis.com/auth/drive.file"])
         creds.refresh(Request())
         _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
         print("✅ Google Drive подключён")
@@ -161,13 +176,11 @@ def _init_drive():
         print(f"❌ Google Drive init error: {e}")
         return None
 
-def _drive(): return _drive_service
-
 def _find_folder(name: str, parent_id: str | None) -> str | None:
     q = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     if parent_id: q += f" and '{parent_id}' in parents"
     try:
-        result = _drive().files().list(q=q, fields="files(id, name)", pageSize=1).execute()
+        result = _drive_service.files().list(q=q, fields="files(id, name)", pageSize=1).execute()
         files = result.get("files", [])
         return files[0]["id"] if files else None
     except: return None
@@ -175,10 +188,10 @@ def _find_folder(name: str, parent_id: str | None) -> str | None:
 def _create_folder(name: str, parent_id: str | None) -> str:
     meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
     if parent_id: meta["parents"] = [parent_id]
-    return _drive().files().create(body=meta, fields="id").execute()["id"]
+    return _drive_service.files().create(body=meta, fields="id").execute()["id"]
 
 def get_or_create_folder(path: str) -> str | None:
-    if not _drive(): return None
+    if not _drive_service: return None
     if path in _folder_cache: return _folder_cache[path]
     parts = [p for p in path.split("/") if p]
     parent = None
@@ -201,11 +214,10 @@ async def async_get_or_create_folder(path: str):
     async with drive_lock:
         return await asyncio.get_running_loop().run_in_executor(None, get_or_create_folder, path)
 
-def _sanitize(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]', "_", (name or "unknown"))[:80]
+def _sanitize(name: str) -> str: return re.sub(r'[\\/:*?"<>|]', "_", (name or "unknown"))[:80]
 
 # ==========================================
-# ПАРСИНГ И АРХИВАЦИЯ
+# АРХИВАЦИЯ
 # ==========================================
 _peer_cache = TTLCache(maxsize=5000, ttl=86400)
 
@@ -269,7 +281,7 @@ async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_
         await bot.download_file(file_obj.file_path, destination=tmp_path)
         def _sync_upload():
             media = MediaFileUpload(tmp_path, mimetype=mime, resumable=True)
-            return _drive().files().create(body={"name": f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{media_type}.{ext}", "parents": [folder_id]}, media_body=media, fields="id, webViewLink").execute()
+            return _drive_service.files().create(body={"name": f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{media_type}.{ext}", "parents": [folder_id]}, media_body=media, fields="id, webViewLink").execute()
         result = await asyncio.get_running_loop().run_in_executor(None, _sync_upload)
         if result: await archive_collection.update_one({"_id": archive_id}, {"$set": {"drive_link": result.get("webViewLink"), "drive_file_id": result.get("id")}})
     except Exception as e: print(f"❌ upload_media_bg error: {e}")
@@ -313,7 +325,7 @@ async def notify_owner_about_edit(owner_id, sender_name, sender_username, old_te
     with suppress(Exception): await bot.send_message(owner_id, text=body, parse_mode="HTML")
 
 # ==========================================
-# NFT API (GiftSatellite + NFTMatch)
+# NFT API
 # ==========================================
 async def fetch_gift_satellite(endpoint: str, retry: int = 2):
     if not GIFT_SATELLITE_TOKEN: return None
@@ -404,24 +416,10 @@ async def format_gift_card(data: dict, owner_id: int) -> str:
 EXCHANGE_CACHE = {}
 STARS_USD_RATE = 0.015
 
-CURRENCY_ALIASES = {
-    "usd": "USDT", "usdt": "USDT", "доллар": "USDT", "доллары": "USDT", "долларов": "USDT", "доллара": "USDT", "долл": "USDT", "долл.": "USDT", "бакс": "USDT", "баксы": "USDT", "баксов": "USDT", "бакса": "USDT", "бачей": "USDT", "бач": "USDT", "бач.": "USDT", "баксик": "USDT", "баксиков": "USDT", "баксика": "USDT", "зеленый": "USDT", "зелёный": "USDT", "зеленых": "USDT", "зелёных": "USDT", "зелень": "USDT", "зелени": "USDT", "юсд": "USDT", "юсдт": "USDT", "усд": "USDT", "усдт": "USDT", "тетер": "USDT", "тетеры": "USDT", "тетеров": "USDT", "тетера": "USDT", "тезер": "USDT", "тезеры": "USDT", "тезеров": "USDT", "тезера": "USDT", "юста": "USDT", "юст": "USDT", "$": "USDT", "💵": "USDT", "💰": "USDT", "💲": "USDT",
-    "rub": "RUB", "руб": "RUB", "руб.": "RUB", "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "рубля": "RUB", "рублю": "RUB", "рубас": "RUB", "рубасов": "RUB", "рубаса": "RUB", "рубасы": "RUB", "рубчик": "RUB", "рубчики": "RUB", "рубчиков": "RUB", "деревянный": "RUB", "деревянных": "RUB", "деревянные": "RUB", "р": "RUB", "р.": "RUB", "₽": "RUB",
-    "eur": "EUR", "евро": "EUR", "еврик": "EUR", "еврики": "EUR", "евриков": "EUR", "еврика": "EUR", "евра": "EUR", "евров": "EUR", "€": "EUR",
-    "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "юаня": "CNY", "юан": "CNY", "yuan": "CNY", "юанчики": "CNY", "женьминьби": "CNY", "жэньминьби": "CNY", "¥": "CNY",
-    "btc": "BTC", "биткоин": "BTC", "биткоины": "BTC", "биткоинов": "BTC", "биткоина": "BTC", "биткойн": "BTC", "биткойны": "BTC", "биткойнов": "BTC", "биток": "BTC", "битки": "BTC", "битков": "BTC", "битка": "BTC", "бит": "BTC", "биты": "BTC", "битов": "BTC", "₿": "BTC",
-    "ton": "TON", "тон": "TON", "тона": "TON", "тонов": "TON", "тоны": "TON", "тоник": "TON", "тоника": "TON", "тоников": "TON", "тонику": "TON", "грам": "TON", "грама": "TON", "грамов": "TON", "граммы": "TON", "грамм": "TON", "gram": "TON", "grams": "TON", "павлуша": "TON", "дуров": "TON", "💎": "TON",
-    "stars": "STARS", "star": "STARS", "звезда": "STARS", "звёзда": "STARS", "звезды": "STARS", "звёзды": "STARS", "звезд": "STARS", "звёзд": "STARS", "звезде": "STARS", "звёзде": "STARS", "звездочка": "STARS", "звёздочка": "STARS", "звездочки": "STARS", "звёздочки": "STARS", "звездочек": "STARS", "звёздочек": "STARS", "зв": "STARS", "зв.": "STARS", "звездулька": "STARS", "звездульки": "STARS", "starчик": "STARS", "стар": "STARS", "стары": "STARS", "старов": "STARS", "⭐": "STARS", "🌟": "STARS", "✨": "STARS",
-    "eth": "ETH", "эфир": "ETH", "эфира": "ETH", "эфиров": "ETH", "эфиры": "ETH", "эфириум": "ETH", "эфирка": "ETH", "эфирки": "ETH", "эфирок": "ETH", "эфирчик": "ETH", "эфирчика": "ETH", "Ξ": "ETH",
-    "kzt": "KZT", "тенге": "KZT", "теньге": "KZT", "теньга": "KZT", "тг": "KZT", "тг.": "KZT", "₸": "KZT",
-    "uah": "UAH", "гривна": "UAH", "гривны": "UAH", "гривен": "UAH", "гривне": "UAH", "гривня": "UAH", "гривню": "UAH", "грн": "UAH", "грн.": "UAH", "₴": "UAH",
-    "gbp": "GBP", "фунт": "GBP", "фунты": "GBP", "фунтов": "GBP", "фунта": "GBP", "стерлинг": "GBP", "стерлинги": "GBP", "стерлингов": "GBP", "£": "GBP",
-    "jpy": "JPY", "иена": "JPY", "иены": "JPY", "иен": "JPY", "йена": "JPY", "йены": "JPY", "йен": "JPY",
-}
+CURRENCY_ALIASES = {"usd": "USDT", "usdt": "USDT", "доллар": "USDT", "доллары": "USDT", "долларов": "USDT", "доллара": "USDT", "долл": "USDT", "долл.": "USDT", "бакс": "USDT", "баксы": "USDT", "баксов": "USDT", "бакса": "USDT", "бачей": "USDT", "бач": "USDT", "бач.": "USDT", "баксик": "USDT", "баксиков": "USDT", "баксика": "USDT", "зеленый": "USDT", "зелёный": "USDT", "зеленых": "USDT", "зелёных": "USDT", "зелень": "USDT", "зелени": "USDT", "юсд": "USDT", "юсдт": "USDT", "усд": "USDT", "усдт": "USDT", "тетер": "USDT", "тетеры": "USDT", "тетеров": "USDT", "тетера": "USDT", "тезер": "USDT", "тезеры": "USDT", "тезеров": "USDT", "тезера": "USDT", "юста": "USDT", "юст": "USDT", "$": "USDT", "💵": "USDT", "💰": "USDT", "💲": "USDT", "rub": "RUB", "руб": "RUB", "руб.": "RUB", "рубль": "RUB", "рубли": "RUB", "рублей": "RUB", "рубля": "RUB", "рублю": "RUB", "рубас": "RUB", "рубасов": "RUB", "рубаса": "RUB", "рубасы": "RUB", "рубчик": "RUB", "рубчики": "RUB", "рубчиков": "RUB", "деревянный": "RUB", "деревянных": "RUB", "деревянные": "RUB", "р": "RUB", "р.": "RUB", "₽": "RUB", "eur": "EUR", "евро": "EUR", "еврик": "EUR", "еврики": "EUR", "евриков": "EUR", "еврика": "EUR", "евра": "EUR", "евров": "EUR", "€": "EUR", "cny": "CNY", "юань": "CNY", "юани": "CNY", "юаней": "CNY", "юаня": "CNY", "юан": "CNY", "yuan": "CNY", "юанчики": "CNY", "женьминьби": "CNY", "жэньминьби": "CNY", "¥": "CNY", "btc": "BTC", "биткоин": "BTC", "биткоины": "BTC", "биткоинов": "BTC", "биткоина": "BTC", "биткойн": "BTC", "биткойны": "BTC", "биткойнов": "BTC", "биток": "BTC", "битки": "BTC", "битков": "BTC", "битка": "BTC", "бит": "BTC", "биты": "BTC", "битов": "BTC", "₿": "BTC", "ton": "TON", "тон": "TON", "тона": "TON", "тонов": "TON", "тоны": "TON", "тоник": "TON", "тоника": "TON", "тоников": "TON", "тонику": "TON", "грам": "TON", "грама": "TON", "грамов": "TON", "граммы": "TON", "грамм": "TON", "gram": "TON", "grams": "TON", "павлуша": "TON", "дуров": "TON", "💎": "TON", "stars": "STARS", "star": "STARS", "звезда": "STARS", "звёзда": "STARS", "звезды": "STARS", "звёзды": "STARS", "звезд": "STARS", "звёзд": "STARS", "звезде": "STARS", "звёзде": "STARS", "звездочка": "STARS", "звёздочка": "STARS", "звездочки": "STARS", "звёздочки": "STARS", "звездочек": "STARS", "звёздочек": "STARS", "зв": "STARS", "зв.": "STARS", "звездулька": "STARS", "звездульки": "STARS", "starчик": "STARS", "стар": "STARS", "стары": "STARS", "старов": "STARS", "⭐": "STARS", "🌟": "STARS", "✨": "STARS", "eth": "ETH", "эфир": "ETH", "эфира": "ETH", "эфиров": "ETH", "эфиры": "ETH", "эфириум": "ETH", "эфирка": "ETH", "эфирки": "ETH", "эфирок": "ETH", "эфирчик": "ETH", "эфирчика": "ETH", "Ξ": "ETH", "kzt": "KZT", "тенге": "KZT", "теньге": "KZT", "теньга": "KZT", "тг": "KZT", "тг.": "KZT", "₸": "KZT", "uah": "UAH", "гривна": "UAH", "гривны": "UAH", "гривен": "UAH", "гривне": "UAH", "гривня": "UAH", "гривню": "UAH", "грн": "UAH", "грн.": "UAH", "₴": "UAH", "gbp": "GBP", "фунт": "GBP", "фунты": "GBP", "фунтов": "GBP", "фунта": "GBP", "стерлинг": "GBP", "стерлинги": "GBP", "стерлингов": "GBP", "£": "GBP", "jpy": "JPY", "иена": "JPY", "иены": "JPY", "иен": "JPY", "йена": "JPY", "йены": "JPY", "йен": "JPY"}
 
 ALL_CURRENCIES = ["RUB", "USDT", "EUR", "CNY", "KZT", "UAH", "GBP", "JPY", "BTC", "ETH", "TON", "STARS"]
 _CURRENCY_ALT = "|".join(sorted([re.escape(a) for a in CURRENCY_ALIASES.keys()], key=len, reverse=True))
-
 WORD_NUMBERS = {"ноль": 0, "один": 1, "одна": 1, "два": 2, "две": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10, "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14, "пятнадцать": 15, "шестнадцать": 16, "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19, "двадцать": 20, "тридцать": 30, "сорок": 40, "пятьдесят": 50, "шестьдесят": 60, "семьдесят": 70, "восемьдесят": 80, "девяносто": 90, "сто": 100, "двести": 200, "триста": 300, "четыреста": 400, "пятьсот": 500, "шестьсот": 600, "семьсот": 700, "восемьсот": 800, "девятьсот": 900, "тысяча": 1000}
 _NUM_WORDS = "|".join(sorted(WORD_NUMBERS.keys(), key=len, reverse=True))
 _SINGLE_NUM = rf"(?:\d+[.,]?\d*|{_NUM_WORDS})"
@@ -433,7 +431,6 @@ AUTO_MATH_PATTERN = re.compile(rf"^\s*{_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0
 AUTO_MATH_CURRENCY_PATTERN = re.compile(rf"^\s*({_NUM}(?:\s{{0,3}}(?:{_OPS}|{_WORDS})\s{{0,3}}{_NUM})*)\s{{0,3}}({_CURRENCY_ALT})\s*$", re.IGNORECASE)
 MIXED_CURRENCY_FULL = re.compile(rf"^\s*{_SINGLE_NUM}\s*(?:{_CURRENCY_ALT})(?:\s*[+\-]\s*{_SINGLE_NUM}\s*(?:{_CURRENCY_ALT}))+\s*$", re.IGNORECASE)
 MIXED_CURRENCY_TERM = re.compile(rf"({_SINGLE_NUM})\s*({_CURRENCY_ALT})", re.IGNORECASE)
-
 OPERATORS = {"умножить на": "*", "разделить на": "/", "поделить на": "/", "в степени": "**", "степень": "**", "плюс": "+", "сложить": "+", "минус": "-", "вычесть": "-", "умножить": "*", "разделить": "/", "делить": "/", "поделить": "/", "х": "*", "x": "*", "^": "**"}
 
 def parse_math_expression(text: str) -> str:
@@ -568,3 +565,31 @@ async def send_mixed_currency_conversion(message, parsed, result_usdt, owner_id)
         if rate: lines.append(f"{target} {EMOJI_MAP.get(target, '•')}: <code>{_format_converted(target, result_usdt / rate)}</code>")
     with suppress(Exception):
         await bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML", reply_to_message_id=message.message_id, business_connection_id=conn_id)
+
+def check_auto_afk(start_h: int, end_h: int, tz_offset: int = 3) -> bool:
+    local_hour = (datetime.now(timezone.utc).hour + tz_offset) % 24
+    return (start_h <= local_hour < end_h) if start_h < end_h else (local_hour >= start_h or local_hour < end_h)
+
+async def get_user_main_kb(user_id: int):
+    user_data = await users_collection.find_one({"user_id": user_id}) or {}
+    is_afk = user_data.get("is_afk", False)
+    fmt_label = format_mode_label(user_data.get("format_mode", []))
+    afk_btn = InlineKeyboardButton(text="🟢 Автоответчик — ВКЛЮЧЕН" if is_afk else "🔴 Автоответчик — ВЫКЛЮЧЕН", callback_data="afk_menu")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📖 Доступные команды", callback_data="user_cmds")],
+        [InlineKeyboardButton(text="🔇 Управление мутами", callback_data="user_mutes"), InlineKeyboardButton(text="🗑 Удалённые", callback_data="deleted_menu")],
+        [InlineKeyboardButton(text="👤 Мой статус", callback_data="user_status"), InlineKeyboardButton(text="💱 Валюты", callback_data="currency_settings")],
+        [InlineKeyboardButton(text=f"✍️ Форматирование: {fmt_label}", callback_data="format_menu")],
+        [afk_btn],
+    ])
+
+async def get_afk_settings_kb(user_id: int):
+    u = await users_collection.find_one({"user_id": user_id}) or {}
+    tz = u.get("tz_offset", 3)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Изменить текст", callback_data="afk_set_text")],
+        [InlineKeyboardButton(text=f"🕒 Авто-включение: {'ВКЛ' if u.get('auto_afk') else 'ВЫКЛ'}", callback_data="toggle_auto_afk")],
+        [InlineKeyboardButton(text=f"⏰ Время: {u.get('afk_start', 23)}:00 - {u.get('afk_end', 7)}:00", callback_data="afk_set_time")],
+        [InlineKeyboardButton(text=f"🌍 Пояс: UTC{'+' if tz >= 0 else ''}{tz}", callback_data="afk_set_tz")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="afk_menu")],
+    ])
