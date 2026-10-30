@@ -19,11 +19,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from simpleeval import simple_eval
 
-# Импорт всего необходимого из нашего utils.py
+# Импортируем всё необходимое из utils.py
 from utils import (
     bot, connections_collection, users_collection, archive_collection, mutes_collection,
     muted_chats, active_amute, active_fakes, self_destruct_ids, action_dedup, copied_messages_cache,
-    SUPERADMIN_ID, MENU_PHOTO, CAPTION_LIMIT, BOT_ID, BOT_USERNAME,
+    SUPERADMIN_ID, MENU_PHOTO, CAPTION_LIMIT,
     parse_mute_duration, format_remaining_mute, is_chat_muted, handle_owner_activity,
     check_auto_afk, apply_format, format_mode_label, get_peer_info,
     check_and_save_protected_media, save_message_quick, notify_owner_about_edit, notify_owner_about_deletion,
