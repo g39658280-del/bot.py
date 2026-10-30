@@ -7,34 +7,28 @@ from datetime import datetime, timezone
 from aiohttp import web
 from contextlib import suppress
 from aiogram import Dispatcher, F
-from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, BusinessMessagesDeleted, BusinessConnection,
-    BotCommand, MenuButtonCommands, BotCommandScopeDefault, BotCommandScopeChat,
-    BufferedInputFile
-)
+from aiogram.types import Message, CallbackQuery, BusinessMessagesDeleted, BusinessConnection, BotCommand, MenuButtonCommands, BotCommandScopeDefault, BotCommandScopeChat, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from simpleeval import simple_eval
 
-# Импортируем всё необходимое из utils.py
+import utils
 from utils import (
     bot, connections_collection, users_collection, archive_collection, mutes_collection,
     muted_chats, active_amute, active_fakes, self_destruct_ids, action_dedup, copied_messages_cache,
     SUPERADMIN_ID, MENU_PHOTO, CAPTION_LIMIT,
     parse_mute_duration, format_remaining_mute, is_chat_muted, handle_owner_activity,
-    check_auto_afk, apply_format, format_mode_label, get_peer_info,
-    check_and_save_protected_media, save_message_quick, notify_owner_about_edit, notify_owner_about_deletion,
-    _init_drive, fetch_gift_satellite, get_gift_card_data, format_gift_card, _extract_media_info,
-    force_update_all_rates, update_rates_loop, ALL_CURRENCIES,
+    apply_format, format_mode_label, get_peer_info, check_and_save_protected_media, save_message_quick, 
+    notify_owner_about_edit, notify_owner_about_deletion, _init_drive, fetch_gift_satellite, 
+    get_gift_card_data, format_gift_card, _extract_media_info, update_rates_loop, ALL_CURRENCIES,
     AUTO_MATH_CURRENCY_PATTERN, AUTO_MATH_PATTERN, MIXED_CURRENCY_FULL, CURRENCY_ALIASES,
-    normalize_math_input, parse_math_expression, format_math_expression,
-    send_currency_conversion, parse_mixed_currency, eval_mixed_currency, send_mixed_currency_conversion
+    normalize_math_input, parse_math_expression, format_math_expression, send_currency_conversion, 
+    parse_mixed_currency, eval_mixed_currency, send_mixed_currency_conversion, check_auto_afk,
+    get_user_main_kb, get_afk_settings_kb, is_bot_connected, get_connect_kb, get_connect_text, show_menu
 )
 
-import utils
 dp = Dispatcher()
 
 class UserStates(StatesGroup):
@@ -46,8 +40,7 @@ class UserStates(StatesGroup):
 # ==========================================
 _web_runner: web.AppRunner | None = None
 
-async def dummy_handler(request):
-    return web.Response(text="Multi-bot is running!")
+async def dummy_handler(request): return web.Response(text="Multi-bot is running!")
 
 async def start_web_server() -> web.AppRunner:
     global _web_runner
@@ -78,9 +71,8 @@ async def on_startup():
                 await mutes_collection.delete_one({"_id": m["_id"]})
             else:
                 muted_chats[m["mute_key"]] = until_ts
-        print(f"✅ Загружено активных мутов из базы: {len(muted_chats)}")
-    except Exception as e:
-        print(f"Ошибка загрузки мутов: {e}")
+        print(f"✅ Загружено активных мутов: {len(muted_chats)}")
+    except Exception as e: print(f"Ошибка загрузки мутов: {e}")
 
     asyncio.create_task(update_rates_loop())
     _init_drive()
@@ -90,8 +82,7 @@ async def on_startup():
         utils.BOT_ID = me.id
         utils.BOT_USERNAME = me.username or "your_bot_username"
         print(f"✅ Бот: @{utils.BOT_USERNAME} (ID: {utils.BOT_ID})")
-    except Exception as e:
-        print(f"❌ Не удалось получить данные бота: {e}")
+    except Exception as e: print(f"❌ Ошибка данных бота: {e}")
 
     with suppress(Exception):
         me = await fetch_gift_satellite("/user/me")
@@ -99,61 +90,13 @@ async def on_startup():
 
     with suppress(Exception):
         await bot.set_my_commands([BotCommand(command="start", description="🏠 Главное меню")], scope=BotCommandScopeDefault())
-        await bot.set_my_commands([
-            BotCommand(command="start", description="🏠 Главное меню"),
-            BotCommand(command="admin", description="👑 Админ-панель")
-        ], scope=BotCommandScopeChat(chat_id=SUPERADMIN_ID))
+        await bot.set_my_commands([BotCommand(command="start", description="🏠 Главное меню"), BotCommand(command="admin", description="👑 Админ-панель")], scope=BotCommandScopeChat(chat_id=SUPERADMIN_ID))
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 dp.startup.register(on_startup)
 
 # ==========================================
-# УТИЛИТЫ МЕНЮ И КЛАВИАТУРЫ
-# ==========================================
-async def is_bot_connected(user_id: int) -> bool:
-    return bool(await connections_collection.find_one({"user_id": user_id}))
-
-def get_connect_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Открыть настройки Telegram", url="tg://settings/edit")],
-        [InlineKeyboardButton(text="✅ Я подключил — проверить", callback_data="check_connection")]
-    ])
-
-def get_connect_text() -> str:
-    return f"1. Настройки профиля - <a href=\"tg://settings/edit\">tg://settings/edit</a>\n\n2. «Автоматизация чатов»\n\n3. В поиск <code>{utils.BOT_USERNAME}</code> - добавить\n\n4. Дайте все права на сообщения"
-
-async def show_menu(call: CallbackQuery, caption: str, kb, with_photo: bool = True):
-    msg = call.message
-    if len(caption) > CAPTION_LIMIT: with_photo = False
-    try:
-        if with_photo:
-            if msg.photo: await msg.edit_caption(caption=caption, reply_markup=kb, parse_mode="HTML")
-            else:
-                with suppress(Exception): await msg.delete()
-                await bot.send_photo(call.from_user.id, photo=MENU_PHOTO, caption=caption, reply_markup=kb, parse_mode="HTML")
-        else:
-            if msg.photo:
-                with suppress(Exception): await msg.delete()
-                await bot.send_message(call.from_user.id, text=caption, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
-            else:
-                with suppress(TelegramBadRequest): await msg.edit_text(caption, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e: print(f"show_menu error: {e}")
-
-async def get_user_main_kb(user_id: int):
-    user_data = await users_collection.find_one({"user_id": user_id}) or {}
-    is_afk = user_data.get("is_afk", False)
-    fmt_label = format_mode_label(user_data.get("format_mode", []))
-    afk_btn = InlineKeyboardButton(text="🟢 Автоответчик — ВКЛЮЧЕН" if is_afk else "🔴 Автоответчик — ВЫКЛЮЧЕН", callback_data="afk_menu")
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📖 Доступные команды", callback_data="user_cmds")],
-        [InlineKeyboardButton(text="🔇 Управление мутами", callback_data="user_mutes"), InlineKeyboardButton(text="🗑 Удалённые", callback_data="deleted_menu")],
-        [InlineKeyboardButton(text="👤 Мой статус", callback_data="user_status"), InlineKeyboardButton(text="💱 Валюты", callback_data="currency_settings")],
-        [InlineKeyboardButton(text=f"✍️ Форматирование: {fmt_label}", callback_data="format_menu")],
-        [afk_btn],
-    ])
-
-# ==========================================
-# ОСНОВНЫЕ КОМАНДЫ И МЕНЮ
+# ОСНОВНЫЕ КОМАНДЫ
 # ==========================================
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
@@ -182,7 +125,7 @@ async def user_main_handler(call: CallbackQuery, state: FSMContext):
     await show_menu(call, "🏠 <b>Главное меню:</b>", await get_user_main_kb(call.from_user.id), True)
 
 # ==========================================
-# ФОРМАТИРОВАНИЕ
+# МЕНЮ
 # ==========================================
 async def _render_format_menu(call: CallbackQuery):
     user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
@@ -223,9 +166,6 @@ async def format_preview_handler(call: CallbackQuery):
         await bot.send_message(call.from_user.id, f"👁 <b>Предпросмотр:</b>\n\n{apply_format('Привет! Это пример твоего форматирования текста', mode)}", parse_mode="HTML")
     await call.answer("Отправлено в чат")
 
-# ==========================================
-# МЕНЮ УДАЛЁНОК
-# ==========================================
 @dp.callback_query(F.data == "deleted_menu")
 async def deleted_menu_handler(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id): return
@@ -287,24 +227,44 @@ async def show_deleted_messages(call: CallbackQuery):
     builder.button(text="🔙 Назад", callback_data=f"delchat|{conn_id}|{chat_id}").adjust(1)
     await call.message.answer(text[:3800], parse_mode="HTML", reply_markup=builder.as_markup(), disable_web_page_preview=True)
 
+def _build_archive_html(msgs: list, chat_title: str) -> str:
+    parts = ['<!DOCTYPE html><html><head><meta charset="utf-8">', f'<title>Архив: {html.escape(chat_title)}</title>', '<style>body{font-family:sans-serif;background:#0e1621;color:#e9edf1;padding:20px;max-width:900px;margin:0 auto;}.m{padding:10px 14px;background:#17212b;border-radius:8px;margin-bottom:6px;}.m.edit{background:#2b3f52;border-left:3px solid #f0a72c;}.m.del{background:#3a2124;border-left:3px solid #e05555;}.h{color:#5eb5f7;font-size:13px;margin-bottom:4px;}.o{color:#8899a6;text-decoration:line-through;}.t{white-space:pre-wrap;}</style></head><body>', f'<h1>Архив: {html.escape(chat_title)}</h1>', f'<p>Сообщений: {len(msgs)} · {datetime.now().strftime("%d.%m.%Y %H:%M")}</p>']
+    for m in msgs:
+        ts_str = m.get("created_at").strftime("%d.%m.%Y %H:%M") if isinstance(m.get("created_at"), datetime) else "?"
+        author = "Я" if m.get("is_owner") else html.escape(m.get("first_name") or "Без имени")
+        cls = "m" + (" del" if m.get("is_deleted") else "") + (" edit" if m.get("is_edited") else "")
+        body = f'<div class="o">{html.escape(m.get("old_text"))}</div><div class="t">{html.escape(m.get("text") or "")}</div>' if m.get("is_edited") and m.get("old_text") else f'<div class="t">{html.escape(m.get("text") or "[медиа]")}</div>'
+        if m.get("drive_link"): body += f'<div><a href="{m["drive_link"]}" style="color:#5eb5f7;">📎 {m.get("media_type")}</a></div>'
+        parts.append(f'<div class="{cls}"><div class="h">{ts_str} · {author}</div>{body}</div>')
+    parts.append('</body></html>')
+    return "".join(parts)
+
+@dp.callback_query(F.data.startswith("deldl|"))
+async def download_archive(call: CallbackQuery):
+    _, conn_id, chat_id_str = call.data.split("|")
+    chat_id, owner_id = int(chat_id_str), call.from_user.id
+    msgs = await archive_collection.find({"owner_id": owner_id, "conn_id": conn_id, "chat_id": chat_id, "$or": [{"is_deleted": True}, {"is_edited": True}]}).sort("created_at", 1).to_list(length=5000)
+    if not msgs:
+        await call.answer("Пусто", show_alert=True)
+        return
+    chat_title = msgs[0].get("peer_first_name") or msgs[0].get("first_name") or f"chat_{chat_id}"
+    content = _build_archive_html(msgs, chat_title).encode("utf-8")
+    await bot.send_document(chat_id=owner_id, document=BufferedInputFile(content, filename=f"archive_{chat_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.html"), caption=f"📥 Архив: {len(msgs)} событий")
+    await call.answer("Отправлено в личку")
+
 # ==========================================
 # АДМИНКА
 # ==========================================
+def get_admin_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")], [InlineKeyboardButton(text="💼 Мои твинки", callback_data="admin_twinks")], [InlineKeyboardButton(text="🔇 Активные муты", callback_data="admin_mutes")]])
+
 @dp.message(F.text == "/admin")
 async def cmd_admin(message: Message):
-    if message.from_user.id == SUPERADMIN_ID:
-        await message.answer("👑 <b>Панель управления:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")], [InlineKeyboardButton(text="💼 Твинки", callback_data="admin_twinks")], [InlineKeyboardButton(text="🔇 Муты", callback_data="admin_mutes")]]), parse_mode="HTML")
+    if message.from_user.id == SUPERADMIN_ID: await message.answer("👑 <b>Панель управления:</b>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
 
 @dp.callback_query(F.data == "admin_main")
-async def admin_main(call: CallbackQuery):
-    if call.from_user.id == SUPERADMIN_ID:
-        await show_menu(call, "👑 <b>Панель:</b>", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")], [InlineKeyboardButton(text="💼 Твинки", callback_data="admin_twinks")], [InlineKeyboardButton(text="🔇 Муты", callback_data="admin_mutes")]]), True)
-
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID: return
-    builder = InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="admin_main")
-    await show_menu(call, f"📊 <b>Статистика:</b>\n\nБизнесов: {await connections_collection.count_documents({})}\nСообщений: {await archive_collection.count_documents({})}\nУдалённых: {await archive_collection.count_documents({'is_deleted': True})}\nИзменённых: {await archive_collection.count_documents({'is_edited': True})}", builder.as_markup(), True)
+async def back_to_main_admin(call: CallbackQuery):
+    if call.from_user.id == SUPERADMIN_ID: await show_menu(call, "👑 <b>Панель управления:</b>", get_admin_main_kb(), True)
 
 @dp.callback_query(F.data == "admin_twinks")
 async def admin_twinks(call: CallbackQuery):
@@ -340,6 +300,11 @@ async def twink_full_chat(call: CallbackQuery):
     lines = [f"{'🗑' if m.get('is_deleted') else ''}{'✏️' if m.get('is_edited') else ''} <b>{m.get('created_at').strftime('%d.%m %H:%M')} · {'Я' if m.get('is_owner') else m.get('first_name')}</b>\n{m.get('text') or '[медиа]'}\n{'─' * 15}" for m in msgs]
     await call.message.answer(f"<b>💬 Переписка (последние 50):</b>\n\n" + "\n".join(lines)[:3900], parse_mode="HTML", disable_web_page_preview=True)
 
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(call: CallbackQuery):
+    if call.from_user.id != SUPERADMIN_ID: return
+    await show_menu(call, f"📊 <b>Статистика:</b>\n\nБизнесов: {await connections_collection.count_documents({})}\nСообщений: {await archive_collection.count_documents({})}\nУдалённых: {await archive_collection.count_documents({'is_deleted': True})}\nИзменённых: {await archive_collection.count_documents({'is_edited': True})}", InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="admin_main").as_markup(), True)
+
 @dp.callback_query(F.data == "admin_mutes")
 async def admin_mutes(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID: return
@@ -373,17 +338,6 @@ async def afk_menu_handler(call: CallbackQuery):
     is_afk = user_data.get("is_afk", False)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🟢 Выключить автоответчик" if is_afk else "🔴 Включить автоответчик", callback_data="toggle_afk")], [InlineKeyboardButton(text="⚙️ Настройки", callback_data="afk_settings")], [InlineKeyboardButton(text="🔙 Назад", callback_data="user_main")]])
     await show_menu(call, f"💤 <b>Автоответчик</b>\n\nСтатус: <b>{'🟢 ВКЛ' if is_afk else '🔴 ВЫКЛ'}</b>\n<i>💡 Выключается сам, если вы напишете в чат.</i>", kb, True)
-
-async def get_afk_settings_kb(user_id: int):
-    u = await users_collection.find_one({"user_id": user_id}) or {}
-    tz = u.get("tz_offset", 3)
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Изменить текст", callback_data="afk_set_text")],
-        [InlineKeyboardButton(text=f"🕒 Авто-включение: {'ВКЛ' if u.get('auto_afk') else 'ВЫКЛ'}", callback_data="toggle_auto_afk")],
-        [InlineKeyboardButton(text=f"⏰ Время: {u.get('afk_start', 23)}:00 - {u.get('afk_end', 7)}:00", callback_data="afk_set_time")],
-        [InlineKeyboardButton(text=f"🌍 Пояс: UTC{'+' if tz >= 0 else ''}{tz}", callback_data="afk_set_tz")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="afk_menu")],
-    ])
 
 @dp.callback_query(F.data == "afk_settings")
 async def afk_settings_handler(call: CallbackQuery):
@@ -448,12 +402,11 @@ async def afk_set_tz(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("afk_tz_set|"))
 async def afk_tz_set_handler(call: CallbackQuery):
     offset = int(call.data.split("|")[1])
-    if -12 <= offset <= 14:
-        await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"tz_offset": offset}}, upsert=True)
+    if -12 <= offset <= 14: await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"tz_offset": offset}}, upsert=True)
     await afk_settings_handler(call)
 
 # ==========================================
-# ВАЛЮТЫ, СТАТУС, КОМАНДЫ, МУТЫ В МЕНЮ
+# ВАЛЮТЫ, СТАТУС, КОМАНДЫ, МУТЫ
 # ==========================================
 @dp.callback_query(F.data == "currency_settings")
 async def currency_settings_handler(call: CallbackQuery):
@@ -509,22 +462,19 @@ async def user_unmute_callback(call: CallbackQuery):
     muted_chats.pop(mute_key, None)
     await user_mutes_handler(call)
 
-# ==========================================
-# КАТАЛОГ КОМАНД
-# ==========================================
 @dp.callback_query(F.data == "user_cmds")
 async def show_cmds(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id): return
-    await show_menu(call, "📖 <b>Справочник команд</b>\nВыбери раздел:", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛡 Модерация", callback_data="cmds_cat|mod")], [InlineKeyboardButton(text="🎬 Анимации", callback_data="cmds_cat|anim")], [InlineKeyboardButton(text="🧮 Валюты и NFT", callback_data="cmds_cat|auto")], [InlineKeyboardButton(text="🔙 Назад", callback_data="user_main")]]), True)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛡 Модерация", callback_data="cmds_cat|mod")], [InlineKeyboardButton(text="🎬 Анимации", callback_data="cmds_cat|anim")], [InlineKeyboardButton(text="🧮 Валюты и NFT", callback_data="cmds_cat|auto")], [InlineKeyboardButton(text="🔙 Назад", callback_data="user_main")]])
+    await show_menu(call, "📖 <b>Справочник команд</b>\nВыбери раздел:", kb, True)
 
 @dp.callback_query(F.data.startswith("cmds_cat|"))
 async def show_cmds_category(call: CallbackQuery):
     cat = call.data.split("|")[1]
     if cat == "mod":
-        admin_block = "<b>📋 .коп / .вст</b>\nОтветь <code>.коп</code> на сообщение, затем <code>.вст</code>.\n\n" if call.from_user.id == SUPERADMIN_ID else ""
-        text = f"🛡 <b>Модерация</b>\n\n<b>🔇 .мут [время]</b>\nПримеры: <code>.мут</code> · <code>.мут 10м</code>\n\n<b>🔁 .амут [текст]</b>\nПример: <code>.амут привет</code>\n\n<b>🎭 .фейк [тип] [сек]</b>\n<code>.фейк печать 30</code> / <code>.фейк стоп</code>\n\n{admin_block}<b>💣 .[N] [текст]</b>\nПример: <code>.10 привет</code>"
+        text = f"🛡 <b>Модерация</b>\n\n<b>🔇 .мут [время]</b>\nПримеры: <code>.мут</code> · <code>.мут 10м</code>\n\n<b>🔁 .амут [текст]</b>\nПример: <code>.амут привет</code>\n\n<b>🎭 .фейк [тип] [сек]</b>\n<code>.фейк печать 30</code> / <code>.фейк стоп</code>\n\n<b>📋 .коп / .вст</b>\nОтветь <code>.коп</code> на сообщение, затем <code>.вст</code> для вставки.\n\n<b>💣 .[N] [текст]</b>\nПример: <code>.10 привет</code>"
     elif cat == "anim":
-        text = "🎬 <b>Анимации</b>\n\n• <code>.танос [текст]</code>\n• <code>.пак [текст]</code>\n• <code>.брут [текст]</code>\n• <code>.глитч [текст]</code>\n• <code>.табло [текст]</code>\n• <code>.п1</code> / <code>.п2</code> / <code>.п3</code>"
+        text = "🎬 <b>Анимации</b>\n\n• <code>.танос</code>\n• <code>.пак</code>\n• <code>.брут</code>\n• <code>.глитч</code>\n• <code>.табло</code>\n• <code>.п1</code> / <code>.п2</code> / <code>.п3</code>"
     else:
         text = "🧮 <b>Валюты и NFT</b>\n\n<b>💱 Конвертер</b>\n<code>100 баксов</code>\n<code>10 тон + 5 тон</code>\n\n<b>🧮 Калькулятор</b>\n<code>25 * 4</code>\n\n<b>🎁 NFT Парсер</b>\nОтветь <code>цена</code> или <code>.ц</code> на ссылку <code>t.me/nft/...</code>"
     await show_menu(call, text, InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="user_cmds")]]), True)
@@ -541,35 +491,45 @@ async def on_business_connection(connection: BusinessConnection):
         with suppress(Exception): await connections_collection.delete_one({"business_connection_id": connection.id})
 
 # ==========================================
-# КОПИРОВАНИЕ И ВСТАВКА
+# КОПИРОВАНИЕ И ВСТАВКА (.коп / .вст)
 # ==========================================
 @dp.business_message(F.text.lower().startswith(".коп"))
 @dp.message(F.text.lower().startswith(".коп"))
-async def copy_message_superadmin(message: Message):
-    if message.from_user.id != SUPERADMIN_ID: return
-    conn_id = getattr(message, "business_connection_id", None)
+async def copy_message_all(message: Message):
+    user_id, conn_id = message.from_user.id, getattr(message, "business_connection_id", None)
     if conn_id:
-        await check_and_save_protected_media(message, SUPERADMIN_ID)
-        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
-    else: await message.delete()
+        await check_and_save_protected_media(message, user_id)
+        with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    else:
+        with suppress(Exception): await message.delete()
+    
     reply = message.reply_to_message
-    if reply:
-        media_type, file_id, _, _, _ = _extract_media_info(reply)
-        html_text = getattr(reply, "html_text", None) or reply.text or reply.caption or ""
-        copied_messages_cache[SUPERADMIN_ID] = {"media_type": media_type, "file_id": file_id, "html_text": html_text}
-        await users_collection.update_one({"user_id": SUPERADMIN_ID}, {"$set": {"copied_msg": copied_messages_cache[SUPERADMIN_ID]}}, upsert=True)
+    if not reply: return
+
+    media_type, file_id, _, _, _ = _extract_media_info(reply)
+    html_text = getattr(reply, "html_text", None) or reply.text or reply.caption or ""
+    clip_data = {"media_type": media_type, "file_id": file_id, "html_text": html_text}
+    copied_messages_cache[user_id] = clip_data
+    with suppress(Exception):
+        await users_collection.update_one({"user_id": user_id}, {"$set": {"copied_msg": clip_data}}, upsert=True)
 
 @dp.business_message(F.text.lower().startswith(".вст"))
 @dp.message(F.text.lower().startswith(".вст"))
-async def paste_message_superadmin(message: Message):
-    if message.from_user.id != SUPERADMIN_ID: return
-    conn_id = getattr(message, "business_connection_id", None)
+async def paste_message_all(message: Message):
+    user_id, conn_id = message.from_user.id, getattr(message, "business_connection_id", None)
     if conn_id:
-        await handle_owner_activity(SUPERADMIN_ID, message.chat.id)
-        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
-    else: await message.delete()
-    clip_data = copied_messages_cache.get(SUPERADMIN_ID) or (await users_collection.find_one({"user_id": SUPERADMIN_ID}) or {}).get("copied_msg")
+        await handle_owner_activity(user_id, message.chat.id)
+        with suppress(Exception): await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    else:
+        with suppress(Exception): await message.delete()
+
+    clip_data = copied_messages_cache.get(user_id)
+    if not clip_data:
+        user_doc = await users_collection.find_one({"user_id": user_id}) or {}
+        clip_data = user_doc.get("copied_msg")
+        if clip_data: copied_messages_cache[user_id] = clip_data
     if not clip_data: return
+
     mt, fid, html_text = clip_data.get("media_type"), clip_data.get("file_id"), clip_data.get("html_text") or ""
     reply_to_id = message.reply_to_message.message_id if message.reply_to_message else None
     with suppress(Exception):
@@ -596,7 +556,31 @@ async def mute_user(message: Message):
     await bot.delete_business_messages(business_connection_id=message.business_connection_id, message_ids=[message.message_id])
     await mutes_collection.update_one({"mute_key": mute_key}, {"$set": {"mute_key": mute_key, "until_ts": until_ts}}, upsert=True)
     muted_chats[mute_key] = until_ts
-    await bot.send_message(peer_id, f"🔇 Замьючен ({duration_label}).", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute|{peer_id}")]]), business_connection_id=message.business_connection_id)
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute|{message.business_connection_id}|{peer_id}")]])
+    await bot.send_message(peer_id, f"🔇 Замьючен ({duration_label}).", reply_markup=markup, business_connection_id=message.business_connection_id)
+
+@dp.callback_query(F.data.startswith("unmute|"))
+async def unmute_user(call: CallbackQuery):
+    parts = call.data.split("|")
+    if len(parts) != 3: return
+    conn_id, peer_id = parts[1], int(parts[2])
+    mute_key = f"{conn_id}_{peer_id}"
+    
+    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    if not owner_data: return
+    owner_id = owner_data["user_id"]
+
+    if call.from_user.id != owner_id and call.from_user.id != SUPERADMIN_ID:
+        await call.answer("Нельзя", show_alert=True)
+        return
+
+    await mutes_collection.delete_one({"mute_key": mute_key})
+    muted_chats.pop(mute_key, None)
+    
+    with suppress(Exception):
+        await bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="🔊 Мут снят.", business_connection_id=conn_id)
+    await call.answer("Мут успешно снят!", show_alert=True)
 
 @dp.business_message(F.text.lower().startswith(".амут"))
 async def amute_command(message: Message):
@@ -649,7 +633,7 @@ async def spam_command(message: Message):
         await asyncio.sleep(0.5)
 
 # ==========================================
-# АНИМАЦИИ
+# АНИМАЦИИ И СПЕЦЭФФЕКТЫ
 # ==========================================
 @dp.business_message(F.text.lower().startswith(".п1"))
 async def type_animation_p1(message: Message):
@@ -929,14 +913,6 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
         if old_msg:
             await archive_collection.update_one({"_id": old_msg["_id"]}, {"$set": {"is_deleted": True, "is_viewed": False, "deleted_at": datetime.now(timezone.utc)}})
             if not old_msg.get("is_owner"): await notify_owner_about_deletion(owner_id, old_msg.get("first_name"), old_msg.get("username"), old_msg.get("text"), old_msg.get("media_type"), old_msg.get("drive_link"), datetime.now(timezone.utc), old_msg.get("media_file_id"))
-
-@dp.callback_query(F.data.startswith("unmute|"))
-async def unmute_user(call: CallbackQuery):
-    peer_id, conn_id = int(call.data.split("|")[1]), call.message.business_connection_id
-    if call.from_user.id not in (await connections_collection.find_one({"business_connection_id": conn_id}) or {}).get("user_id", SUPERADMIN_ID) and call.from_user.id != SUPERADMIN_ID: return
-    await mutes_collection.delete_one({"mute_key": f"{conn_id}_{peer_id}"})
-    muted_chats.pop(f"{conn_id}_{peer_id}", None)
-    with suppress(TelegramBadRequest): await call.message.edit_text("🔊 Мут снят."); await call.answer("Снят")
 
 # ==========================================
 # MAIN
