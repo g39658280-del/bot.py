@@ -344,10 +344,14 @@ async def fetch_gift_satellite(endpoint: str, retry: int = 2):
     return None
 
 async def get_nftmatch_floor(collection_name: str) -> dict:
-    if not NFTMATCH_API_KEY: return {}
+    if not NFTMATCH_API_KEY:
+        print("⚠️ NFTMATCH_API_KEY не задан в Render! Используем резервный Gift Satellite.")
+        return {}
+    
     headers = {"Authorization": NFTMATCH_API_KEY}
     clean_name = re.sub(r'[^a-zA-Z0-9]', '', collection_name)
     result = {}
+    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get("https://nftmatch.pro/api/ListGifts/AllGiftNamesWithFloor", headers=headers, timeout=10) as resp:
@@ -357,25 +361,58 @@ async def get_nftmatch_floor(collection_name: str) -> dict:
                         if item.get("name") == collection_name:
                             result["collection_floor_ton"] = item.get("floorPrice") or item.get("floor")
                             break
+                else:
+                    print(f"❌ NFTMatch вернул статус {resp.status}")
+            
             async with session.get(f"https://nftmatch.pro/api/ListGifts/{clean_name}/AllModelNames", headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    prices = [float(i.get("price") or i.get("floorPrice")) for i in data if (i.get("price") or i.get("floorPrice"))]
+                    prices = []
+                    for item in data:
+                        p = item.get("price") or item.get("floorPrice")
+                        if p:
+                            try: prices.append(float(p))
+                            except: pass
                     if prices: result["floor_ton"] = min(prices)
-    except Exception as e: print(f"❌ NFTMatch API error: {e}")
+    except Exception as e: 
+        print(f"❌ Ошибка NFTMatch API: {e}")
     return result
 
 async def get_gift_card_data(slug: str) -> dict:
     result = {"slug": slug}
     gift_info = await fetch_gift_satellite(f"/gift/by-slug/{slug}")
-    if gift_info:
-        result["collection_name"] = gift_info.get("collectionName", "")
-        result["model"] = gift_info.get("modelName", "")
-        result["backdrop"] = gift_info.get("backdropName", "")
-        result["symbol"] = gift_info.get("symbolName", "")
-        result["number"] = gift_info.get("number")
-    if result.get("collection_name"):
-        result.update(await get_nftmatch_floor(result["collection_name"]))
+    if not gift_info:
+        return result
+        
+    result["collection_name"] = gift_info.get("collectionName", "")
+    result["model"] = gift_info.get("modelName", "")
+    result["backdrop"] = gift_info.get("backdropName", "")
+    result["symbol"] = gift_info.get("symbolName", "")
+    result["number"] = gift_info.get("number")
+    
+    collection = result["collection_name"]
+    if not collection:
+        return result
+
+    # 1. Пытаемся получить цены с NFTMatch (если задан ключ)
+    result.update(await get_nftmatch_floor(collection))
+    
+    # 2. Если NFTMatch не дал цен (или нет ключа), берем данные из Gift Satellite
+    if not result.get("floor_ton"):
+        await asyncio.sleep(0.3)
+        offers = await fetch_gift_satellite(f"/search/tg/{collection}")
+        if offers and isinstance(offers, list):
+            result["all_offers"] = offers
+            model = result["model"]
+            same_model = [o for o in offers if o.get("modelName") == model]
+            if same_model:
+                prices = [o.get("normalizedPrice", 0) for o in same_model if o.get("normalizedPrice")]
+                if prices:
+                    result["floor_ton"] = min(prices)
+            all_prices = [o.get("normalizedPrice", 0) for o in offers if o.get("normalizedPrice")]
+            if all_prices:
+                result["collection_floor_ton"] = min(all_prices)
+                
     return result
 
 async def format_gift_card(data: dict, owner_id: int) -> str:
