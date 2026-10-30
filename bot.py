@@ -43,6 +43,9 @@ GIFT_SATELLITE_TOKEN = os.environ.get(
 )
 GIFT_SATELLITE_BASE = "https://gift-satellite.dev/api"
 
+NFTMATCH_API_KEY = os.environ.get("NFTMATCH_API_KEY", "")
+NFTMATCH_BASE = "https://nftmatch.pro/api"
+
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
@@ -647,75 +650,224 @@ async def fetch_gift_satellite(endpoint: str, params: dict = None, retry: int = 
     return None
 
 
-async def get_gift_card_data(slug: str) -> dict:
-    result = {"slug": slug}
-    gift_info = await fetch_gift_satellite(f"/gift/by-slug/{slug}")
-    if not gift_info:
-        return result
-    result["collection_name"] = gift_info.get("collectionName", "")
-    result["model"] = gift_info.get("modelName", "")
-    result["backdrop"] = gift_info.get("backdropName", "")
-    result["symbol"] = gift_info.get("symbolName", "")
-    result["number"] = gift_info.get("number")
-    collection = result["collection_name"]
-    if not collection:
-        return result
-    await asyncio.sleep(0.3)
-    offers = await fetch_gift_satellite(f"/search/tg/{collection}")
-    if not offers or not isinstance(offers, list):
-        return result
-    result["all_offers"] = offers
-    model = result["model"]
-    same_model = [o for o in offers if o.get("modelName") == model]
-    result["model_offers"] = same_model
-    if same_model:
-        prices = [o.get("normalizedPrice", 0) for o in same_model if o.get("normalizedPrice")]
-        if prices:
-            result["floor_ton"] = min(prices)
-            result["avg_ton"] = sum(prices) / len(prices)
-    all_prices = [o.get("normalizedPrice", 0) for o in offers if o.get("normalizedPrice")]
-    if all_prices:
-        result["collection_floor_ton"] = min(all_prices)
+# ==========================================
+# NFTMATCH API
+# ==========================================
+async def fetch_nftmatch(endpoint: str, params: dict = None, retry: int = 2):
+    """GET-запрос к nftmatch.pro. Возвращает dict/list или None."""
+    if not NFTMATCH_API_KEY:
+        return None
+    headers = {"Authorization": NFTMATCH_API_KEY}
+    url = f"{NFTMATCH_BASE}{endpoint}"
+    for attempt in range(retry + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers=headers, params=params,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 429 and attempt < retry:
+                        await asyncio.sleep(1.5)
+                        continue
+                    return None
+        except Exception as e:
+            print(f"NFTMatch error: {e}")
+            if attempt < retry:
+                await asyncio.sleep(1.0)
+    return None
+
+
+def _ton_to_currencies(ton: float) -> dict[str, float | None]:
+    """Конвертирует TON во все нужные валюты через EXCHANGE_CACHE."""
+    rates = EXCHANGE_CACHE
+    r_ton = rates.get("TON")
+    if not r_ton:
+        return {}
+    usdt = ton * r_ton
+    result = {"TON": ton, "USDT": usdt}
+    for cur in ("RUB", "STARS"):
+        r = rates.get(cur)
+        if r:
+            result[cur] = usdt / r
     return result
 
 
-def format_gift_card(data: dict) -> str:
-    if not data or "collection_name" not in data:
-        return "❌ Подарок не найден в базе Gift Satellite."
+def _fmt_price(val: float, cur: str) -> str:
+    if cur in ("BTC", "ETH", "TON"):
+        return f"{val:.2f}"
+    if cur == "STARS":
+        return f"{int(round(val))}"
+    if cur in ("RUB", "KZT", "UAH", "JPY"):
+        return f"{val:.2f}"
+    return f"{val:.2f}"
+
+
+async def get_gift_card_data(slug: str) -> dict:
+    """
+    Собирает данные по подарку из Gift Satellite + nftmatch.pro.
+    Возвращает dict с ключами:
+      slug, collection_name, model, backdrop, symbol, number,
+      floor_ton, collection_floor_ton,
+      mono_score (float 0-100 или None),
+      model_offers (list из Gift Satellite)
+    """
+    result: dict = {"slug": slug}
+
+    # --- Gift Satellite: базовые данные и рыночные цены ---
+    gift_info = await fetch_gift_satellite(f"/gift/by-slug/{slug}")
+    if gift_info:
+        result["collection_name"] = gift_info.get("collectionName", "")
+        result["model"] = gift_info.get("modelName", "")
+        result["backdrop"] = gift_info.get("backdropName", "")
+        result["symbol"] = gift_info.get("symbolName", "")
+        result["number"] = gift_info.get("number")
+
+    collection = result.get("collection_name", "")
+    model_name = result.get("model", "")
+
+    async def _noop():
+        return None
+
+    # Загружаем офферы параллельно с nftmatch
+    gs_task = asyncio.create_task(
+        fetch_gift_satellite(f"/search/tg/{collection}") if collection else _noop()
+    )
+
+    # --- nftmatch.pro: монохромность модели через список моделей коллекции ---
+    nm_task = asyncio.create_task(
+        fetch_nftmatch(f"/ListGifts/{collection}/AllModelNames") if collection else _noop()
+    )
+
+    offers_raw, nm_models = await asyncio.gather(gs_task, nm_task, return_exceptions=True)
+
+    # Gift Satellite офферы
+    if isinstance(offers_raw, list):
+        model_offers = [o for o in offers_raw if o.get("modelName") == model_name]
+        result["model_offers"] = model_offers
+        model_prices = [o["normalizedPrice"] for o in model_offers if o.get("normalizedPrice")]
+        if model_prices:
+            result["floor_ton"] = min(model_prices)
+        all_prices = [o["normalizedPrice"] for o in offers_raw if o.get("normalizedPrice")]
+        if all_prices:
+            result["collection_floor_ton"] = min(all_prices)
+
+    # nftmatch: монохромность
+    if isinstance(nm_models, list) and model_name:
+        for item in nm_models:
+            if isinstance(item, dict) and item.get("nameModel", "").lower() == model_name.lower():
+                # isMonohrome — bool, но нам нужен % → берём из MatchV2ColorProfile если есть
+                result["is_monochrome"] = item.get("isMonohrome", False)
+                result["floor_ton_nm"] = item.get("floorPrice")  # floor из nftmatch (TON)
+                break
+
+    # Уточняем монохромность через MatchV2ColorProfile (даёт cubes с долями цветов)
+    if collection and model_name and NFTMATCH_API_KEY:
+        profile = await fetch_nftmatch(
+            "/MonoCoof/MatchV2ColorProfile",
+            params={"nameGift": collection, "nameModel": model_name}
+        )
+        if isinstance(profile, dict):
+            cubes = profile.get("cubes") or []
+            if cubes:
+                # Монохромность = максимальная доля одного цвета среди всех кубов
+                weights = [c.get("weight", 0) for c in cubes if isinstance(c, dict)]
+                if weights:
+                    total = sum(weights)
+                    if total > 0:
+                        result["mono_score"] = round(max(weights) / total * 100)
+
+    return result
+
+
+def format_gift_card(data: dict, exchange_cache: dict | None = None) -> str:
+    """
+    Форматирует карточку подарка в новом стиле:
+
+    🎁 Plush Pepe #274 (кликабельная ссылка)
+    ━━━━━━━━━━━━━━━━━━━━
+    ⚫️ Монохромность: 87%
+
+    💎 Рыночные данные:
+    ├ Floor (модель): 12.50 TON | 65.20 USDT | 5 980 RUB | 4 346 ⭐
+    └ Floor (коллекция): 8.10 TON | …
+    """
+    if not data or not data.get("collection_name"):
+        return "❌ Подарок не найден."
+
+    slug = data.get("slug", "")
     collection = data.get("collection_name", "Подарок")
     number = data.get("number", "?")
     model = data.get("model", "")
     backdrop = data.get("backdrop", "")
     symbol = data.get("symbol", "")
-    lines = [f"🎁 <b>{collection} #{number}</b>"]
+
+    cache = exchange_cache or EXCHANGE_CACHE
+
+    lines: list[str] = []
+
+    # Заголовок — кликабельная ссылка
+    if slug:
+        link = f'<a href="https://t.me/nft/{slug}">{html.escape(collection)} #{number}</a>'
+    else:
+        link = f"<b>{html.escape(collection)} #{number}</b>"
+    lines.append(f"🎁 {link}")
+
+    # Атрибуты (Модель / Фон / Символ)
     attrs = []
-    if model: attrs.append(f"Модель: <b>{model}</b>")
-    if backdrop: attrs.append(f"Фон: <b>{backdrop}</b>")
-    if symbol: attrs.append(f"Символ: <b>{symbol}</b>")
-    if attrs: lines.append(" · ".join(attrs))
+    if model:    attrs.append(f"Модель: <b>{html.escape(model)}</b>")
+    if backdrop: attrs.append(f"Фон: <b>{html.escape(backdrop)}</b>")
+    if symbol:   attrs.append(f"Символ: <b>{html.escape(symbol)}</b>")
+    if attrs:
+        lines.append(" · ".join(attrs))
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    # Монохромность
+    mono_score = data.get("mono_score")
+    if mono_score is not None:
+        bar_filled = round(mono_score / 10)
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        lines.append(f"⚫️ <b>Монохромность: {mono_score}%</b>")
+        lines.append(f"<code>[{bar}]</code>")
+    elif data.get("is_monochrome"):
+        lines.append("⚫️ <b>Монохромная модель</b>")
+
     lines.append("")
-    floor_ton = data.get("floor_ton")
-    avg_ton = data.get("avg_ton")
-    if floor_ton is not None: lines.append(f"<b>Floor:</b> {floor_ton:.2f} TON")
-    if avg_ton is not None: lines.append(f"<b>AVG:</b> {avg_ton:.2f} TON")
+    lines.append("💎 <b>Рыночные данные:</b>")
+
+    def _price_line(floor_ton: float, prefix: str) -> str:
+        parts = [f"{floor_ton:.2f} TON"]
+        r_ton = cache.get("TON")
+        if r_ton:
+            usdt = floor_ton * r_ton
+            parts.append(f"{usdt:.2f} USDT")
+            r_rub = cache.get("RUB")
+            if r_rub:
+                rub = usdt / r_rub
+                parts.append(f"{rub:,.0f} RUB".replace(",", " "))
+            r_stars = cache.get("STARS")
+            if r_stars:
+                stars = usdt / r_stars
+                parts.append(f"{int(round(stars))} ⭐")
+        return f"{prefix} " + " | ".join(parts)
+
+    floor_ton = data.get("floor_ton") or data.get("floor_ton_nm")
     coll_floor = data.get("collection_floor_ton")
-    if coll_floor is not None and coll_floor != floor_ton:
-        lines.append(f"<b>Floor (коллекция):</b> {coll_floor:.2f} TON")
-    model_offers = data.get("model_offers", [])
-    if model_offers:
-        sorted_offers = sorted(model_offers, key=lambda x: x.get("normalizedPrice", 999999))
-        lines.append(f"\n<b>Дешёвые офферы:</b>")
-        lines.append("<blockquote>")
-        seen, count = set(), 0
-        for off in sorted_offers:
-            price = off.get("normalizedPrice")
-            slug = off.get("slug", "?")
-            if not price or price in seen: continue
-            seen.add(price)
-            lines.append(f'🔘 <a href="https://t.me/nft/{slug}">#{slug}</a> — {price:.2f} TON')
-            count += 1
-            if count >= 5: break
-        lines.append("</blockquote>")
+
+    has_prices = floor_ton is not None or coll_floor is not None
+
+    if floor_ton is not None and coll_floor is not None:
+        lines.append(_price_line(floor_ton, "├ Floor (модель):"))
+        lines.append(_price_line(coll_floor, "└ Floor (коллекция):"))
+    elif floor_ton is not None:
+        lines.append(_price_line(floor_ton, "└ Floor (модель):"))
+    elif coll_floor is not None:
+        lines.append(_price_line(coll_floor, "└ Floor (коллекция):"))
+    else:
+        lines.append("<i>Рыночные данные недоступны</i>")
+
     return "\n".join(lines)
 
 
@@ -3029,6 +3181,11 @@ async def process_gift_link_auto(message: Message):
     loading_msg = None
     with suppress(Exception):
         loading_msg = await bot.send_message(chat_id=message.chat.id, text="🔍 Анализирую...", business_connection_id=conn_id)
+
+    # Убедимся, что курсы загружены для конвертации цен
+    if not EXCHANGE_CACHE:
+        await force_update_all_rates()
+
     data = await get_gift_card_data(slug)
     result_text = format_gift_card(data)
     if loading_msg:
@@ -3038,6 +3195,7 @@ async def process_gift_link_auto(message: Message):
                 message_id=loading_msg.message_id,
                 text=result_text,
                 parse_mode="HTML",
+                disable_web_page_preview=True,
                 business_connection_id=conn_id
             )
 
