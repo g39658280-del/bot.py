@@ -8,6 +8,7 @@ import urllib.parse
 import json
 import aiohttp
 import tempfile
+from aiogram import BaseMiddleware
 from datetime import datetime, timezone
 from aiohttp import web
 from contextlib import suppress
@@ -56,6 +57,43 @@ CAPTION_LIMIT = 1024
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+class GlobalMuteMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: Message, data: dict):
+        conn_id = getattr(event, "business_connection_id", None)
+        if not conn_id:
+            return await handler(event, data)
+
+        owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+        peer_id = event.chat.id
+
+        if not owner_data:
+            # Сообщение пришло через ЧУЖОГО бота
+            if await _is_peer_muted_anywhere(peer_id):
+                with suppress(Exception):
+                    await event.bot.delete_business_messages(
+                        business_connection_id=conn_id,
+                        message_ids=[event.message_id]
+                    )
+                return  # СТОП! Дальше не передаем
+        else:
+            # Сообщение пришло через НАШЕГО бота
+            owner_id = owner_data["user_id"]
+            is_owner = (event.from_user.id == owner_id)
+            if not is_owner and await is_chat_muted(conn_id, peer_id):
+                # Если это не владелец и чат в муте — удаляем
+                if event.from_user.id != BOT_ID or is_foreign_bot(event):
+                    with suppress(Exception):
+                        await event.bot.delete_business_messages(
+                            business_connection_id=conn_id,
+                            message_ids=[event.message_id]
+                        )
+                    return  # СТОП! Дальше не передаем
+
+        return await handler(event, data)
+
+# Регистрируем Middleware на все бизнес-сообщения
+dp.business_message.middleware(GlobalMuteMiddleware())
 
 BOT_ID: int = 8855259798   # константа — наш бот
 BOT_USERNAME = "your_bot_username"
