@@ -68,77 +68,15 @@ def get_http_session() -> aiohttp.ClientSession:
     return _http_session
 
 
-
-async def _find_mute_owner_conn(sender_id: int, chat_id: int, incoming_conn_id: str) -> tuple[str | None, int | None]:
-    """
-    Проверяет, находится ли отправитель (sender_id) в муте в данном диалоге.
-    Возвращает (conn_id_владельца_мута, owner_id) или (None, None).
-    Работает в обе стороны:
-      1) Апдейт пришёл на подключение Владельца (sender_id == chat_id)
-      2) Апдейт пришёл на подключение самого замученного собеседника (sender_id != chat_id)
-    """
-    now = datetime.now(timezone.utc).timestamp()
-
-    # Случай 1: пишет собеседник, и апдейт пришёл со стороны Владельца (или чужого conn_id)
-    if sender_id == chat_id:
-        # Сначала проверяем прямое совпадение incoming_conn_id
-        mute_key = f"{incoming_conn_id}_{sender_id}"
-        if mute_key in muted_chats:
-            until_ts = muted_chats[mute_key]
-            if until_ts is None or now < until_ts:
-                conn_doc = await connections_collection.find_one({"business_connection_id": incoming_conn_id})
-                if conn_doc:
-                    return incoming_conn_id, conn_doc["user_id"]
-            else:
-                muted_chats.pop(mute_key, None)
-
-        # Ищем по всем активным мутам для этого sender_id
-        suffix = f"_{sender_id}"
-        for m_key, until_ts in list(muted_chats.items()):
-            if m_key.endswith(suffix):
-                if until_ts is None or now < until_ts:
-                    target_conn_id = m_key.rsplit("_", 1)[0]
-                    conn_doc = await connections_collection.find_one({"business_connection_id": target_conn_id})
-                    if conn_doc:
-                        return target_conn_id, conn_doc["user_id"]
-                else:
-                    muted_chats.pop(m_key, None)
-
-        # Фолбэк в MongoDB
-        doc = await mutes_collection.find_one({"peer_id": sender_id})
-        if doc:
-            until_ts = doc.get("until_ts")
-            if until_ts is None or now < until_ts:
-                muted_chats[doc["mute_key"]] = until_ts
-                return doc["conn_id"], doc["owner_id"]
-
-    # Случай 2: апдейт пришёл со стороны подключения САМОГО замученного (он пытается вызвать .амут в нашем боте)
-    # В этом случае sender_id — замученный, а chat_id — это ID Владельца, который его замутил!
-    else:
-        doc = await mutes_collection.find_one({"owner_id": chat_id, "peer_id": sender_id})
-        if doc:
-            until_ts = doc.get("until_ts")
-            if until_ts is None or now < until_ts:
-                muted_chats[doc["mute_key"]] = until_ts
-                return doc["conn_id"], doc["owner_id"]
-            else:
-                muted_chats.pop(doc["mute_key"], None)
-                with suppress(Exception):
-                    await mutes_collection.delete_one({"_id": doc["_id"]})
-
-    return None, None
-
-
 async def _sniper_delete_followup(bot_instance: Bot, owner_conn_id: str, msg_id: int):
     """
     Добивает сообщения (M+1, M+2, M+3), которые сторонний бизнес-бот отправляет
     через 100-2000 мс после перехвата команды от замученного собеседника.
     """
     candidate_ids = [msg_id + 1, msg_id + 2, msg_id + 3]
-    for delay in (0.25, 0.55, 1.1, 2.2):
+    for delay in (0.2, 0.5, 1.1, 2.2):
         await asyncio.sleep(delay)
         for cand_id in candidate_ids:
-            # Проверяем, не занят ли этот message_id обычным сообщением в другом чате Владельца
             exists_in_other = await archive_collection.find_one({
                 "conn_id": owner_conn_id,
                 "message_id": cand_id
@@ -152,9 +90,10 @@ async def _sniper_delete_followup(bot_instance: Bot, owner_conn_id: str, msg_id:
 
 
 def _get_mute_owner_conn_sync(sender_id: int, chat_id: int, incoming_conn_id: str) -> tuple[str | None, int | None]:
+    """Мгновенный поиск активного мута в оперативной памяти (0 мс)."""
     now = datetime.now(timezone.utc).timestamp()
-    
-    # 1. Проверяем прямое совпадение
+
+    # 1. Проверяем прямое совпадение по текущему подключению
     mute_key = f"{incoming_conn_id}_{chat_id}"
     if mute_key in muted_chats:
         until_ts = muted_chats[mute_key]
@@ -165,7 +104,7 @@ def _get_mute_owner_conn_sync(sender_id: int, chat_id: int, incoming_conn_id: st
         else:
             muted_chats.pop(mute_key, None)
 
-    # 2. Проверяем все активные муты в памяти
+    # 2. Проверяем все активные муты в памяти (если пишет через чужого бота или со своего подключения)
     for m_key, until_ts in list(muted_chats.items()):
         if until_ts is not None and now >= until_ts:
             muted_chats.pop(m_key, None)
@@ -177,11 +116,11 @@ def _get_mute_owner_conn_sync(sender_id: int, chat_id: int, incoming_conn_id: st
             continue
         owner_id = conn_doc["user_id"]
 
-        # Если отправитель — замученный собеседник в чате с этим владельцем
         if sender_id == muted_peer_id and (chat_id == muted_peer_id or chat_id == owner_id):
             return conn_part, owner_id
 
     return None, None
+
 
 class GlobalMuteMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: Message, data: dict):
@@ -192,9 +131,25 @@ class GlobalMuteMiddleware(BaseMiddleware):
         sender_id = event.from_user.id
         chat_id = event.chat.id
 
+        # Быстрое удаление сообщения чужого бота реплаем Владельца (ответ точкой ".")
+        if event.text in (".", ".дел", ".del") and event.reply_to_message:
+            owner_conn = connections_cache.get(incoming_conn_id)
+            if owner_conn and owner_conn["user_id"] == sender_id:
+                with suppress(Exception):
+                    await event.bot.delete_business_messages(
+                        business_connection_id=incoming_conn_id,
+                        message_ids=[event.reply_to_message.message_id, event.message_id]
+                    )
+                return
+
+        # Мгновенная проверка мута в RAM (0 запросов к MongoDB)
         valid_owner_conn_id, owner_id = _get_mute_owner_conn_sync(sender_id, chat_id, incoming_conn_id)
         if not valid_owner_conn_id or sender_id == owner_id or sender_id == BOT_ID:
             return await handler(event, data)
+
+        # Сбрасываем попытки нарушителя запустить .амут
+        active_amute.pop(f"{incoming_conn_id}_{chat_id}", None)
+        active_amute.pop(f"{valid_owner_conn_id}_{sender_id}", None)
 
         # Запускаем удаление параллельно
         tasks = [
@@ -212,55 +167,15 @@ class GlobalMuteMiddleware(BaseMiddleware):
             )
 
         await asyncio.gather(*tasks, return_exceptions=True)
-        return
 
-# Не забудь заменить регистрацию на outer_middleware
-dp.business_message.outer_middleware(GlobalMuteMiddleware())
-dp.edited_business_message.outer_middleware(GlobalMuteMiddleware())
-
-        # Проверяем, замучен ли автор сообщения (sender_id) в этом чате
-        valid_owner_conn_id, owner_id = await _find_mute_owner_conn(sender_id, chat_id, incoming_conn_id)
-        if not valid_owner_conn_id:
-            return await handler(event, data)
-
-        # Если пишет сам Владелец, который выдал мут — пропускаем
-        if sender_id == owner_id:
-            return await handler(event, data)
-
-        # Гасим активную сессию .амут, если нарушитель пытался запустить её через нашего бота
-        amute_key_1 = f"{incoming_conn_id}_{chat_id}"
-        amute_key_2 = f"{valid_owner_conn_id}_{sender_id}"
-        active_amute.pop(amute_key_1, None)
-        active_amute.pop(amute_key_2, None)
-
-        # 1. Если апдейт пришёл с подключения самого нарушителя (он тоже подключил нашего бота),
-        # сначала удаляем сообщение через его собственное подключение:
-        if incoming_conn_id != valid_owner_conn_id:
-            with suppress(Exception):
-                await event.bot.delete_business_messages(
-                    business_connection_id=incoming_conn_id,
-                    message_ids=[event.message_id]
-                )
-
-        # 2. Удаляем сообщение через подключение Владельца:
-        try:
-            await event.bot.delete_business_messages(
-                business_connection_id=valid_owner_conn_id,
-                message_ids=[event.message_id]
-            )
-            print(f"✅ [Mute] Удалено сообщение {event.message_id} от {sender_id} (conn={valid_owner_conn_id})")
-        except Exception as e:
-            print(f"❌ [Mute] Ошибка удаления {event.message_id}: {e}")
-
-        # 3. Запускаем снайперское добивание M+1..M+3 на случай, если это была команда для чужого бота
+        # Запускаем снайперское добивание M+1..M+3 в фоне
         if incoming_conn_id == valid_owner_conn_id:
             asyncio.create_task(_sniper_delete_followup(event.bot, valid_owner_conn_id, event.message_id))
 
-        # ЖЕСТКО прерываем цепочку: ни .амут, ни анимации, ни калькулятор дальше не запустятся
         return
 
 
-# Регистрируем как OUTER middleware и на новые сообщения, и на редактирования!
+# Регистрируем как OUTER middleware (один раз!)
 dp.business_message.outer_middleware(GlobalMuteMiddleware())
 dp.edited_business_message.outer_middleware(GlobalMuteMiddleware())
 
@@ -276,20 +191,17 @@ try:
     mutes_collection = db['mutes']
 except Exception as e:
     print(f"Ошибка БД: {e}")
+
 connections_cache: dict[str, dict] = {}
 users_cache: dict[int, dict] = {}
 muted_chats: dict[str, float | None] = {}
 afk_cooldowns = TTLCache(maxsize=2000, ttl=300)
-# active_amute: dict без TTL — сессия живёт бессрочно до явного .амут стоп
-# Структура: { "conn_id_peer_id": {"text": str, "message_id": int, "until_ts": float|None} }
 active_amute: dict[str, dict] = {}
 action_dedup = TTLCache(maxsize=2000, ttl=4)
 self_destruct_ids = TTLCache(maxsize=1000, ttl=30)
 active_fakes: dict[str, asyncio.Task] = {}
 copied_messages_cache = {}
-# Блокировка для race condition в active_amute при конкурентных удалениях
 _amute_lock: dict[str, asyncio.Lock] = {}
-# message_id-ы уже обработанные специализированными хендлерами — catch-all их пропускает
 _handled_msg_ids: TTLCache = TTLCache(maxsize=5000, ttl=30)
 
 
@@ -349,11 +261,9 @@ async def is_chat_muted(conn_id: str, peer_id: int) -> bool:
     return True
     
 async def _is_peer_muted_anywhere(peer_id: int) -> bool:
-    """Проверяет, есть ли активный мут на этого пира в памяти или в БД."""
     suffix = f"_{peer_id}"
     now = datetime.now(timezone.utc).timestamp()
 
-    # 1. Проверка локального кэша
     for mute_key, until_ts in list(muted_chats.items()):
         if not mute_key.endswith(suffix):
             continue
@@ -362,7 +272,6 @@ async def _is_peer_muted_anywhere(peer_id: int) -> bool:
         else:
             muted_chats.pop(mute_key, None)
 
-    # 2. Фолбэк на базу данных
     doc = await mutes_collection.find_one({"peer_id": peer_id})
     if doc:
         until_ts = doc.get("until_ts")
@@ -383,6 +292,7 @@ async def handle_owner_activity(owner_id: int, peer_id: int):
             {"$set": {"is_afk": False}}
         )
         if result.modified_count > 0:
+            users_cache.setdefault(owner_id, {})["is_afk"] = False
             with suppress(Exception):
                 await bot.send_message(
                     chat_id=owner_id,
@@ -397,29 +307,17 @@ async def handle_owner_activity(owner_id: int, peer_id: int):
 # ПОДКЛЮЧЕНИЕ БИЗНЕС-БОТА
 # ==========================================
 async def is_bot_connected(user_id: int) -> bool:
-    conn = await connections_collection.find_one({"user_id": user_id})
-    return bool(conn)
+    return any(c.get("user_id") == user_id for c in connections_cache.values())
 
 
 def is_foreign_bot(message) -> bool:
-    """
-    Возвращает True если сообщение отправлено ботом, который НЕ является нашим ботом.
-    Используется для блокировки обхода мута через чужих бизнес-ботов.
-    Проверяем:
-      1. from_user.is_bot — явный флаг бота
-      2. via_bot — сообщение отправлено через inline-бота
-      3. from_user.id == BOT_ID — пропускаем только себя
-    """
     u = getattr(message, "from_user", None)
     if u is None:
         return False
-    # Наш бот — не блокируем
     if u.id == BOT_ID:
         return False
-    # Любой другой бот — блокируем
     if getattr(u, "is_bot", False):
         return True
-    # Сообщение через inline-бота (via_bot) — блокируем
     via = getattr(message, "via_bot", None)
     if via and via.id != BOT_ID:
         return True
@@ -489,7 +387,7 @@ async def show_menu(call: CallbackQuery, caption: str, kb, with_photo: bool = Tr
 
 
 # ==========================================
-# ФОРМАТИРОВАНИЕ ТЕКСТА (КАПС / ЖИРНЫЙ / КУРСИВ)
+# ФОРМАТИРОВАНИЕ ТЕКСТА
 # ==========================================
 def apply_format(text: str, mode: list) -> str:
     if not mode or not isinstance(mode, list):
@@ -713,7 +611,6 @@ async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_
     tmp_path = None
     try:
         if file_size and file_size > 20 * 1024 * 1024:
-            print(f"⚠️ Файл слишком большой ({file_size} байт), пропускаем для {peer_id}")
             return
 
         peer_name = _sanitize(peer_name_raw or f"peer_{peer_id}")
@@ -744,7 +641,6 @@ async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_
                 {"_id": archive_id},
                 {"$set": {"drive_link": result.get("webViewLink"), "drive_file_id": result.get("id")}}
             )
-            print(f"✅ Медиа загружено: {media_type} для {peer_id}")
     except Exception as e:
         print(f"❌ upload_media_bg error: {e}")
     finally:
@@ -797,14 +693,10 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
         return None
 
     if media_type and file_id:
-        # ИСПРАВЛЕНО: Теперь передаем имя СОБЕСЕДНИКА (peer_info), а не отправителя
-        task = asyncio.create_task(upload_media_bg(
+        asyncio.create_task(upload_media_bg(
             doc["_id"], file_id, media_type, ext, mime,
             peer_info["first_name"], peer_id, owner_name, file_size
         ))
-        task.add_done_callback(
-            lambda t: print(f"❌ upload_media_bg error: {t.exception()}") if not t.cancelled() and t.exception() else None
-        )
 
     return doc
 
@@ -894,23 +786,23 @@ async def notify_owner_about_edit(owner_id, sender_name, sender_username, old_te
 
 
 # ==========================================
-# GIFT SATELLITE
+# GIFT SATELLITE & NFTMATCH API
 # ==========================================
 async def fetch_gift_satellite(endpoint: str, params: dict = None, retry: int = 2):
     if not GIFT_SATELLITE_TOKEN:
         return None
     headers = {"Authorization": f"Token {GIFT_SATELLITE_TOKEN}"}
     url = f"{GIFT_SATELLITE_BASE}{endpoint}"
+    session = get_http_session()
     for attempt in range(retry + 1):
         try:
-            async with get_http_session() as session:
-                async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    elif resp.status == 429 and attempt < retry:
-                        await asyncio.sleep(1.5)
-                        continue
-                    return None
+            async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                elif resp.status == 429 and attempt < retry:
+                    await asyncio.sleep(1.5)
+                    continue
+                return None
         except Exception as e:
             print(f"GiftSatellite error: {e}")
             if attempt < retry:
@@ -918,28 +810,21 @@ async def fetch_gift_satellite(endpoint: str, params: dict = None, retry: int = 
     return None
 
 
-# ==========================================
-# NFTMATCH API
-# ==========================================
 async def fetch_nftmatch(endpoint: str, params: dict = None, retry: int = 2):
-    """GET-запрос к nftmatch.pro. Возвращает dict/list или None."""
     if not NFTMATCH_API_KEY:
         return None
     headers = {"Authorization": NFTMATCH_API_KEY}
     url = f"{NFTMATCH_BASE}{endpoint}"
+    session = get_http_session()
     for attempt in range(retry + 1):
         try:
-            async with get_http_session() as session:
-                async with session.get(
-                    url, headers=headers, params=params,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    elif resp.status == 429 and attempt < retry:
-                        await asyncio.sleep(1.5)
-                        continue
-                    return None
+            async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                elif resp.status == 429 and attempt < retry:
+                    await asyncio.sleep(1.5)
+                    continue
+                return None
         except Exception as e:
             print(f"NFTMatch error: {e}")
             if attempt < retry:
@@ -947,20 +832,8 @@ async def fetch_nftmatch(endpoint: str, params: dict = None, retry: int = 2):
     return None
 
 
-
-
 async def get_gift_card_data(slug: str) -> dict:
-    """
-    Собирает данные по подарку из Gift Satellite + nftmatch.pro.
-    Возвращает dict с ключами:
-      slug, collection_name, model, backdrop, symbol, number,
-      floor_ton, collection_floor_ton,
-      mono_score (float 0-100 или None),
-      model_offers (list из Gift Satellite)
-    """
     result: dict = {"slug": slug}
-
-    # --- Gift Satellite: базовые данные и рыночные цены ---
     gift_info = await fetch_gift_satellite(f"/gift/by-slug/{slug}")
     if gift_info:
         result["collection_name"] = gift_info.get("collectionName", "")
@@ -975,30 +848,17 @@ async def get_gift_card_data(slug: str) -> dict:
     async def _noop():
         return None
 
-    # URL-encode имени коллекции (пробелы → %20), иначе aiohttp может отрезать хвост
     collection_encoded = urllib.parse.quote(collection, safe="")
 
-    # Загружаем офферы параллельно с nftmatch
     gs_task = asyncio.create_task(
         fetch_gift_satellite(f"/search/tg/{collection_encoded}") if collection else _noop()
     )
-
-    # --- nftmatch.pro: монохромность модели через список моделей коллекции ---
     nm_task = asyncio.create_task(
         fetch_nftmatch(f"/ListGifts/{collection_encoded}/AllModelNames") if collection else _noop()
     )
 
     offers_raw, nm_models = await asyncio.gather(gs_task, nm_task, return_exceptions=True)
 
-    # Логируем ошибки gather
-    if isinstance(offers_raw, Exception):
-        print(f"[get_gift_card_data] offers error: {offers_raw}")
-        offers_raw = None
-    if isinstance(nm_models, Exception):
-        print(f"[get_gift_card_data] nftmatch error: {nm_models}")
-        nm_models = None
-
-    # Gift Satellite офферы
     if isinstance(offers_raw, list):
         model_offers = [o for o in offers_raw if o.get("modelName") == model_name]
         result["model_offers"] = model_offers
@@ -1008,19 +868,14 @@ async def get_gift_card_data(slug: str) -> dict:
         all_prices = [o["normalizedPrice"] for o in offers_raw if o.get("normalizedPrice")]
         if all_prices:
             result["collection_floor_ton"] = min(all_prices)
-    else:
-        print(f"[get_gift_card_data] offers_raw not list: {type(offers_raw)} slug={slug}")
 
-    # nftmatch: монохромность
     if isinstance(nm_models, list) and model_name:
         for item in nm_models:
             if isinstance(item, dict) and item.get("nameModel", "").lower() == model_name.lower():
-                # isMonohrome — bool, но нам нужен % → берём из MatchV2ColorProfile если есть
                 result["is_monochrome"] = item.get("isMonohrome", False)
-                result["floor_ton_nm"] = item.get("floorPrice")  # floor из nftmatch (TON)
+                result["floor_ton_nm"] = item.get("floorPrice")
                 break
 
-    # Уточняем монохромность через MatchV2ColorProfile (даёт cubes с долями цветов)
     if collection and model_name and NFTMATCH_API_KEY:
         profile = await fetch_nftmatch(
             "/MonoCoof/MatchV2ColorProfile",
@@ -1029,7 +884,6 @@ async def get_gift_card_data(slug: str) -> dict:
         if isinstance(profile, dict):
             cubes = profile.get("cubes") or []
             if cubes:
-                # Монохромность = максимальная доля одного цвета среди всех кубов
                 weights = [c.get("weight", 0) for c in cubes if isinstance(c, dict)]
                 if weights:
                     total = sum(weights)
@@ -1040,17 +894,6 @@ async def get_gift_card_data(slug: str) -> dict:
 
 
 def format_gift_card(data: dict, exchange_cache: dict | None = None) -> str:
-    """
-    Форматирует карточку подарка в новом стиле:
-
-    🎁 Plush Pepe #274 (кликабельная ссылка)
-    ━━━━━━━━━━━━━━━━━━━━
-    ⚫️ Монохромность: 87%
-
-    💎 Рыночные данные:
-    ├ Floor (модель): 12.50 TON | 65.20 USDT | 5 980 RUB | 4 346 ⭐
-    └ Floor (коллекция): 8.10 TON | …
-    """
     if not data or not data.get("collection_name"):
         return "❌ Подарок не найден."
 
@@ -1062,19 +905,16 @@ def format_gift_card(data: dict, exchange_cache: dict | None = None) -> str:
     symbol = data.get("symbol", "")
 
     cache = exchange_cache or EXCHANGE_CACHE
-
     lines: list[str] = []
 
-    # Заголовок — кликабельная ссылка
     if slug:
         link = f'<a href="https://t.me/nft/{slug}">{html.escape(collection)} #{number}</a>'
     else:
         link = f"<b>{html.escape(collection)} #{number}</b>"
     lines.append(f"🎁 {link}")
 
-    # Атрибуты (Модель / Фон / Символ)
     attrs = []
-    if model:    attrs.append(f"Модель: <b>{html.escape(model)}</b>")
+    if model:   attrs.append(f"Модель: <b>{html.escape(model)}</b>")
     if backdrop: attrs.append(f"Фон: <b>{html.escape(backdrop)}</b>")
     if symbol:   attrs.append(f"Символ: <b>{html.escape(symbol)}</b>")
     if attrs:
@@ -1082,7 +922,6 @@ def format_gift_card(data: dict, exchange_cache: dict | None = None) -> str:
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
 
-    # Монохромность
     mono_score = data.get("mono_score")
     if mono_score is not None:
         bar_filled = round(mono_score / 10)
@@ -1113,8 +952,6 @@ def format_gift_card(data: dict, exchange_cache: dict | None = None) -> str:
 
     floor_ton = data.get("floor_ton") or data.get("floor_ton_nm")
     coll_floor = data.get("collection_floor_ton")
-
-    has_prices = floor_ton is not None or coll_floor is not None
 
     if floor_ton is not None and coll_floor is not None:
         lines.append(_price_line(floor_ton, "├ Floor (модель):"))
@@ -1246,11 +1083,11 @@ def format_math_expression(expr: str) -> str:
 
 
 async def fetch_json(url: str):
+    session = get_http_session()
     try:
-        async with get_http_session() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    return await resp.json()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                return await resp.json()
     except Exception:
         pass
     return None
@@ -1365,7 +1202,7 @@ async def send_currency_conversion(message: Message, amount: float, from_cur: st
     if not owner_id:
         owner_id = message.from_user.id
 
-    owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
+    owner_settings = users_cache.get(owner_id) or await users_collection.find_one({"user_id": owner_id}) or {}
     display_currencies = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
 
     if from_cur == "USD":
@@ -1479,7 +1316,7 @@ async def eval_mixed_currency(parsed):
 
 async def send_mixed_currency_conversion(message, parsed, result_usdt, owner_id):
     conn_id = getattr(message, "business_connection_id", None)
-    owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
+    owner_settings = users_cache.get(owner_id) or await users_collection.find_one({"user_id": owner_id}) or {}
     display_currencies = list(owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"]))
 
     expr_parts = []
@@ -1581,6 +1418,7 @@ async def on_startup():
         print(f"✅ Загружено активных мутов из базы: {len(muted_chats)}")
     except Exception as e:
         print(f"Ошибка загрузки мутов: {e}")
+
     try:
         all_conns = await connections_collection.find({}).to_list(length=None)
         for c in all_conns:
@@ -1589,7 +1427,7 @@ async def on_startup():
         all_users = await users_collection.find({}).to_list(length=None)
         for u in all_users:
             users_cache[u["user_id"]] = u
-        print(f"✅ Прогрет RAM-кэш: {len(connections_cache)} подключений")
+        print(f"✅ Прогрет RAM-кэш: {len(connections_cache)} подключений, {len(users_cache)} юзеров")
     except Exception as e:
         print(f"Ошибка прогрева кэша: {e}")
 
@@ -1626,7 +1464,7 @@ dp.startup.register(on_startup)
 # ГЛАВНОЕ МЕНЮ
 # ==========================================
 async def get_user_main_kb(user_id: int):
-    user_data = await users_collection.find_one({"user_id": user_id}) or {}
+    user_data = users_cache.get(user_id) or await users_collection.find_one({"user_id": user_id}) or {}
     is_afk = user_data.get("is_afk", False)
     format_mode = user_data.get("format_mode", [])
     if not isinstance(format_mode, list):
@@ -1657,21 +1495,24 @@ async def get_user_main_kb(user_id: int):
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    uid = message.from_user.id
     with suppress(Exception):
         await users_collection.update_one(
-            {"user_id": message.from_user.id},
-            {"$set": {"user_id": message.from_user.id}},
+            {"user_id": uid},
+            {"$set": {"user_id": uid}},
             upsert=True
         )
+        if uid not in users_cache:
+            users_cache[uid] = await users_collection.find_one({"user_id": uid}) or {}
 
-    if message.from_user.id != SUPERADMIN_ID and not await is_bot_connected(message.from_user.id):
+    if uid != SUPERADMIN_ID and not await is_bot_connected(uid):
         try:
             await message.answer_photo(photo=MENU_PHOTO, caption=get_connect_text(), reply_markup=get_connect_kb(), parse_mode="HTML")
         except Exception:
             await message.answer(get_connect_text(), reply_markup=get_connect_kb(), parse_mode="HTML")
         return
 
-    kb = await get_user_main_kb(message.from_user.id)
+    kb = await get_user_main_kb(uid)
     text = "👋 <b>Твой личный бот-секретарь.</b>\nУправляй настройками ниже:"
     try:
         await message.answer_photo(photo=MENU_PHOTO, caption=text, reply_markup=kb, parse_mode="HTML")
@@ -1681,8 +1522,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "check_connection")
 async def check_connection_handler(call: CallbackQuery):
-    conns = await connections_collection.find({"user_id": call.from_user.id}).to_list(length=None)
-    if not conns:
+    if not await is_bot_connected(call.from_user.id):
         await call.answer(
             "❌ Бот ещё не подключён.\n\n"
             "Открой настройки → Автоматизация чатов → Добавить бота → "
@@ -1710,7 +1550,8 @@ async def user_main_handler(call: CallbackQuery, state: FSMContext):
 # ФОРМАТИРОВАНИЕ (меню)
 # ==========================================
 async def _render_format_menu(call: CallbackQuery):
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    uid = call.from_user.id
+    user_data = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     mode = user_data.get("format_mode", [])
     if not isinstance(mode, list):
         mode = []
@@ -1743,7 +1584,8 @@ async def format_menu_handler(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("format_toggle|"))
 async def format_toggle_handler(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
+    uid = call.from_user.id
+    if uid != SUPERADMIN_ID and not await is_bot_connected(uid):
         return
     parts = call.data.split("|")
     if len(parts) != 2:
@@ -1752,7 +1594,7 @@ async def format_toggle_handler(call: CallbackQuery):
     if key not in ("caps", "bold", "italic"):
         return
 
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    user_data = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     mode = user_data.get("format_mode", [])
     if not isinstance(mode, list):
         mode = []
@@ -1763,16 +1605,18 @@ async def format_toggle_handler(call: CallbackQuery):
         mode.append(key)
 
     await users_collection.update_one(
-        {"user_id": call.from_user.id},
+        {"user_id": uid},
         {"$set": {"format_mode": mode}},
         upsert=True
     )
+    users_cache.setdefault(uid, {})["format_mode"] = mode
     await _render_format_menu(call)
 
 
 @dp.callback_query(F.data == "format_preview")
 async def format_preview_handler(call: CallbackQuery):
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    uid = call.from_user.id
+    user_data = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     mode = user_data.get("format_mode", [])
     if not mode:
         await call.answer("Включи хотя бы один стиль", show_alert=True)
@@ -1781,7 +1625,7 @@ async def format_preview_handler(call: CallbackQuery):
     formatted = apply_format(sample, mode)
     with suppress(Exception):
         await bot.send_message(
-            chat_id=call.from_user.id,
+            chat_id=uid,
             text=f"👁 <b>Предпросмотр:</b>\n\n{formatted}",
             parse_mode="HTML"
         )
@@ -2261,12 +2105,13 @@ async def force_unmute(call: CallbackQuery):
 # ==========================================
 @dp.callback_query(F.data == "afk_menu")
 async def afk_menu_handler(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
+    uid = call.from_user.id
+    if uid != SUPERADMIN_ID and not await is_bot_connected(uid):
         kb = get_connect_kb()
         await show_menu(call, get_connect_text(), kb, with_photo=True)
         return
 
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    user_data = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     is_afk = user_data.get("is_afk", False)
 
     if is_afk:
@@ -2290,7 +2135,7 @@ async def afk_menu_handler(call: CallbackQuery):
 
 
 async def get_afk_settings_kb(user_id: int):
-    user_data = await users_collection.find_one({"user_id": user_id}) or {}
+    user_data = users_cache.get(user_id) or await users_collection.find_one({"user_id": user_id}) or {}
     auto_afk = user_data.get("auto_afk", False)
     start_h = user_data.get("afk_start", 23)
     end_h = user_data.get("afk_end", 7)
@@ -2318,34 +2163,39 @@ async def afk_settings_handler(call: CallbackQuery):
 
 @dp.callback_query(F.data == "toggle_afk")
 async def toggle_afk_handler(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
+    uid = call.from_user.id
+    if uid != SUPERADMIN_ID and not await is_bot_connected(uid):
         return
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    user_data = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     new_status = not user_data.get("is_afk", False)
     await users_collection.update_one(
-        {"user_id": call.from_user.id},
+        {"user_id": uid},
         {"$set": {"is_afk": new_status}},
         upsert=True
     )
+    users_cache.setdefault(uid, {})["is_afk"] = new_status
     await afk_menu_handler(call)
 
 
 @dp.callback_query(F.data == "toggle_auto_afk")
 async def toggle_auto_afk(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
+    uid = call.from_user.id
+    if uid != SUPERADMIN_ID and not await is_bot_connected(uid):
         return
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    user_data = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     new_status = not user_data.get("auto_afk", False)
-    await users_collection.update_one({"user_id": call.from_user.id}, {"$set": {"auto_afk": new_status}}, upsert=True)
-    kb = await get_afk_settings_kb(call.from_user.id)
+    await users_collection.update_one({"user_id": uid}, {"$set": {"auto_afk": new_status}}, upsert=True)
+    users_cache.setdefault(uid, {})["auto_afk"] = new_status
+    kb = await get_afk_settings_kb(uid)
     await show_menu(call, "⚙️ <b>Настройки автоответчика:</b>", kb, with_photo=True)
 
 
 @dp.callback_query(F.data == "afk_set_text")
 async def afk_set_text(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
+    uid = call.from_user.id
+    if uid != SUPERADMIN_ID and not await is_bot_connected(uid):
         return
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    user_data = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     current = user_data.get("afk_text", "Владелец занят. 💤")
     if current is None:
         current = "Владелец занят. 💤"
@@ -2364,8 +2214,10 @@ async def save_afk_text(message: Message, state: FSMContext):
     if not message.text:
         await message.answer("⚠️ Отправь <b>текстовое</b> сообщение.", parse_mode="HTML")
         return
-    await users_collection.update_one({"user_id": message.from_user.id}, {"$set": {"afk_text": message.text}})
-    kb = await get_afk_settings_kb(message.from_user.id)
+    uid = message.from_user.id
+    await users_collection.update_one({"user_id": uid}, {"$set": {"afk_text": message.text}})
+    users_cache.setdefault(uid, {})["afk_text"] = message.text
+    kb = await get_afk_settings_kb(uid)
     await message.answer("✅ Сохранено!", reply_markup=kb)
     await state.clear()
 
@@ -2392,12 +2244,15 @@ async def save_afk_time(message: Message, state: FSMContext):
     try:
         parts = message.text.replace("-", " ").split()
         start_h, end_h = int(parts[0]), int(parts[1])
+        uid = message.from_user.id
         if 0 <= start_h <= 23 and 0 <= end_h <= 23:
             await users_collection.update_one(
-                {"user_id": message.from_user.id},
+                {"user_id": uid},
                 {"$set": {"afk_start": start_h, "afk_end": end_h}}
             )
-            kb = await get_afk_settings_kb(message.from_user.id)
+            users_cache.setdefault(uid, {})["afk_start"] = start_h
+            users_cache[uid]["afk_end"] = end_h
+            kb = await get_afk_settings_kb(uid)
             await message.answer("✅ Сохранено!", reply_markup=kb)
             await state.clear()
         else:
@@ -2408,9 +2263,10 @@ async def save_afk_time(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "afk_set_tz")
 async def afk_set_tz(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
+    uid = call.from_user.id
+    if uid != SUPERADMIN_ID and not await is_bot_connected(uid):
         return
-    user_data = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    user_data = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     current = user_data.get("tz_offset", 3)
 
     builder = InlineKeyboardBuilder()
@@ -2425,7 +2281,8 @@ async def afk_set_tz(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("afk_tz_set|"))
 async def afk_tz_set_handler(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
+    uid = call.from_user.id
+    if uid != SUPERADMIN_ID and not await is_bot_connected(uid):
         return
     try:
         offset = int(call.data.split("|")[1])
@@ -2433,10 +2290,11 @@ async def afk_tz_set_handler(call: CallbackQuery):
         return
     if -12 <= offset <= 14:
         await users_collection.update_one(
-            {"user_id": call.from_user.id},
+            {"user_id": uid},
             {"$set": {"tz_offset": offset}},
             upsert=True
         )
+        users_cache.setdefault(uid, {})["tz_offset"] = offset
     await afk_settings_handler(call)
 
 
@@ -2445,12 +2303,13 @@ async def afk_tz_set_handler(call: CallbackQuery):
 # ==========================================
 @dp.callback_query(F.data == "currency_settings")
 async def currency_settings_handler(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
+    uid = call.from_user.id
+    if uid != SUPERADMIN_ID and not await is_bot_connected(uid):
         kb = get_connect_kb()
         await show_menu(call, get_connect_text(), kb, with_photo=True)
         return
 
-    owner_settings = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    owner_settings = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
 
     builder = InlineKeyboardBuilder()
@@ -2467,23 +2326,25 @@ async def currency_settings_handler(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("cur_toggle|"))
 async def currency_toggle_handler(call: CallbackQuery):
-    if call.from_user.id != SUPERADMIN_ID and not await is_bot_connected(call.from_user.id):
+    uid = call.from_user.id
+    if uid != SUPERADMIN_ID and not await is_bot_connected(uid):
         return
     parts = call.data.split("|")
     if len(parts) != 2:
         return
     cur = parts[1]
-    owner_settings = await users_collection.find_one({"user_id": call.from_user.id}) or {}
+    owner_settings = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
     if cur in display:
         display.remove(cur)
     else:
         display.append(cur)
     await users_collection.update_one(
-        {"user_id": call.from_user.id},
+        {"user_id": uid},
         {"$set": {"display_currencies": display}},
         upsert=True
     )
+    users_cache.setdefault(uid, {})["display_currencies"] = display
     await currency_settings_handler(call)
 
 
@@ -2497,7 +2358,7 @@ async def user_mutes_handler(call: CallbackQuery):
         await show_menu(call, get_connect_text(), kb, with_photo=True)
         return
 
-    user_conns = await connections_collection.find({"user_id": call.from_user.id}).to_list(length=None)
+    user_conns = [c for c in connections_cache.values() if c.get("user_id") == call.from_user.id]
     conn_ids = [c["business_connection_id"] for c in user_conns]
     builder = InlineKeyboardBuilder()
     has_mutes = False
@@ -2536,11 +2397,8 @@ async def user_unmute_callback(call: CallbackQuery):
     mute_key = parts[1]
     try:
         conn, chat = mute_key.rsplit("_", 1)
-        owner_conn = await connections_collection.find_one({
-            "business_connection_id": conn,
-            "user_id": call.from_user.id
-        })
-        if not owner_conn and call.from_user.id != SUPERADMIN_ID:
+        owner_conn = connections_cache.get(conn)
+        if (not owner_conn or owner_conn.get("user_id") != call.from_user.id) and call.from_user.id != SUPERADMIN_ID:
             await call.answer("Нет доступа", show_alert=True)
             return
     except Exception:
@@ -2565,7 +2423,7 @@ async def user_unmute_callback(call: CallbackQuery):
 async def user_status_handler(call: CallbackQuery):
     owner_id = call.from_user.id
 
-    user_data = await users_collection.find_one({"user_id": owner_id}) or {}
+    user_data = users_cache.get(owner_id) or await users_collection.find_one({"user_id": owner_id}) or {}
     is_afk = user_data.get("is_afk", False)
     afk_text = user_data.get("afk_text") or "—"
     display_cur = user_data.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
@@ -2573,7 +2431,7 @@ async def user_status_handler(call: CallbackQuery):
     if not isinstance(format_mode, list):
         format_mode = []
 
-    conns = await connections_collection.find({"user_id": owner_id}).to_list(length=None)
+    conns = [c for c in connections_cache.values() if c.get("user_id") == owner_id]
     conn_ids = [c["business_connection_id"] for c in conns]
 
     total_archive = 0
@@ -2727,17 +2585,19 @@ async def on_business_connection(connection: BusinessConnection):
                 "can_edit_profile_photo": getattr(r, "can_edit_profile_photo", False),
                 "can_edit_username": getattr(r, "can_edit_username", False),
             }
+
+        doc_data = {
+            "business_connection_id": connection.id,
+            "user_id": connection.user.id,
+            "first_name": connection.user.first_name or "Без имени",
+            "username": connection.user.username or "",
+            "rights": rights_dict,
+            "updated_at": datetime.now(timezone.utc)
+        }
         connections_cache[connection.id] = doc_data
         await connections_collection.update_one(
             {"business_connection_id": connection.id},
-            {"$set": {
-                "business_connection_id": connection.id,
-                "user_id": connection.user.id,
-                "first_name": connection.user.first_name or "Без имени",
-                "username": connection.user.username or "",
-                "rights": rights_dict,
-                "updated_at": datetime.now(timezone.utc)
-            }},
+            {"$set": doc_data},
             upsert=True
         )
 
@@ -2751,6 +2611,7 @@ async def on_business_connection(connection: BusinessConnection):
                 parse_mode="HTML"
             )
     else:
+        connections_cache.pop(connection.id, None)
         with suppress(Exception):
             await connections_collection.delete_one({"business_connection_id": connection.id})
 
@@ -2795,7 +2656,7 @@ async def copy_message_superadmin(message: Message):
 
 
 @dp.business_message(F.text.lower().startswith(".вст"))
-@dp.message(F.text.lower().startswith(".вст"))
+@dp.business_message(F.text.lower().startswith(".вст"))
 async def paste_message_superadmin(message: Message):
     if message.from_user.id != SUPERADMIN_ID:
         return
@@ -2811,7 +2672,7 @@ async def paste_message_superadmin(message: Message):
 
     clip_data = copied_messages_cache.get(SUPERADMIN_ID)
     if not clip_data:
-        user_doc = await users_collection.find_one({"user_id": SUPERADMIN_ID}) or {}
+        user_doc = users_cache.get(SUPERADMIN_ID) or await users_collection.find_one({"user_id": SUPERADMIN_ID}) or {}
         clip_data = user_doc.get("copied_msg")
         if clip_data:
             copied_messages_cache[SUPERADMIN_ID] = clip_data
@@ -2852,7 +2713,7 @@ async def paste_message_superadmin(message: Message):
 @dp.business_message(F.text.lower().startswith(".мут"))
 async def mute_user(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
@@ -2896,7 +2757,7 @@ async def mute_user(message: Message):
 @dp.business_message(F.text.lower().startswith(".амут"))
 async def amute_command(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
@@ -2909,10 +2770,9 @@ async def amute_command(message: Message):
 
     await handle_owner_activity(owner_id, peer_id)
 
-    # .амут стоп — выключить защиту
     if raw.lower() in ("стоп", "stop", "off", "выкл"):
         active_amute.pop(key, None)
-        _amute_lock.pop(key, None)  # чистим Lock чтобы не утекал
+        _amute_lock.pop(key, None)
         with suppress(Exception):
             await bot.delete_business_messages(
                 business_connection_id=conn_id,
@@ -2929,14 +2789,11 @@ async def amute_command(message: Message):
     if not raw:
         return
 
-    # Синтаксис: .амут [N] текст  — N = секунды защиты (необязательно)
-    # Например: .амут 30 привет — защита 30 секунд
-    #           .амут привет     — защита 3 минуты (дефолт)
-    AMUTE_DEFAULT_SECS = 180  # 3 минуты по умолчанию
+    AMUTE_DEFAULT_SECS = 180
     until_ts: float
     m = re.match(r"^(\d+)\s+(.+)$", raw, re.DOTALL)
     if m:
-        secs = min(int(m.group(1)), 3600)  # максимум 1 час
+        secs = min(int(m.group(1)), 3600)
         text = m.group(2)
         until_ts = datetime.now(timezone.utc).timestamp() + (secs if secs > 0 else AMUTE_DEFAULT_SECS)
     else:
@@ -2964,7 +2821,7 @@ async def amute_command(message: Message):
         "text": text,
         "message_id": sent.message_id,
         "until_ts": until_ts,
-        "resends": 0,          # счётчик переотправок
+        "resends": 0,
     }
 
 
@@ -2985,7 +2842,7 @@ FAKE_ACTION_MAP = {
 @dp.business_message(F.text.lower().startswith(".фейк"))
 async def fake_action_command(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
@@ -3029,7 +2886,6 @@ async def fake_action_command(message: Message):
             await asyncio.sleep(4.3)
 
     task = asyncio.create_task(_run_fake())
-    # Когда задача завершится — удаляем из словаря чтобы не копились мёртвые записи
     task.add_done_callback(lambda t: active_fakes.pop(key, None))
     active_fakes[key] = task
 
@@ -3037,7 +2893,7 @@ async def fake_action_command(message: Message):
 @dp.business_message(F.text.regexp(r"^\.(\d+)\s+"))
 async def spam_command(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
@@ -3054,7 +2910,7 @@ async def spam_command(message: Message):
     for _ in range(count):
         with suppress(Exception):
             await bot.send_message(chat_id=peer_id, text=match.group(2), business_connection_id=conn_id)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.05)
 
 
 # ==========================================
@@ -3063,7 +2919,7 @@ async def spam_command(message: Message):
 @dp.business_message(F.text.lower().startswith(".п1"))
 async def type_animation_p1(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
     full_text = message.text[3:].strip()
@@ -3079,7 +2935,7 @@ async def type_animation_p1(message: Message):
     step = max(1, len(full_text) // 12)
     for i in range(step, len(full_text) + step, step):
         current = full_text[:i]
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.15)
         with suppress(Exception):
             await bot.edit_message_text(chat_id=peer_id, message_id=sent_msg.message_id, text=current, business_connection_id=conn_id)
 
@@ -3087,7 +2943,7 @@ async def type_animation_p1(message: Message):
 @dp.business_message(F.text.lower().startswith(".п2"))
 async def type_animation_p2(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
     full_text = message.text[3:].strip()
@@ -3103,10 +2959,10 @@ async def type_animation_p2(message: Message):
     step = max(1, len(full_text) // 12)
     for i in range(step, len(full_text) + step, step):
         current = full_text[:i]
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.15)
         with suppress(Exception):
             await bot.edit_message_text(chat_id=peer_id, message_id=sent_msg.message_id, text=current + "▌", business_connection_id=conn_id)
-    await asyncio.sleep(0.25)
+    await asyncio.sleep(0.15)
     with suppress(Exception):
         await bot.edit_message_text(chat_id=peer_id, message_id=sent_msg.message_id, text=full_text, business_connection_id=conn_id)
 
@@ -3114,7 +2970,7 @@ async def type_animation_p2(message: Message):
 @dp.business_message(F.text.lower().startswith(".п3"))
 async def type_animation_p3(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
     full_text = message.text[3:].strip()
@@ -3131,7 +2987,7 @@ async def type_animation_p3(message: Message):
     step = max(1, len(full_text) // 12)
     for i in range(step, len(full_text) + step, step):
         idx = min(i, len(full_text))
-        await asyncio.sleep(0.22)
+        await asyncio.sleep(0.12)
         correct = full_text[:idx]
         rnd = "".join(random.choice(alphabet) for _ in range(len(full_text) - idx))
         with suppress(Exception):
@@ -3144,7 +3000,7 @@ async def type_animation_p3(message: Message):
 @dp.business_message(F.text.lower().startswith(".танос"))
 async def anim_thanos(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
@@ -3168,7 +3024,7 @@ async def anim_thanos(message: Message):
         return
 
     self_destruct_ids[f"{conn_id}_{sent.message_id}"] = True
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(1.0)
 
     chars = list(raw_text)
     indices = [i for i, c in enumerate(chars) if c != " "]
@@ -3191,7 +3047,7 @@ async def anim_thanos(message: Message):
         if not current_str.strip():
             break
 
-        await asyncio.sleep(0.32)
+        await asyncio.sleep(0.2)
         with suppress(Exception):
             await bot.edit_message_text(
                 chat_id=peer_id,
@@ -3201,7 +3057,7 @@ async def anim_thanos(message: Message):
                 business_connection_id=conn_id
             )
 
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.2)
     with suppress(Exception):
         await bot.edit_message_text(
             chat_id=peer_id,
@@ -3210,7 +3066,7 @@ async def anim_thanos(message: Message):
             parse_mode="HTML",
             business_connection_id=conn_id
         )
-    await asyncio.sleep(0.7)
+    await asyncio.sleep(0.4)
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[sent.message_id])
 
@@ -3218,7 +3074,7 @@ async def anim_thanos(message: Message):
 @dp.business_message(F.text.lower().startswith(".пак"))
 async def anim_pacman(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
@@ -3251,7 +3107,7 @@ async def anim_pacman(message: Message):
         revealed = html.escape(raw_text[:pos])
         dots_left = "•" * min(n - pos, 20)
         frame = f"<code>{revealed}</code> {pac}<code>{dots_left}</code>"
-        await asyncio.sleep(0.28)
+        await asyncio.sleep(0.18)
         with suppress(Exception):
             await bot.edit_message_text(
                 chat_id=peer_id,
@@ -3261,7 +3117,7 @@ async def anim_pacman(message: Message):
                 business_connection_id=conn_id
             )
 
-    await asyncio.sleep(0.28)
+    await asyncio.sleep(0.18)
     with suppress(Exception):
         await bot.edit_message_text(
             chat_id=peer_id,
@@ -3275,7 +3131,7 @@ async def anim_pacman(message: Message):
 @dp.business_message(F.text.lower().startswith(".брут"))
 async def anim_brute(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
@@ -3308,7 +3164,7 @@ async def anim_brute(message: Message):
         spinning = "".join(random.choice(hex_chars) for _ in range(rem_len))
         pct = int((pos / n) * 100)
         frame = f"🔐 <code>{locked}{spinning}</code> <b>[{pct}%]</b>"
-        await asyncio.sleep(0.26)
+        await asyncio.sleep(0.16)
         with suppress(Exception):
             await bot.edit_message_text(
                 chat_id=peer_id,
@@ -3318,7 +3174,7 @@ async def anim_brute(message: Message):
                 business_connection_id=conn_id
             )
 
-    await asyncio.sleep(0.26)
+    await asyncio.sleep(0.16)
     with suppress(Exception):
         await bot.edit_message_text(
             chat_id=peer_id,
@@ -3345,7 +3201,7 @@ def _zalgoify(text: str, intensity: int) -> str:
 @dp.business_message(F.text.lower().startswith(".глитч"))
 async def anim_glitch(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
@@ -3370,7 +3226,7 @@ async def anim_glitch(message: Message):
         return
 
     for lvl in intensities:
-        await asyncio.sleep(0.28)
+        await asyncio.sleep(0.18)
         glitched = html.escape(_zalgoify(raw_text, lvl))
         prefix = random.choice(["⚡", "⚠️", "📡", "🔌"])
         with suppress(Exception):
@@ -3382,7 +3238,7 @@ async def anim_glitch(message: Message):
                 business_connection_id=conn_id
             )
 
-    await asyncio.sleep(0.28)
+    await asyncio.sleep(0.18)
     with suppress(Exception):
         await bot.edit_message_text(
             chat_id=peer_id,
@@ -3396,7 +3252,7 @@ async def anim_glitch(message: Message):
 @dp.business_message(F.text.lower().startswith(".табло"))
 async def anim_ticker(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data or message.from_user.id != owner_data["user_id"]:
         return
 
@@ -3433,7 +3289,7 @@ async def anim_ticker(message: Message):
 
     for pos in range(step, total_shifts + 1, step):
         window = padded[pos:pos + width].ljust(width)
-        await asyncio.sleep(0.28)
+        await asyncio.sleep(0.18)
         with suppress(Exception):
             await bot.edit_message_text(
                 chat_id=peer_id,
@@ -3443,7 +3299,7 @@ async def anim_ticker(message: Message):
                 business_connection_id=conn_id
             )
 
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.2)
     with suppress(Exception):
         await bot.edit_message_text(
             chat_id=peer_id,
@@ -3470,20 +3326,18 @@ async def process_gift_link_auto(message: Message):
     slug = tg_match.group(1)
 
     if conn_id:
-        owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+        owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
         peer_id = message.chat.id
 
         if not owner_data:
             if await _is_peer_muted_anywhere(peer_id):
-                print(f"🔍 NFT: Попытка удалить сообщение от чужого бота. conn_id={conn_id}")
                 try:
                     await bot.delete_business_messages(
                         business_connection_id=conn_id,
                         message_ids=[message.message_id]
                     )
-                    print(f"✅ NFT: УСПЕШНО УДАЛЕНО (чужой бот) {message.message_id}")
-                except Exception as e:
-                    print(f"❌ NFT: ОШИБКА УДАЛЕНИЯ (чужой бот): {type(e).__name__}: {e}")
+                except Exception:
+                    pass
             return
             
         owner_id = owner_data["user_id"]
@@ -3491,15 +3345,12 @@ async def process_gift_link_auto(message: Message):
         is_owner = (message.from_user.id == owner_id)
 
         if not is_owner and await is_chat_muted(conn_id, peer_id):
-            # Удаляем: и обычные сообщения собеседника, и сообщения чужих ботов
             if message.from_user.id != BOT_ID or is_foreign_bot(message):
                 with suppress(Exception):
                     await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
             return
 
-        with suppress(Exception):
-            await save_message_quick(message, conn_id, peer_id, owner_id, owner_data.get("first_name", "owner"), is_owner)
-        # Помечаем: catch-all handle_messages не должен сохранять это сообщение повторно
+        asyncio.create_task(save_message_quick(message, conn_id, peer_id, owner_id, owner_data.get("first_name", "owner"), is_owner))
         _handled_msg_ids[(conn_id, message.message_id)] = True
 
         if is_owner:
@@ -3517,7 +3368,6 @@ async def process_gift_link_auto(message: Message):
     with suppress(Exception):
         loading_msg = await bot.send_message(chat_id=message.chat.id, text="🔍 Анализирую...", business_connection_id=conn_id)
 
-    # Убедимся, что курсы загружены для конвертации цен
     if not EXCHANGE_CACHE:
         await force_update_all_rates()
 
@@ -3550,7 +3400,7 @@ async def auto_math_and_currency(message: Message):
         return
 
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     peer_id = message.chat.id
 
     if not owner_data:
@@ -3572,9 +3422,7 @@ async def auto_math_and_currency(message: Message):
         return
 
     owner_name = owner_data.get("first_name", "owner")
-    with suppress(Exception):
-        await save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner)
-    # Помечаем: catch-all handle_messages не должен сохранять это сообщение повторно
+    asyncio.create_task(save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner))
     _handled_msg_ids[(conn_id, message.message_id)] = True
 
     if is_owner:
@@ -3652,14 +3500,12 @@ async def auto_math_and_currency(message: Message):
 async def handle_messages(message: Message):
     conn_id = message.business_connection_id
 
-    # Пропускаем сообщения, уже обработанные специализированным хендлером (NFT, калькулятор)
     if _handled_msg_ids.get((conn_id, message.message_id)):
         return
 
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     peer_id = message.chat.id
 
-    # Если сообщение пришло через чужого бота (conn_id не наш) — проверяем мут по пиру
     if not owner_data:
         if await _is_peer_muted_anywhere(peer_id):
             with suppress(Exception):
@@ -3671,8 +3517,8 @@ async def handle_messages(message: Message):
 
     owner_id = owner_data["user_id"]
     owner_name = owner_data.get("first_name", "owner")
-    peer_id = message.chat.id
     is_owner = (message.from_user.id == owner_id)
+
     if is_owner:
         owner_settings = users_cache.get(owner_id) or {}
         mode = owner_settings.get("format_mode", [])
@@ -3683,7 +3529,6 @@ async def handle_messages(message: Message):
             and not message.text.startswith(".")
         )
 
-        # 1. СНАЧАЛА форматируем (мгновенно)
         if should_format:
             formatted = apply_format(message.text, mode)
             if formatted and formatted != message.text:
@@ -3696,21 +3541,14 @@ async def handle_messages(message: Message):
                         business_connection_id=conn_id
                     )
 
-        # 2. Сохранение в БД и AFK отправляем в фон (не ждем их!)
         asyncio.create_task(check_and_save_protected_media(message, owner_id))
         asyncio.create_task(save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner))
         asyncio.create_task(handle_owner_activity(owner_id, peer_id))
         return
 
     # --- Собеседник ---
-    with suppress(Exception):
-        await save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner)
+    asyncio.create_task(save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner))
 
-    # ── Защита .амут от обходов ──────────────────────────────────────────────
-    # Пока .амут активен — удаляем у собеседника:
-    #   • форварды (forward_origin)
-    #   • inline-ответы через другой бот (via_bot != наш бот)
-    #   • медиа с подписью (caption) — нельзя отредактировать обычный текст через фото
     amute_key = f"{conn_id}_{peer_id}"
     amute_session = active_amute.get(amute_key)
     if amute_session:
@@ -3727,10 +3565,8 @@ async def handle_messages(message: Message):
                     )
                 return
         else:
-            # Истекло — чистим
             active_amute.pop(amute_key, None)
             _amute_lock.pop(amute_key, None)
-    # ─────────────────────────────────────────────────────────────────────────
 
     if await is_chat_muted(conn_id, peer_id):
         if message.from_user.id != owner_id and (message.from_user.id != BOT_ID or is_foreign_bot(message)):
@@ -3738,7 +3574,7 @@ async def handle_messages(message: Message):
                 await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
         return
 
-    owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
+    owner_settings = users_cache.get(owner_id) or {}
     manual_afk = owner_settings.get("is_afk", False)
     in_schedule = (
         check_auto_afk(
@@ -3763,7 +3599,7 @@ async def handle_messages(message: Message):
 @dp.edited_business_message()
 async def catch_edits(message: Message):
     conn_id = message.business_connection_id
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
@@ -3772,7 +3608,6 @@ async def catch_edits(message: Message):
 
     new_text = message.text or message.caption or "[Без текста]"
 
-    # Защита .амут: если собеседник отредактировал наше .амут-сообщение — откатываем
     if not is_owner:
         key = f"{conn_id}_{peer_id}"
         session = active_amute.get(key)
@@ -3822,7 +3657,7 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
     conn_id = deleted.business_connection_id
     peer_id = deleted.chat.id
 
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
@@ -3838,26 +3673,21 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                 active_amute.pop(key, None)
                 _amute_lock.pop(key, None)
                 continue
-            # Проверяем не истекло ли время защиты
             until_ts = session.get("until_ts", 0)
             if datetime.now(timezone.utc).timestamp() >= until_ts:
-                # Время вышло — снимаем защиту и чистим Lock
                 active_amute.pop(key, None)
                 _amute_lock.pop(key, None)
                 continue
 
-            # Лимит переотправок — защита от бесконечного ping-pong
             resends = session.get("resends", 0)
             if resends >= 200:
                 active_amute.pop(key, None)
                 _amute_lock.pop(key, None)
                 continue
 
-            # Блокировка от race condition — два удаления одновременно → одно сообщение
             if key not in _amute_lock:
                 _amute_lock[key] = asyncio.Lock()
             async with _amute_lock[key]:
-                # Перепроверяем после блокировки
                 session = active_amute.get(key)
                 if not session or session.get("message_id") != msg_id:
                     continue
@@ -3920,7 +3750,7 @@ async def unmute_user(call: CallbackQuery):
         return
     mute_key = f"{conn_id}_{peer_id}"
 
-    owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
     if not owner_data:
         return
     owner_id = owner_data["user_id"]
