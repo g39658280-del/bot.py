@@ -58,66 +58,160 @@ CAPTION_LIMIT = 1024
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+
+
+
+async def _find_mute_owner_conn(sender_id: int, chat_id: int, incoming_conn_id: str) -> tuple[str | None, int | None]:
+    """
+    Проверяет, находится ли отправитель (sender_id) в муте в данном диалоге.
+    Возвращает (conn_id_владельца_мута, owner_id) или (None, None).
+    Работает в обе стороны:
+      1) Апдейт пришёл на подключение Владельца (sender_id == chat_id)
+      2) Апдейт пришёл на подключение самого замученного собеседника (sender_id != chat_id)
+    """
+    now = datetime.now(timezone.utc).timestamp()
+
+    # Случай 1: пишет собеседник, и апдейт пришёл со стороны Владельца (или чужого conn_id)
+    if sender_id == chat_id:
+        # Сначала проверяем прямое совпадение incoming_conn_id
+        mute_key = f"{incoming_conn_id}_{sender_id}"
+        if mute_key in muted_chats:
+            until_ts = muted_chats[mute_key]
+            if until_ts is None or now < until_ts:
+                conn_doc = await connections_collection.find_one({"business_connection_id": incoming_conn_id})
+                if conn_doc:
+                    return incoming_conn_id, conn_doc["user_id"]
+            else:
+                muted_chats.pop(mute_key, None)
+
+        # Ищем по всем активным мутам для этого sender_id
+        suffix = f"_{sender_id}"
+        for m_key, until_ts in list(muted_chats.items()):
+            if m_key.endswith(suffix):
+                if until_ts is None or now < until_ts:
+                    target_conn_id = m_key.rsplit("_", 1)[0]
+                    conn_doc = await connections_collection.find_one({"business_connection_id": target_conn_id})
+                    if conn_doc:
+                        return target_conn_id, conn_doc["user_id"]
+                else:
+                    muted_chats.pop(m_key, None)
+
+        # Фолбэк в MongoDB
+        doc = await mutes_collection.find_one({"peer_id": sender_id})
+        if doc:
+            until_ts = doc.get("until_ts")
+            if until_ts is None or now < until_ts:
+                muted_chats[doc["mute_key"]] = until_ts
+                return doc["conn_id"], doc["owner_id"]
+
+    # Случай 2: апдейт пришёл со стороны подключения САМОГО замученного (он пытается вызвать .амут в нашем боте)
+    # В этом случае sender_id — замученный, а chat_id — это ID Владельца, который его замутил!
+    else:
+        doc = await mutes_collection.find_one({"owner_id": chat_id, "peer_id": sender_id})
+        if doc:
+            until_ts = doc.get("until_ts")
+            if until_ts is None or now < until_ts:
+                muted_chats[doc["mute_key"]] = until_ts
+                return doc["conn_id"], doc["owner_id"]
+            else:
+                muted_chats.pop(doc["mute_key"], None)
+                with suppress(Exception):
+                    await mutes_collection.delete_one({"_id": doc["_id"]})
+
+    return None, None
+
+
+async def _sniper_delete_followup(bot_instance: Bot, owner_conn_id: str, msg_id: int):
+    """
+    Добивает сообщения (M+1, M+2, M+3), которые сторонний бизнес-бот отправляет
+    через 100-2000 мс после перехвата команды от замученного собеседника.
+    """
+    candidate_ids = [msg_id + 1, msg_id + 2, msg_id + 3]
+    for delay in (0.25, 0.55, 1.1, 2.2):
+        await asyncio.sleep(delay)
+        for cand_id in candidate_ids:
+            # Проверяем, не занят ли этот message_id обычным сообщением в другом чате Владельца
+            exists_in_other = await archive_collection.find_one({
+                "conn_id": owner_conn_id,
+                "message_id": cand_id
+            })
+            if not exists_in_other:
+                with suppress(Exception):
+                    await bot_instance.delete_business_messages(
+                        business_connection_id=owner_conn_id,
+                        message_ids=[cand_id]
+                    )
+
+
 class GlobalMuteMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: Message, data: dict):
-        # Работаем только с бизнес-сообщениями
         incoming_conn_id = getattr(event, "business_connection_id", None)
-        if not incoming_conn_id:
+        if not incoming_conn_id or not event.from_user:
             return await handler(event, data)
 
-        peer_id = event.chat.id
-        sender_id = event.from_user.id if event.from_user else None
+        sender_id = event.from_user.id
+        chat_id = event.chat.id
 
-        # Проверяем, замучен ли собеседник в каком-либо из наших подключений
-        if not await _is_peer_muted_anywhere(peer_id):
+        # Быстрое удаление сообщения чужого бота реплаем Владельца (достаточно ответить точкой ".")
+        if (
+            event.text in (".", ".дел", ".del")
+            and event.reply_to_message
+            and await _is_peer_muted_anywhere(chat_id)
+        ):
+            owner_conn = await connections_collection.find_one({"business_connection_id": incoming_conn_id})
+            if owner_conn and owner_conn["user_id"] == sender_id:
+                with suppress(Exception):
+                    await event.bot.delete_business_messages(
+                        business_connection_id=incoming_conn_id,
+                        message_ids=[event.reply_to_message.message_id, event.message_id]
+                    )
+                return
+
+        # Проверяем, замучен ли автор сообщения (sender_id) в этом чате
+        valid_owner_conn_id, owner_id = await _find_mute_owner_conn(sender_id, chat_id, incoming_conn_id)
+        if not valid_owner_conn_id:
             return await handler(event, data)
 
-        # Ищем ВСЕ активные подключения владельцев, у которых есть чат с этим собеседником
-        # или где собеседник находится в муте
-        # 1) Сначала пробуем подключение из самого события, если оно принадлежит нашему владельцу:
-        target_conn = await connections_collection.find_one({"business_connection_id": incoming_conn_id})
-
-        # 2) Если в incoming_conn_id пришел чужой ID (сторонний бот), ищем НАШЕ подключение владельца:
-        if not target_conn:
-            # Находим запись мута, чтобы узнать точный conn_id владельца
-            suffix = f"_{peer_id}"
-            target_conn_id = None
-            for mute_key in list(muted_chats.keys()):
-                if mute_key.endswith(suffix):
-                    target_conn_id = mute_key.rsplit("_", 1)[0]
-                    break
-
-            if target_conn_id:
-                target_conn = await connections_collection.find_one({"business_connection_id": target_conn_id})
-
-        if not target_conn:
-            # Если подключение владельца не найдено, пропускаем дальше
+        # Если пишет сам Владелец, который выдал мут — пропускаем
+        if sender_id == owner_id:
             return await handler(event, data)
 
-        owner_id = target_conn["user_id"]
-        valid_owner_conn_id = target_conn["business_connection_id"]
+        # Гасим активную сессию .амут, если нарушитель пытался запустить её через нашего бота
+        amute_key_1 = f"{incoming_conn_id}_{chat_id}"
+        amute_key_2 = f"{valid_owner_conn_id}_{sender_id}"
+        active_amute.pop(amute_key_1, None)
+        active_amute.pop(amute_key_2, None)
 
-        # Если пишет сам владелец или наш собственный бот — не удаляем
-        if sender_id == owner_id or sender_id == BOT_ID:
-            return await handler(event, data)
+        # 1. Если апдейт пришёл с подключения самого нарушителя (он тоже подключил нашего бота),
+        # сначала удаляем сообщение через его собственное подключение:
+        if incoming_conn_id != valid_owner_conn_id:
+            with suppress(Exception):
+                await event.bot.delete_business_messages(
+                    business_connection_id=incoming_conn_id,
+                    message_ids=[event.message_id]
+                )
 
-        # Выполняем удаление через корректный conn_id владельца
+        # 2. Удаляем сообщение через подключение Владельца:
         try:
             await event.bot.delete_business_messages(
                 business_connection_id=valid_owner_conn_id,
                 message_ids=[event.message_id]
             )
-            print(f"✅ [Mute] Сообщение {event.message_id} от {sender_id} удалено через подключение владельца {valid_owner_conn_id}")
-            return  # Прерываем обработку: сообщение удалено
+            print(f"✅ [Mute] Удалено сообщение {event.message_id} от {sender_id} (conn={valid_owner_conn_id})")
         except Exception as e:
-            print(f"❌ [Mute] Ошибка удаления сообщения {event.message_id}: {type(e).__name__}: {e}")
+            print(f"❌ [Mute] Ошибка удаления {event.message_id}: {e}")
 
-        return await handler(event, data)
+        # 3. Запускаем снайперское добивание M+1..M+3 на случай, если это была команда для чужого бота
+        if incoming_conn_id == valid_owner_conn_id:
+            asyncio.create_task(_sniper_delete_followup(event.bot, valid_owner_conn_id, event.message_id))
+
+        # ЖЕСТКО прерываем цепочку: ни .амут, ни анимации, ни калькулятор дальше не запустятся
+        return
 
 
-
-# Регистрируем Middleware на все бизнес-сообщения
-dp.business_message.middleware(GlobalMuteMiddleware())
+# Регистрируем как OUTER middleware и на новые сообщения, и на редактирования!
+dp.business_message.outer_middleware(GlobalMuteMiddleware())
+dp.edited_business_message.outer_middleware(GlobalMuteMiddleware())
 
 BOT_ID: int = 8855259798   # константа — наш бот
 BOT_USERNAME = "your_bot_username"
@@ -3692,6 +3786,10 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
         key = f"{conn_id}_{peer_id}"
         session = active_amute.get(key)
         if session and session.get("message_id") == msg_id:
+            if await mutes_collection.find_one({"owner_id": peer_id, "peer_id": owner_id}):
+                active_amute.pop(key, None)
+                _amute_lock.pop(key, None)
+                continue
             # Проверяем не истекло ли время защиты
             until_ts = session.get("until_ts", 0)
             if datetime.now(timezone.utc).timestamp() >= until_ts:
