@@ -64,24 +64,38 @@ class GlobalMuteMiddleware(BaseMiddleware):
         if not conn_id:
             return await handler(event, data)
 
+        # 1. Проверяем, что сообщение пришло не от владельца и не от нашего бота
+        owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+        if not owner_data:
+            return await handler(event, data)  # Чужое подключение, пропускаем
+
+        owner_id = owner_data["user_id"]
         sender_id = event.from_user.id
 
-        if sender_id == BOT_ID:
+        # Если пишет владелец или наш бот — пропускаем
+        if sender_id == owner_id or sender_id == BOT_ID:
             return await handler(event, data)
 
-        if await _is_peer_muted_anywhere(sender_id):
-            print(f"🔍 ПОЛУЧЕНО сообщение от {sender_id} через conn_id={conn_id}")
-            try:
-                await event.bot.delete_business_messages(
-                    business_connection_id=conn_id,
-                    message_ids=[event.message_id]
-                )
-                print(f"✅ УСПЕШНО УДАЛЕНО сообщение {event.message_id}")
-            except Exception as e:
-                print(f"❌ ОШИБКА УДАЛЕНИЯ: {type(e).__name__}: {e}")
-            return
+        # 2. Проверяем, включен ли мут для этого собеседника
+        peer_id = event.chat.id
+        if not await _is_peer_muted_anywhere(peer_id):
+            return await handler(event, data)
 
-        return await handler(event, data)
+        # 3. Если мут включен — удаляем сообщение
+        try:
+            await event.bot.delete_business_messages(
+                business_connection_id=conn_id,
+                message_ids=[event.message_id]
+            )
+            print(f"✅ Удалено сообщение от {sender_id} в муте")
+        except Exception as e:
+            # Здесь вы увидите ошибку, если Telegram не даст удалить сообщение
+            print(f"❌ Ошибка удаления: {e}")
+
+        # Сообщение удалено, дальше не передаем
+        return
+
+dp.business_message.middleware(GlobalMuteMiddleware())
 
 # Регистрируем Middleware на все бизнес-сообщения
 dp.business_message.middleware(GlobalMuteMiddleware())
