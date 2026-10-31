@@ -139,7 +139,19 @@ async def is_chat_muted(conn_id: str, peer_id: int) -> bool:
             await mutes_collection.delete_one({"mute_key": mute_key})
         return False
     return True
-
+    
+async def _is_peer_muted_anywhere(peer_id: int) -> bool:
+    """Проверяет, есть ли активный мут на этого пира в ЛЮБОМ нашем подключении."""
+    suffix = f"_{peer_id}"
+    now = datetime.now(timezone.utc).timestamp()
+    for mute_key, until_ts in list(muted_chats.items()):
+        if not mute_key.endswith(suffix):
+            continue
+        if until_ts is None or now < until_ts:
+            return True
+        else:
+            muted_chats.pop(mute_key, None)
+    return False
 
 async def handle_owner_activity(owner_id: int, peer_id: int):
     afk_cooldowns[(owner_id, peer_id)] = True
@@ -3293,8 +3305,16 @@ async def auto_math_and_currency(message: Message):
 
     conn_id = message.business_connection_id
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    peer_id = message.chat.id
+
     if not owner_data:
-        return
+        if await _is_peer_muted_anywhere(peer_id):
+            with suppress(Exception):
+                await bot.delete_business_messages(
+                    business_connection_id=conn_id,
+                    message_ids=[message.message_id]
+                )
+        returnn
     owner_id = owner_data["user_id"]
     peer_id = message.chat.id
     is_owner = (message.from_user.id == owner_id)
@@ -3391,7 +3411,16 @@ async def handle_messages(message: Message):
         return
 
     owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+    peer_id = message.chat.id
+
+    # Если сообщение пришло через чужого бота (conn_id не наш) — проверяем мут по пиру
     if not owner_data:
+        if await _is_peer_muted_anywhere(peer_id):
+            with suppress(Exception):
+                await bot.delete_business_messages(
+                    business_connection_id=conn_id,
+                    message_ids=[message.message_id]
+                )
         return
 
     owner_id = owner_data["user_id"]
