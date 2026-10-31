@@ -3322,7 +3322,7 @@ async def auto_math_and_currency(message: Message):
                     business_connection_id=conn_id,
                     message_ids=[message.message_id]
                 )
-        returnn
+        return
     owner_id = owner_data["user_id"]
     peer_id = message.chat.id
     is_owner = (message.from_user.id == owner_id)
