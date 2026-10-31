@@ -58,6 +58,14 @@ CAPTION_LIMIT = 1024
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+_http_session: aiohttp.ClientSession | None = None
+
+def get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=600, keepalive_timeout=60)
+        _http_session = aiohttp.ClientSession(connector=connector)
+    return _http_session
 
 
 
@@ -851,7 +859,7 @@ async def fetch_gift_satellite(endpoint: str, params: dict = None, retry: int = 
     url = f"{GIFT_SATELLITE_BASE}{endpoint}"
     for attempt in range(retry + 1):
         try:
-            async with aiohttp.ClientSession() as session:
+            async with get_http_session() as session:
                 async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 200:
                         return await resp.json()
@@ -877,7 +885,7 @@ async def fetch_nftmatch(endpoint: str, params: dict = None, retry: int = 2):
     url = f"{NFTMATCH_BASE}{endpoint}"
     for attempt in range(retry + 1):
         try:
-            async with aiohttp.ClientSession() as session:
+            async with get_http_session() as session:
                 async with session.get(
                     url, headers=headers, params=params,
                     timeout=aiohttp.ClientTimeout(total=15)
@@ -1195,7 +1203,7 @@ def format_math_expression(expr: str) -> str:
 
 async def fetch_json(url: str):
     try:
-        async with aiohttp.ClientSession() as session:
+        async with get_http_session() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     return await resp.json()
@@ -3610,30 +3618,21 @@ async def handle_messages(message: Message):
     owner_name = owner_data.get("first_name", "owner")
     peer_id = message.chat.id
     is_owner = (message.from_user.id == owner_id)
-
     if is_owner:
-        # Сохраняем защищенные медиа
-        await check_and_save_protected_media(message, owner_id)
-
-        # Получаем настройки форматирования
-        owner_settings = await users_collection.find_one({"user_id": owner_id}) or {}
+        owner_settings = users_cache.get(owner_id) or {}
         mode = owner_settings.get("format_mode", [])
         
-        # Сначала сохраняем сообщение в архив (в исходном виде)
-        doc = await save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner)
-
-        # Проверяем, нужно ли форматирование
         should_format = (
             isinstance(mode, list) and mode
             and message.text
             and not message.text.startswith(".")
         )
 
+        # 1. СНАЧАЛА форматируем (мгновенно)
         if should_format:
             formatted = apply_format(message.text, mode)
             if formatted and formatted != message.text:
-                try:
-                    # ИСПОЛЬЗУЕМ EDIT_MESSAGE_TEXT ВМЕСТО УДАЛЕНИЯ
+                with suppress(Exception):
                     await bot.edit_message_text(
                         chat_id=peer_id,
                         message_id=message.message_id,
@@ -3641,17 +3640,11 @@ async def handle_messages(message: Message):
                         parse_mode="HTML",
                         business_connection_id=conn_id
                     )
-                    # Обновляем текст в базе данных, если редактирование прошло успешно
-                    if doc:
-                        await archive_collection.update_one(
-                            {"_id": doc["_id"]},
-                            {"$set": {"text": formatted}}
-                        )
-                except Exception as e:
-                    print(f"❌ Ошибка форматирования (edit_message_text): {e}")
-                    # Если не удалось отредактировать, сообщение остается в исходном виде
 
-        await handle_owner_activity(owner_id, peer_id)
+        # 2. Сохранение в БД и AFK отправляем в фон (не ждем их!)
+        asyncio.create_task(check_and_save_protected_media(message, owner_id))
+        asyncio.create_task(save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner))
+        asyncio.create_task(handle_owner_activity(owner_id, peer_id))
         return
 
     # --- Собеседник ---
