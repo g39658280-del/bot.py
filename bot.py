@@ -64,33 +64,27 @@ class GlobalMuteMiddleware(BaseMiddleware):
         if not conn_id:
             return await handler(event, data)
 
-        owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
-        peer_id = event.chat.id
+        sender_id = event.from_user.id
 
-        if not owner_data:
-            # Сообщение пришло через ЧУЖОГО бота
-            if await _is_peer_muted_anywhere(peer_id):
-                with suppress(Exception):
-                    await event.bot.delete_business_messages(
-                        business_connection_id=conn_id,
-                        message_ids=[event.message_id]
-                    )
-                return  # СТОП! Дальше не передаем
-        else:
-            # Сообщение пришло через НАШЕГО бота
-            owner_id = owner_data["user_id"]
-            is_owner = (event.from_user.id == owner_id)
-            if not is_owner and await is_chat_muted(conn_id, peer_id):
-                # Если это не владелец и чат в муте — удаляем
-                if event.from_user.id != BOT_ID or is_foreign_bot(event):
-                    with suppress(Exception):
-                        await event.bot.delete_business_messages(
-                            business_connection_id=conn_id,
-                            message_ids=[event.message_id]
-                        )
-                    return  # СТОП! Дальше не передаем
+        if sender_id == BOT_ID:
+            return await handler(event, data)
+
+        if await _is_peer_muted_anywhere(sender_id):
+            print(f"🔍 ПОЛУЧЕНО сообщение от {sender_id} через conn_id={conn_id}")
+            try:
+                await event.bot.delete_business_messages(
+                    business_connection_id=conn_id,
+                    message_ids=[event.message_id]
+                )
+                print(f"✅ УСПЕШНО УДАЛЕНО сообщение {event.message_id}")
+            except Exception as e:
+                print(f"❌ ОШИБКА УДАЛЕНИЯ: {type(e).__name__}: {e}")
+            return
 
         return await handler(event, data)
+
+# Регистрируем Middleware на все бизнес-сообщения
+dp.business_message.middleware(GlobalMuteMiddleware())
 
 # Регистрируем Middleware на все бизнес-сообщения
 dp.business_message.middleware(GlobalMuteMiddleware())
@@ -3280,12 +3274,17 @@ async def process_gift_link_auto(message: Message):
 
         if not owner_data:
             if await _is_peer_muted_anywhere(peer_id):
-                with suppress(Exception):
+                print(f"🔍 NFT: Попытка удалить сообщение от чужого бота. conn_id={conn_id}")
+                try:
                     await bot.delete_business_messages(
                         business_connection_id=conn_id,
                         message_ids=[message.message_id]
                     )
+                    print(f"✅ NFT: УСПЕШНО УДАЛЕНО (чужой бот) {message.message_id}")
+                except Exception as e:
+                    print(f"❌ NFT: ОШИБКА УДАЛЕНИЯ (чужой бот): {type(e).__name__}: {e}")
             return
+            
         owner_id = owner_data["user_id"]
         peer_id = message.chat.id
         is_owner = (message.from_user.id == owner_id)
