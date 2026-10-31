@@ -60,45 +60,61 @@ dp = Dispatcher()
 
 class GlobalMuteMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: Message, data: dict):
-        conn_id = getattr(event, "business_connection_id", None)
-        if not conn_id:
+        # Работаем только с бизнес-сообщениями
+        incoming_conn_id = getattr(event, "business_connection_id", None)
+        if not incoming_conn_id:
             return await handler(event, data)
 
-        # 1. Проверяем, что сообщение пришло не от владельца и не от нашего бота
-        owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
-        if not owner_data:
-            return await handler(event, data)  # Чужое подключение, пропускаем
-
-        owner_id = owner_data["user_id"]
-        sender_id = event.from_user.id
-
-        # Если пишет владелец или наш бот — пропускаем
-        if sender_id == owner_id or sender_id == BOT_ID:
-            return await handler(event, data)
-
-        # 2. Проверяем, включен ли мут для этого собеседника
         peer_id = event.chat.id
+        sender_id = event.from_user.id if event.from_user else None
+
+        # Проверяем, замучен ли собеседник в каком-либо из наших подключений
         if not await _is_peer_muted_anywhere(peer_id):
             return await handler(event, data)
 
-        # 3. Если мут включен — удаляем сообщение
+        # Ищем ВСЕ активные подключения владельцев, у которых есть чат с этим собеседником
+        # или где собеседник находится в муте
+        # 1) Сначала пробуем подключение из самого события, если оно принадлежит нашему владельцу:
+        target_conn = await connections_collection.find_one({"business_connection_id": incoming_conn_id})
+
+        # 2) Если в incoming_conn_id пришел чужой ID (сторонний бот), ищем НАШЕ подключение владельца:
+        if not target_conn:
+            # Находим запись мута, чтобы узнать точный conn_id владельца
+            suffix = f"_{peer_id}"
+            target_conn_id = None
+            for mute_key in list(muted_chats.keys()):
+                if mute_key.endswith(suffix):
+                    target_conn_id = mute_key.rsplit("_", 1)[0]
+                    break
+
+            if target_conn_id:
+                target_conn = await connections_collection.find_one({"business_connection_id": target_conn_id})
+
+        if not target_conn:
+            # Если подключение владельца не найдено, пропускаем дальше
+            return await handler(event, data)
+
+        owner_id = target_conn["user_id"]
+        valid_owner_conn_id = target_conn["business_connection_id"]
+
+        # Если пишет сам владелец или наш собственный бот — не удаляем
+        if sender_id == owner_id or sender_id == BOT_ID:
+            return await handler(event, data)
+
+        # Выполняем удаление через корректный conn_id владельца
         try:
             await event.bot.delete_business_messages(
-                business_connection_id=conn_id,
+                business_connection_id=valid_owner_conn_id,
                 message_ids=[event.message_id]
             )
-            print(f"✅ Удалено сообщение от {sender_id} в муте")
+            print(f"✅ [Mute] Сообщение {event.message_id} от {sender_id} удалено через подключение владельца {valid_owner_conn_id}")
+            return  # Прерываем обработку: сообщение удалено
         except Exception as e:
-            # Здесь вы увидите ошибку, если Telegram не даст удалить сообщение
-            print(f"❌ Ошибка удаления: {e}")
+            print(f"❌ [Mute] Ошибка удаления сообщения {event.message_id}: {type(e).__name__}: {e}")
 
-        # Сообщение удалено, дальше не передаем
-        return
+        return await handler(event, data)
 
-dp.business_message.middleware(GlobalMuteMiddleware())
 
-# Регистрируем Middleware на все бизнес-сообщения
-dp.business_message.middleware(GlobalMuteMiddleware())
 
 # Регистрируем Middleware на все бизнес-сообщения
 dp.business_message.middleware(GlobalMuteMiddleware())
@@ -187,9 +203,11 @@ async def is_chat_muted(conn_id: str, peer_id: int) -> bool:
     return True
     
 async def _is_peer_muted_anywhere(peer_id: int) -> bool:
-    """Проверяет, есть ли активный мут на этого пира в ЛЮБОМ нашем подключении."""
+    """Проверяет, есть ли активный мут на этого пира в памяти или в БД."""
     suffix = f"_{peer_id}"
     now = datetime.now(timezone.utc).timestamp()
+
+    # 1. Проверка локального кэша
     for mute_key, until_ts in list(muted_chats.items()):
         if not mute_key.endswith(suffix):
             continue
@@ -197,6 +215,18 @@ async def _is_peer_muted_anywhere(peer_id: int) -> bool:
             return True
         else:
             muted_chats.pop(mute_key, None)
+
+    # 2. Фолбэк на базу данных
+    doc = await mutes_collection.find_one({"peer_id": peer_id})
+    if doc:
+        until_ts = doc.get("until_ts")
+        if until_ts is None or now < until_ts:
+            muted_chats[doc["mute_key"]] = until_ts
+            return True
+        else:
+            with suppress(Exception):
+                await mutes_collection.delete_one({"_id": doc["_id"]})
+
     return False
 
 async def handle_owner_activity(owner_id: int, peer_id: int):
