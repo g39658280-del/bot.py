@@ -151,6 +151,38 @@ async def _sniper_delete_followup(bot_instance: Bot, owner_conn_id: str, msg_id:
                     )
 
 
+def _get_mute_owner_conn_sync(sender_id: int, chat_id: int, incoming_conn_id: str) -> tuple[str | None, int | None]:
+    now = datetime.now(timezone.utc).timestamp()
+    
+    # 1. Проверяем прямое совпадение
+    mute_key = f"{incoming_conn_id}_{chat_id}"
+    if mute_key in muted_chats:
+        until_ts = muted_chats[mute_key]
+        if until_ts is None or now < until_ts:
+            conn_doc = connections_cache.get(incoming_conn_id)
+            if conn_doc:
+                return incoming_conn_id, conn_doc["user_id"]
+        else:
+            muted_chats.pop(mute_key, None)
+
+    # 2. Проверяем все активные муты в памяти
+    for m_key, until_ts in list(muted_chats.items()):
+        if until_ts is not None and now >= until_ts:
+            muted_chats.pop(m_key, None)
+            continue
+        conn_part, muted_peer_str = m_key.rsplit("_", 1)
+        muted_peer_id = int(muted_peer_str)
+        conn_doc = connections_cache.get(conn_part)
+        if not conn_doc:
+            continue
+        owner_id = conn_doc["user_id"]
+
+        # Если отправитель — замученный собеседник в чате с этим владельцем
+        if sender_id == muted_peer_id and (chat_id == muted_peer_id or chat_id == owner_id):
+            return conn_part, owner_id
+
+    return None, None
+
 class GlobalMuteMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: Message, data: dict):
         incoming_conn_id = getattr(event, "business_connection_id", None)
@@ -160,20 +192,31 @@ class GlobalMuteMiddleware(BaseMiddleware):
         sender_id = event.from_user.id
         chat_id = event.chat.id
 
-        # Быстрое удаление сообщения чужого бота реплаем Владельца (достаточно ответить точкой ".")
-        if (
-            event.text in (".", ".дел", ".del")
-            and event.reply_to_message
-            and await _is_peer_muted_anywhere(chat_id)
-        ):
-            owner_conn = await connections_collection.find_one({"business_connection_id": incoming_conn_id})
-            if owner_conn and owner_conn["user_id"] == sender_id:
-                with suppress(Exception):
-                    await event.bot.delete_business_messages(
-                        business_connection_id=incoming_conn_id,
-                        message_ids=[event.reply_to_message.message_id, event.message_id]
-                    )
-                return
+        valid_owner_conn_id, owner_id = _get_mute_owner_conn_sync(sender_id, chat_id, incoming_conn_id)
+        if not valid_owner_conn_id or sender_id == owner_id or sender_id == BOT_ID:
+            return await handler(event, data)
+
+        # Запускаем удаление параллельно
+        tasks = [
+            event.bot.delete_business_messages(
+                business_connection_id=valid_owner_conn_id,
+                message_ids=[event.message_id]
+            )
+        ]
+        if incoming_conn_id != valid_owner_conn_id and incoming_conn_id in connections_cache:
+            tasks.append(
+                event.bot.delete_business_messages(
+                    business_connection_id=incoming_conn_id,
+                    message_ids=[event.message_id]
+                )
+            )
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        return
+
+# Не забудь заменить регистрацию на outer_middleware
+dp.business_message.outer_middleware(GlobalMuteMiddleware())
+dp.edited_business_message.outer_middleware(GlobalMuteMiddleware())
 
         # Проверяем, замучен ли автор сообщения (sender_id) в этом чате
         valid_owner_conn_id, owner_id = await _find_mute_owner_conn(sender_id, chat_id, incoming_conn_id)
@@ -233,7 +276,8 @@ try:
     mutes_collection = db['mutes']
 except Exception as e:
     print(f"Ошибка БД: {e}")
-
+connections_cache: dict[str, dict] = {}
+users_cache: dict[int, dict] = {}
 muted_chats: dict[str, float | None] = {}
 afk_cooldowns = TTLCache(maxsize=2000, ttl=300)
 # active_amute: dict без TTL — сессия живёт бессрочно до явного .амут стоп
@@ -1537,6 +1581,17 @@ async def on_startup():
         print(f"✅ Загружено активных мутов из базы: {len(muted_chats)}")
     except Exception as e:
         print(f"Ошибка загрузки мутов: {e}")
+    try:
+        all_conns = await connections_collection.find({}).to_list(length=None)
+        for c in all_conns:
+            connections_cache[c["business_connection_id"]] = c
+
+        all_users = await users_collection.find({}).to_list(length=None)
+        for u in all_users:
+            users_cache[u["user_id"]] = u
+        print(f"✅ Прогрет RAM-кэш: {len(connections_cache)} подключений")
+    except Exception as e:
+        print(f"Ошибка прогрева кэша: {e}")
 
     asyncio.create_task(update_rates_loop())
     loop = asyncio.get_running_loop()
@@ -2672,7 +2727,7 @@ async def on_business_connection(connection: BusinessConnection):
                 "can_edit_profile_photo": getattr(r, "can_edit_profile_photo", False),
                 "can_edit_username": getattr(r, "can_edit_username", False),
             }
-
+        connections_cache[connection.id] = doc_data
         await connections_collection.update_one(
             {"business_connection_id": connection.id},
             {"$set": {
@@ -3910,4 +3965,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    with suppress(ImportError):
+        import uvloop
+        uvloop.install()
     asyncio.run(main())
