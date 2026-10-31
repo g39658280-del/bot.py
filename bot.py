@@ -4,6 +4,7 @@ import asyncio
 import random
 import html
 import re
+import urllib.parse
 import json
 import aiohttp
 import tempfile
@@ -56,7 +57,7 @@ CAPTION_LIMIT = 1024
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-BOT_ID: int | None = None
+BOT_ID: int = 8855259798   # константа — наш бот
 BOT_USERNAME = "your_bot_username"
 
 try:
@@ -71,7 +72,9 @@ except Exception as e:
 
 muted_chats: dict[str, float | None] = {}
 afk_cooldowns = TTLCache(maxsize=2000, ttl=300)
-active_amute = TTLCache(maxsize=1000, ttl=15)
+# active_amute: dict без TTL — сессия живёт бессрочно до явного .амут стоп
+# Структура: { "conn_id_peer_id": {"text": str, "message_id": int, "until_ts": float|None} }
+active_amute: dict[str, dict] = {}
 action_dedup = TTLCache(maxsize=2000, ttl=4)
 self_destruct_ids = TTLCache(maxsize=1000, ttl=30)
 active_fakes: dict[str, asyncio.Task] = {}
@@ -162,6 +165,31 @@ async def handle_owner_activity(owner_id: int, peer_id: int):
 async def is_bot_connected(user_id: int) -> bool:
     conn = await connections_collection.find_one({"user_id": user_id})
     return bool(conn)
+
+
+def is_foreign_bot(message) -> bool:
+    """
+    Возвращает True если сообщение отправлено ботом, который НЕ является нашим ботом.
+    Используется для блокировки обхода мута через чужих бизнес-ботов.
+    Проверяем:
+      1. from_user.is_bot — явный флаг бота
+      2. via_bot — сообщение отправлено через inline-бота
+      3. from_user.id == BOT_ID — пропускаем только себя
+    """
+    u = getattr(message, "from_user", None)
+    if u is None:
+        return False
+    # Наш бот — не блокируем
+    if u.id == BOT_ID:
+        return False
+    # Любой другой бот — блокируем
+    if getattr(u, "is_bot", False):
+        return True
+    # Сообщение через inline-бота (via_bot) — блокируем
+    via = getattr(message, "via_bot", None)
+    if via and via.id != BOT_ID:
+        return True
+    return False
 
 
 def get_connect_kb():
@@ -713,17 +741,28 @@ async def get_gift_card_data(slug: str) -> dict:
     async def _noop():
         return None
 
+    # URL-encode имени коллекции (пробелы → %20), иначе aiohttp может отрезать хвост
+    collection_encoded = urllib.parse.quote(collection, safe="")
+
     # Загружаем офферы параллельно с nftmatch
     gs_task = asyncio.create_task(
-        fetch_gift_satellite(f"/search/tg/{collection}") if collection else _noop()
+        fetch_gift_satellite(f"/search/tg/{collection_encoded}") if collection else _noop()
     )
 
     # --- nftmatch.pro: монохромность модели через список моделей коллекции ---
     nm_task = asyncio.create_task(
-        fetch_nftmatch(f"/ListGifts/{collection}/AllModelNames") if collection else _noop()
+        fetch_nftmatch(f"/ListGifts/{collection_encoded}/AllModelNames") if collection else _noop()
     )
 
     offers_raw, nm_models = await asyncio.gather(gs_task, nm_task, return_exceptions=True)
+
+    # Логируем ошибки gather
+    if isinstance(offers_raw, Exception):
+        print(f"[get_gift_card_data] offers error: {offers_raw}")
+        offers_raw = None
+    if isinstance(nm_models, Exception):
+        print(f"[get_gift_card_data] nftmatch error: {nm_models}")
+        nm_models = None
 
     # Gift Satellite офферы
     if isinstance(offers_raw, list):
@@ -735,6 +774,8 @@ async def get_gift_card_data(slug: str) -> dict:
         all_prices = [o["normalizedPrice"] for o in offers_raw if o.get("normalizedPrice")]
         if all_prices:
             result["collection_floor_ton"] = min(all_prices)
+    else:
+        print(f"[get_gift_card_data] offers_raw not list: {type(offers_raw)} slug={slug}")
 
     # nftmatch: монохромность
     if isinstance(nm_models, list) and model_name:
@@ -1047,7 +1088,10 @@ async def force_update_all_rates():
 
 async def update_rates_loop():
     while True:
-        await force_update_all_rates()
+        try:
+            await force_update_all_rates()
+        except Exception as e:
+            print(f"❌ update_rates_loop error: {e}")
         await asyncio.sleep(300)
 
 
@@ -1310,7 +1354,7 @@ async def on_startup():
 
     try:
         me = await bot.get_me()
-        BOT_ID = me.id
+        global BOT_USERNAME
         BOT_USERNAME = me.username or "your_bot_username"
         print(f"✅ Бот: @{BOT_USERNAME} (ID: {BOT_ID})")
     except Exception as e:
@@ -2614,25 +2658,69 @@ async def amute_command(message: Message):
     if message.from_user.id != owner_id:
         return
 
-    text = message.text[5:].strip()
-    if not text:
-        return
-
+    raw = message.text[5:].strip()
     peer_id = message.chat.id
+    key = f"{conn_id}_{peer_id}"
+
     await handle_owner_activity(owner_id, peer_id)
 
+    # .амут стоп — выключить защиту
+    if raw.lower() in ("стоп", "stop", "off", "выкл"):
+        active_amute.pop(key, None)
+        _amute_lock.pop(key, None)  # чистим Lock чтобы не утекал
+        with suppress(Exception):
+            await bot.delete_business_messages(
+                business_connection_id=conn_id,
+                message_ids=[message.message_id]
+            )
+        with suppress(Exception):
+            await bot.send_message(
+                chat_id=peer_id,
+                text="🔓 Защита сообщения снята.",
+                business_connection_id=conn_id
+            )
+        return
+
+    if not raw:
+        return
+
+    # Синтаксис: .амут [N] текст  — N = секунды защиты (необязательно)
+    # Например: .амут 30 привет — защита 30 секунд
+    #           .амут привет     — защита 3 минуты (дефолт)
+    AMUTE_DEFAULT_SECS = 180  # 3 минуты по умолчанию
+    until_ts: float
+    m = re.match(r"^(\d+)\s+(.+)$", raw, re.DOTALL)
+    if m:
+        secs = min(int(m.group(1)), 3600)  # максимум 1 час
+        text = m.group(2)
+        until_ts = datetime.now(timezone.utc).timestamp() + (secs if secs > 0 else AMUTE_DEFAULT_SECS)
+    else:
+        text = raw
+        until_ts = datetime.now(timezone.utc).timestamp() + AMUTE_DEFAULT_SECS
+
     with suppress(Exception):
-        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+        await bot.delete_business_messages(
+            business_connection_id=conn_id,
+            message_ids=[message.message_id]
+        )
 
     sent = None
     with suppress(Exception):
-        sent = await bot.send_message(chat_id=peer_id, text=text, business_connection_id=conn_id)
+        sent = await bot.send_message(
+            chat_id=peer_id,
+            text=text,
+            business_connection_id=conn_id
+        )
 
     if not sent:
         return
 
-    key = f"{conn_id}_{peer_id}"
-    active_amute[key] = {"text": text, "message_id": sent.message_id}
+    active_amute[key] = {
+        "text": text,
+        "message_id": sent.message_id,
+        "until_ts": until_ts,
+        "resends": 0,          # счётчик переотправок
+    }
 
 
 # ==========================================
@@ -2696,6 +2784,8 @@ async def fake_action_command(message: Message):
             await asyncio.sleep(4.3)
 
     task = asyncio.create_task(_run_fake())
+    # Когда задача завершится — удаляем из словаря чтобы не копились мёртвые записи
+    task.add_done_callback(lambda t: active_fakes.pop(key, None))
     active_fakes[key] = task
 
 
@@ -2711,7 +2801,7 @@ async def spam_command(message: Message):
     match = re.match(r"^\.(\d+)\s+(.*)", message.text, re.DOTALL)
     if not match:
         return
-    count = min(int(match.group(1)), 50)
+    count = min(int(match.group(1)), 20)
     peer_id = message.chat.id
     await handle_owner_activity(owner_id, peer_id)
     with suppress(Exception):
@@ -2719,7 +2809,7 @@ async def spam_command(message: Message):
     for _ in range(count):
         with suppress(Exception):
             await bot.send_message(chat_id=peer_id, text=match.group(2), business_connection_id=conn_id)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
 
 # ==========================================
@@ -3143,7 +3233,8 @@ async def process_gift_link_auto(message: Message):
         is_owner = (message.from_user.id == owner_id)
 
         if not is_owner and await is_chat_muted(conn_id, peer_id):
-            if message.from_user.id != BOT_ID:
+            # Удаляем: и обычные сообщения собеседника, и сообщения чужих ботов
+            if message.from_user.id != BOT_ID or is_foreign_bot(message):
                 with suppress(Exception):
                     await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
             return
@@ -3209,7 +3300,7 @@ async def auto_math_and_currency(message: Message):
     is_owner = (message.from_user.id == owner_id)
 
     if not is_owner and await is_chat_muted(conn_id, peer_id):
-        if message.from_user.id != BOT_ID:
+        if message.from_user.id != BOT_ID or is_foreign_bot(message):
             with suppress(Exception):
                 await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
         return
@@ -3355,8 +3446,34 @@ async def handle_messages(message: Message):
     with suppress(Exception):
         await save_message_quick(message, conn_id, peer_id, owner_id, owner_name, is_owner)
 
+    # ── Защита .амут от обходов ──────────────────────────────────────────────
+    # Пока .амут активен — удаляем у собеседника:
+    #   • форварды (forward_origin)
+    #   • inline-ответы через другой бот (via_bot != наш бот)
+    #   • медиа с подписью (caption) — нельзя отредактировать обычный текст через фото
+    amute_key = f"{conn_id}_{peer_id}"
+    amute_session = active_amute.get(amute_key)
+    if amute_session:
+        until_ts = amute_session.get("until_ts", 0)
+        if datetime.now(timezone.utc).timestamp() < until_ts:
+            is_forward = getattr(message, "forward_origin", None) is not None
+            via = getattr(message, "via_bot", None)
+            is_via_foreign = via is not None and via.id != BOT_ID
+            if is_forward or is_via_foreign:
+                with suppress(Exception):
+                    await bot.delete_business_messages(
+                        business_connection_id=conn_id,
+                        message_ids=[message.message_id]
+                    )
+                return
+        else:
+            # Истекло — чистим
+            active_amute.pop(amute_key, None)
+            _amute_lock.pop(amute_key, None)
+    # ─────────────────────────────────────────────────────────────────────────
+
     if await is_chat_muted(conn_id, peer_id):
-        if message.from_user.id != owner_id and message.from_user.id != BOT_ID:
+        if message.from_user.id != owner_id and (message.from_user.id != BOT_ID or is_foreign_bot(message)):
             with suppress(Exception):
                 await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
         return
@@ -3394,6 +3511,22 @@ async def catch_edits(message: Message):
     is_owner = (message.from_user.id == owner_id)
 
     new_text = message.text or message.caption or "[Без текста]"
+
+    # Защита .амут: если собеседник отредактировал наше .амут-сообщение — откатываем
+    if not is_owner:
+        key = f"{conn_id}_{peer_id}"
+        session = active_amute.get(key)
+        if session and session.get("message_id") == message.message_id:
+            until_ts = session.get("until_ts", 0)
+            if datetime.now(timezone.utc).timestamp() < until_ts:
+                with suppress(Exception):
+                    await bot.edit_message_text(
+                        chat_id=peer_id,
+                        message_id=message.message_id,
+                        text=session["text"],
+                        business_connection_id=conn_id
+                    )
+                return
 
     old_doc = await archive_collection.find_one({
         "conn_id": conn_id,
@@ -3441,11 +3574,26 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
         key = f"{conn_id}_{peer_id}"
         session = active_amute.get(key)
         if session and session.get("message_id") == msg_id:
-            # Блокировка от race condition — два одновременных удаления не должны слать два сообщения
+            # Проверяем не истекло ли время защиты
+            until_ts = session.get("until_ts", 0)
+            if datetime.now(timezone.utc).timestamp() >= until_ts:
+                # Время вышло — снимаем защиту и чистим Lock
+                active_amute.pop(key, None)
+                _amute_lock.pop(key, None)
+                continue
+
+            # Лимит переотправок — защита от бесконечного ping-pong
+            resends = session.get("resends", 0)
+            if resends >= 200:
+                active_amute.pop(key, None)
+                _amute_lock.pop(key, None)
+                continue
+
+            # Блокировка от race condition — два удаления одновременно → одно сообщение
             if key not in _amute_lock:
                 _amute_lock[key] = asyncio.Lock()
             async with _amute_lock[key]:
-                # Перепроверяем после получения блокировки
+                # Перепроверяем после блокировки
                 session = active_amute.get(key)
                 if not session or session.get("message_id") != msg_id:
                     continue
@@ -3458,6 +3606,7 @@ async def catch_deletions(deleted: BusinessMessagesDeleted):
                     )
                 if new_sent:
                     session["message_id"] = new_sent.message_id
+                    session["resends"] = session.get("resends", 0) + 1
             continue
 
         old_msg = await archive_collection.find_one({
