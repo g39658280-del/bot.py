@@ -3238,7 +3238,15 @@ async def process_gift_link_auto(message: Message):
 
     if conn_id:
         owner_data = await connections_collection.find_one({"business_connection_id": conn_id})
+        peer_id = message.chat.id
+
         if not owner_data:
+            if await _is_peer_muted_anywhere(peer_id):
+                with suppress(Exception):
+                    await bot.delete_business_messages(
+                        business_connection_id=conn_id,
+                        message_ids=[message.message_id]
+                    )
             return
         owner_id = owner_data["user_id"]
         peer_id = message.chat.id
