@@ -3843,7 +3843,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    with suppress(ImportError):
-        import uvloop
-        uvloop.install()
     asyncio.run(main())
