@@ -52,7 +52,10 @@ GIFT_SATELLITE_TOKEN = os.environ.get(
 )
 GIFT_SATELLITE_BASE = "https://gift-satellite.dev/api"
 
-NFTMATCH_API_KEY = os.environ.get("NFTMATCH_API_KEY", "")
+NFTMATCH_API_KEY = os.environ.get(
+    "NFTMATCH_API_KEY",
+    "6a818eac458d1f1943cdafe86a63f30adfc55453b6930b01b48bb4eeaae12310"
+)
 NFTMATCH_BASE = "https://nftmatch.pro/api"
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -437,18 +440,16 @@ def format_mode_label(mode: list) -> str:
 
 
 # ==========================================
-# GOOGLE DRIVE
+# GOOGLE DRIVE (ПОТОКОБЕЗОПАСНЫЙ)
 # ==========================================
-_drive_service = None
 _folder_cache = TTLCache(maxsize=1000, ttl=86400)
 drive_lock = asyncio.Lock()
 ROOT_FOLDER_NAME = "TelegramArchiveBot"
 
 
-def _init_drive():
-    global _drive_service
+def get_drive_service():
+    """Создает НОВУЮ изолированную сессию для каждого потока (защита от SSL и double free)"""
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
-        print("⚠️ Google Drive: ключи не заданы в переменных окружения")
         return None
     try:
         creds = Credentials(
@@ -460,24 +461,18 @@ def _init_drive():
             scopes=["https://www.googleapis.com/auth/drive.file"],
         )
         creds.refresh(Request())
-        _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        print("✅ Google Drive подключён")
-        return _drive_service
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception as e:
         print(f"❌ Google Drive init error: {e}")
         return None
 
 
-def _drive():
-    return _drive_service
-
-
-def _find_folder(name: str, parent_id: str | None) -> str | None:
+def _find_folder(service, name: str, parent_id: str | None) -> str | None:
     q = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     if parent_id:
         q += f" and '{parent_id}' in parents"
     try:
-        result = _drive().files().list(q=q, fields="files(id, name)", pageSize=1).execute()
+        result = service.files().list(q=q, fields="files(id, name)", pageSize=1).execute()
         files = result.get("files", [])
         return files[0]["id"] if files else None
     except Exception as e:
@@ -485,19 +480,22 @@ def _find_folder(name: str, parent_id: str | None) -> str | None:
         return None
 
 
-def _create_folder(name: str, parent_id: str | None) -> str:
+def _create_folder(service, name: str, parent_id: str | None) -> str:
     meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
     if parent_id:
         meta["parents"] = [parent_id]
-    folder = _drive().files().create(body=meta, fields="id").execute()
+    folder = service.files().create(body=meta, fields="id").execute()
     return folder["id"]
 
 
 def get_or_create_folder(path: str) -> str | None:
-    if not _drive():
-        return None
     if path in _folder_cache:
         return _folder_cache[path]
+
+    service = get_drive_service()
+    if not service:
+        return None
+
     parts = [p for p in path.split("/") if p]
     parent = None
     current_path = ""
@@ -506,18 +504,22 @@ def get_or_create_folder(path: str) -> str | None:
         if current_path in _folder_cache:
             parent = _folder_cache[current_path]
             continue
-        existing = _find_folder(part, parent)
+        existing = _find_folder(service, part, parent)
         if existing:
             _folder_cache[current_path] = existing
             parent = existing
         else:
-            parent = _create_folder(part, parent)
+            parent = _create_folder(service, part, parent)
             _folder_cache[current_path] = parent
     return parent
 
 
 async def async_get_or_create_folder(path: str):
+    if path in _folder_cache:
+        return _folder_cache[path]
     async with drive_lock:
+        if path in _folder_cache:
+            return _folder_cache[path]
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, get_or_create_folder, path)
 
@@ -627,7 +629,7 @@ async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_
             print(f"⚠️ Файл слишком большой ({file_size} байт), пропускаем для {peer_id}")
             return
 
-        if not _drive():
+        if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
             return
 
         peer_name = _sanitize(peer_name_raw or f"peer_{peer_id}")
@@ -647,11 +649,13 @@ async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_
         await bot.download_file(file_obj.file_path, destination=tmp_path)
 
         def _sync_upload():
+            service = get_drive_service()
+            if not service:
+                return None
             media = MediaFileUpload(tmp_path, mimetype=mime, resumable=True)
             meta = {"name": filename, "parents": [folder_id]}
-            return _drive().files().create(body=meta, media_body=media, fields="id, webViewLink, webContentLink").execute()
+            return service.files().create(body=meta, media_body=media, fields="id, webViewLink, webContentLink").execute()
 
-        # КРИТИЧЕСКИ ВАЖНО: drive_lock защищает C-сокеты OpenSSL от ошибки double free or corruption
         async with drive_lock:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(None, _sync_upload)
@@ -835,16 +839,27 @@ async def fetch_gift_satellite(endpoint: str, params: dict = None, retry: int = 
 
 
 async def fetch_nftmatch(endpoint: str, params: dict = None, retry: int = 2):
+    """GET-запрос к nftmatch.pro. Возвращает dict/list/float/int или None."""
     if not NFTMATCH_API_KEY:
         return None
-    headers = {"Authorization": NFTMATCH_API_KEY}
+    headers = {
+        "accept": "application/json",
+        "Authorization": NFTMATCH_API_KEY
+    }
     url = f"{NFTMATCH_BASE}{endpoint}"
     session = get_http_session()
     for attempt in range(retry + 1):
         try:
             async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
-                    return await resp.json()
+                    try:
+                        return await resp.json(content_type=None)
+                    except Exception:
+                        text_val = (await resp.text()).strip()
+                        try:
+                            return float(text_val)
+                        except ValueError:
+                            return text_val
                 elif resp.status == 429 and attempt < retry:
                     await asyncio.sleep(1.5)
                     continue
@@ -856,7 +871,43 @@ async def fetch_nftmatch(endpoint: str, params: dict = None, retry: int = 2):
     return None
 
 
+def _extract_mono_percent(mono_resp) -> int | None:
+    """Извлекает процент монохромности (0-100) из ответа /MonoCoof/MonohromeCoof."""
+    if mono_resp is None or isinstance(mono_resp, Exception):
+        return None
+
+    val = None
+    if isinstance(mono_resp, (int, float)):
+        val = float(mono_resp)
+    elif isinstance(mono_resp, str):
+        cleaned = mono_resp.replace("%", "").replace(",", ".").strip()
+        with suppress(ValueError):
+            val = float(cleaned)
+    elif isinstance(mono_resp, dict):
+        for k in ("monohromeCoof", "monochromeCoof", "coof", "coef", "coefficient", "score", "percent", "percentage", "value", "result", "data"):
+            if k in mono_resp and isinstance(mono_resp[k], (int, float, str)):
+                with suppress(ValueError):
+                    val = float(str(mono_resp[k]).replace("%", "").replace(",", ".").strip())
+                    break
+        if val is None:
+            for v in mono_resp.values():
+                if isinstance(v, (int, float)):
+                    val = float(v)
+                    break
+
+    if val is None:
+        return None
+
+    # Если API вернуло долю от 0 до 1 (например 0.87), переводим в проценты (87)
+    if 0 < val <= 1.0:
+        val *= 100
+    return max(0, min(100, round(val)))
+
+
 async def get_gift_card_data(slug: str) -> dict:
+    """
+    Собирает данные по подарку из Gift Satellite + nftmatch.pro (/MonoCoof/MonohromeCoof).
+    """
     result: dict = {"slug": slug}
     gift_info = await fetch_gift_satellite(f"/gift/by-slug/{slug}")
     if gift_info:
@@ -868,20 +919,36 @@ async def get_gift_card_data(slug: str) -> dict:
 
     collection = result.get("collection_name", "")
     model_name = result.get("model", "")
+    backdrop_name = result.get("backdrop", "")
 
     async def _noop():
         return None
 
     collection_encoded = urllib.parse.quote(collection, safe="")
 
+    # 1. Офферы из Gift Satellite
     gs_task = asyncio.create_task(
         fetch_gift_satellite(f"/search/tg/{collection_encoded}") if collection else _noop()
     )
-    nm_task = asyncio.create_task(
+    # 2. Список моделей из nftmatch (для резервной цены floorPrice)
+    nm_models_task = asyncio.create_task(
         fetch_nftmatch(f"/ListGifts/{collection_encoded}/AllModelNames") if collection else _noop()
     )
+    # 3. Точный коэффициент монохромности по коллекции (nameGift), модели (nameModel) и фону (nameColor)
+    nm_mono_task = asyncio.create_task(
+        fetch_nftmatch(
+            "/MonoCoof/MonohromeCoof",
+            params={
+                "nameGift": collection,
+                "nameModel": model_name,
+                "nameColor": backdrop_name,
+            }
+        ) if (collection and model_name and backdrop_name) else _noop()
+    )
 
-    offers_raw, nm_models = await asyncio.gather(gs_task, nm_task, return_exceptions=True)
+    offers_raw, nm_models, mono_resp = await asyncio.gather(
+        gs_task, nm_models_task, nm_mono_task, return_exceptions=True
+    )
 
     if isinstance(offers_raw, list):
         model_offers = [o for o in offers_raw if o.get("modelName") == model_name]
@@ -900,19 +967,9 @@ async def get_gift_card_data(slug: str) -> dict:
                 result["floor_ton_nm"] = item.get("floorPrice")
                 break
 
-    if collection and model_name and NFTMATCH_API_KEY:
-        profile = await fetch_nftmatch(
-            "/MonoCoof/MatchV2ColorProfile",
-            params={"nameGift": collection, "nameModel": model_name}
-        )
-        if isinstance(profile, dict):
-            cubes = profile.get("cubes") or []
-            if cubes:
-                weights = [c.get("weight", 0) for c in cubes if isinstance(c, dict)]
-                if weights:
-                    total = sum(weights)
-                    if total > 0:
-                        result["mono_score"] = round(max(weights) / total * 100)
+    mono_score = _extract_mono_percent(mono_resp)
+    if mono_score is not None:
+        result["mono_score"] = mono_score
 
     return result
 
@@ -938,9 +995,9 @@ def format_gift_card(data: dict, exchange_cache: dict | None = None) -> str:
     lines.append(f"🎁 {link}")
 
     attrs = []
-    if model:   attrs.append(f"Модель: <b>{html.escape(model)}</b>")
+    if model:    attrs.append(f"Модель: <b>{html.escape(model)}</b>")
     if backdrop: attrs.append(f"Фон: <b>{html.escape(backdrop)}</b>")
-    if symbol:   attrs.append(f"Символ: <b>{html.escape(symbol)}</b>")
+    if symbol:   attrs.append(f"Узор: <b>{html.escape(symbol)}</b>")
     if attrs:
         lines.append(" · ".join(attrs))
 
@@ -1411,7 +1468,7 @@ async def start_web_server() -> web.AppRunner:
     app.router.add_get("/", dummy_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     _web_runner = runner
@@ -1419,17 +1476,8 @@ async def start_web_server() -> web.AppRunner:
     return runner
 
 
-async def on_startup():
-    global BOT_USERNAME, BOT_ID
-
-    with suppress(Exception):
-        await archive_collection.create_index([("owner_id", 1), ("conn_id", 1), ("chat_id", 1), ("created_at", -1)])
-        await archive_collection.create_index([("conn_id", 1), ("chat_id", 1), ("message_id", 1)])
-        await archive_collection.create_index([("user_id", 1)])
-        await archive_collection.create_index([("conn_id", 1), ("chat_id", 1), ("is_owner", 1), ("created_at", -1)])
-    with suppress(Exception):
-        await mutes_collection.create_index([("mute_key", 1)], unique=True)
-
+async def _warmup_db_and_caches():
+    """Фоновый прогрев кэша и индексов БД, чтобы не задерживать старт бота на Render"""
     try:
         now_ts = datetime.now(timezone.utc).timestamp()
         stored_mutes = await mutes_collection.find({}).to_list(length=None)
@@ -1455,13 +1503,29 @@ async def on_startup():
     except Exception as e:
         print(f"Ошибка прогрева кэша: {e}")
 
+    with suppress(Exception):
+        await archive_collection.create_index([("owner_id", 1), ("conn_id", 1), ("chat_id", 1), ("created_at", -1)])
+        await archive_collection.create_index([("conn_id", 1), ("chat_id", 1), ("message_id", 1)])
+        await archive_collection.create_index([("user_id", 1)])
+        await archive_collection.create_index([("conn_id", 1), ("chat_id", 1), ("is_owner", 1), ("created_at", -1)])
+    with suppress(Exception):
+        await mutes_collection.create_index([("mute_key", 1)], unique=True)
+
+
+async def on_startup():
+    global BOT_USERNAME, BOT_ID
+
+    # Запускаем прогрев БД и курсов параллельно, не блокируя поллинг
+    asyncio.create_task(_warmup_db_and_caches())
     asyncio.create_task(update_rates_loop())
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, _init_drive)
+
+    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN:
+        print("✅ Ключи Google Drive найдены (потокобезопасный режим)")
+    else:
+        print("⚠️ Google Drive: ключи не заданы в переменных окружения")
 
     try:
         me = await bot.get_me()
-        global BOT_USERNAME
         BOT_USERNAME = me.username or "your_bot_username"
         print(f"✅ Бот: @{BOT_USERNAME} (ID: {BOT_ID})")
     except Exception as e:
@@ -3818,18 +3882,15 @@ async def unmute_user(call: CallbackQuery):
 # MAIN
 # ==========================================
 async def main():
-    web_task = asyncio.create_task(start_web_server())
-
-    def _web_done(t: asyncio.Task):
-        try:
-            t.result()
-        except Exception as e:
-            print(f"❌ Веб-сервер упал: {e}")
-
-    web_task.add_done_callback(_web_done)
+    # 1. СНАЧАЛА мгновенно открываем веб-порт для Render, чтобы он сразу погасил старый инстанс (SIGTERM)
+    await start_web_server()
+    # Даём Render 2 секунды на остановку старого контейнера перед запуском getUpdates
+    await asyncio.sleep(2)
 
     try:
-        await dp.start_polling(bot)
+        # 2. Запускаем поллинг (с очисткой возможных вебхуков)
+        await bot.delete_webhook(drop_pending_updates=False)
+        await dp.start_polling(bot, polling_timeout=20)
     finally:
         if _http_session and not _http_session.closed:
             with suppress(Exception):
@@ -3837,9 +3898,6 @@ async def main():
         if _web_runner:
             with suppress(Exception):
                 await _web_runner.cleanup()
-        web_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await web_task
 
 
 if __name__ == "__main__":
