@@ -8,6 +8,7 @@ import urllib.parse
 import json
 import aiohttp
 import tempfile
+import builtins
 from aiogram import BaseMiddleware
 from datetime import datetime, timezone
 from aiohttp import web
@@ -31,6 +32,12 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+
+# Принудительный сброс буфера логов для Render, чтобы все print() отображались мгновенно
+_orig_print = builtins.print
+def print(*args, **kwargs):
+    kwargs.setdefault("flush", True)
+    _orig_print(*args, **kwargs)
 
 # ==========================================
 # КОНФИГ
@@ -307,7 +314,13 @@ async def handle_owner_activity(owner_id: int, peer_id: int):
 # ПОДКЛЮЧЕНИЕ БИЗНЕС-БОТА
 # ==========================================
 async def is_bot_connected(user_id: int) -> bool:
-    return any(c.get("user_id") == user_id for c in connections_cache.values())
+    if any(c.get("user_id") == user_id for c in connections_cache.values()):
+        return True
+    conn = await connections_collection.find_one({"user_id": user_id})
+    if conn:
+        connections_cache[conn["business_connection_id"]] = conn
+        return True
+    return False
 
 
 def is_foreign_bot(message) -> bool:
@@ -611,6 +624,10 @@ async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_
     tmp_path = None
     try:
         if file_size and file_size > 20 * 1024 * 1024:
+            print(f"⚠️ Файл слишком большой ({file_size} байт), пропускаем для {peer_id}")
+            return
+
+        if not _drive():
             return
 
         peer_name = _sanitize(peer_name_raw or f"peer_{peer_id}")
@@ -634,13 +651,17 @@ async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_
             meta = {"name": filename, "parents": [folder_id]}
             return _drive().files().create(body=meta, media_body=media, fields="id, webViewLink, webContentLink").execute()
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _sync_upload)
+        # КРИТИЧЕСКИ ВАЖНО: drive_lock защищает C-сокеты OpenSSL от ошибки double free or corruption
+        async with drive_lock:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, _sync_upload)
+
         if result:
             await archive_collection.update_one(
                 {"_id": archive_id},
                 {"$set": {"drive_link": result.get("webViewLink"), "drive_file_id": result.get("id")}}
             )
+            print(f"✅ Медиа загружено на Google Drive: {media_type} для {peer_id}")
     except Exception as e:
         print(f"❌ upload_media_bg error: {e}")
     finally:
@@ -693,10 +714,13 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
         return None
 
     if media_type and file_id:
-        asyncio.create_task(upload_media_bg(
+        task = asyncio.create_task(upload_media_bg(
             doc["_id"], file_id, media_type, ext, mime,
             peer_info["first_name"], peer_id, owner_name, file_size
         ))
+        task.add_done_callback(
+            lambda t: print(f"❌ upload_media_bg task exception: {t.exception()}") if not t.cancelled() and t.exception() else None
+        )
 
     return doc
 
@@ -1523,14 +1547,16 @@ async def cmd_start(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "check_connection")
 async def check_connection_handler(call: CallbackQuery):
     if not await is_bot_connected(call.from_user.id):
-        await call.answer(
-            "❌ Бот ещё не подключён.\n\n"
-            "Открой настройки → Автоматизация чатов → Добавить бота → "
-            f"введи @{BOT_USERNAME}",
-            show_alert=True
-        )
+        with suppress(TelegramBadRequest):
+            await call.answer(
+                "❌ Бот ещё не подключён.\n\n"
+                "Открой настройки → Автоматизация чатов → Добавить бота → "
+                f"введи @{BOT_USERNAME}",
+                show_alert=True
+            )
         return
-    await call.answer("✅ Подключено!", show_alert=True)
+    with suppress(TelegramBadRequest):
+        await call.answer("✅ Подключено!", show_alert=True)
     kb = await get_user_main_kb(call.from_user.id)
     await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
 
@@ -1595,9 +1621,7 @@ async def format_toggle_handler(call: CallbackQuery):
         return
 
     user_data = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
-    mode = user_data.get("format_mode", [])
-    if not isinstance(mode, list):
-        mode = []
+    mode = list(user_data.get("format_mode", []))
 
     if key in mode:
         mode.remove(key)
@@ -1619,7 +1643,8 @@ async def format_preview_handler(call: CallbackQuery):
     user_data = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
     mode = user_data.get("format_mode", [])
     if not mode:
-        await call.answer("Включи хотя бы один стиль", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Включи хотя бы один стиль", show_alert=True)
         return
     sample = "Привет! Это пример твоего форматирования текста"
     formatted = apply_format(sample, mode)
@@ -1690,7 +1715,8 @@ async def deleted_chat_handler(call: CallbackQuery):
         return
     parts = call.data.split("|")
     if len(parts) != 3:
-        await call.answer("Ошибка навигации", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Ошибка навигации", show_alert=True)
         return
     _, conn_id, chat_id_str = parts
     chat_id = int(chat_id_str)
@@ -1781,7 +1807,8 @@ async def _render_page(conn_id: str, chat_id: int, owner_id: int, mode: str, off
 async def show_deleted_messages(call: CallbackQuery):
     parts = call.data.split("|")
     if len(parts) != 5:
-        await call.answer("Ошибка", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Ошибка", show_alert=True)
         return
     _, conn_id, chat_id_str, mode, offset_str = parts
     chat_id = int(chat_id_str)
@@ -1790,7 +1817,8 @@ async def show_deleted_messages(call: CallbackQuery):
 
     text, shown, total, has_more = await _render_page(conn_id, chat_id, owner_id, mode, offset)
     if not text:
-        await call.answer("Пусто", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Пусто", show_alert=True)
         return
 
     builder = InlineKeyboardBuilder()
@@ -1850,7 +1878,8 @@ def _build_archive_html(msgs: list, chat_title: str) -> str:
 async def download_archive(call: CallbackQuery):
     parts = call.data.split("|")
     if len(parts) != 3:
-        await call.answer("Ошибка", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Ошибка", show_alert=True)
         return
     _, conn_id, chat_id_str = parts
     chat_id = int(chat_id_str)
@@ -1862,7 +1891,8 @@ async def download_archive(call: CallbackQuery):
     ).sort("created_at", 1).to_list(length=5000)
 
     if not msgs:
-        await call.answer("Пусто", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Пусто", show_alert=True)
         return
 
     chat_title = msgs[0].get("peer_first_name") or msgs[0].get("first_name") or f"chat_{chat_id}"
@@ -1898,7 +1928,8 @@ async def cmd_admin(message: Message):
 @dp.callback_query(F.data == "admin_main")
 async def back_to_main_admin(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != SUPERADMIN_ID:
-        await call.answer("Нет доступа", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Нет доступа", show_alert=True)
         return
     await state.clear()
     await show_menu(call, "👑 <b>Панель управления:</b>", get_admin_main_kb(), with_photo=True)
@@ -1907,7 +1938,8 @@ async def back_to_main_admin(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "admin_twinks")
 async def admin_twinks(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID:
-        await call.answer("Нет доступа", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Нет доступа", show_alert=True)
         return
 
     conns = await connections_collection.find({}).to_list(length=100)
@@ -1932,11 +1964,13 @@ async def admin_twinks(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("twink|"))
 async def twink_chats(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID:
-        await call.answer("Нет доступа", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Нет доступа", show_alert=True)
         return
     parts = call.data.split("|")
     if len(parts) != 2:
-        await call.answer("Ошибка", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Ошибка", show_alert=True)
         return
     _, conn_id = parts
 
@@ -1975,11 +2009,13 @@ async def twink_chats(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("twinkchat|"))
 async def twink_full_chat(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID:
-        await call.answer("Нет доступа", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Нет доступа", show_alert=True)
         return
     parts = call.data.split("|")
     if len(parts) != 3:
-        await call.answer("Ошибка", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Ошибка", show_alert=True)
         return
     _, conn_id, chat_id_str = parts
     chat_id = int(chat_id_str)
@@ -1990,7 +2026,8 @@ async def twink_full_chat(call: CallbackQuery):
     msgs.reverse()
 
     if not msgs:
-        await call.answer("Пусто", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Пусто", show_alert=True)
         return
 
     lines = []
@@ -2026,7 +2063,8 @@ async def twink_full_chat(call: CallbackQuery):
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID:
-        await call.answer("Нет доступа", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Нет доступа", show_alert=True)
         return
     builder = InlineKeyboardBuilder()
     builder.button(text="🔙 Назад", callback_data="admin_main")
@@ -2050,7 +2088,8 @@ async def admin_stats(call: CallbackQuery):
 @dp.callback_query(F.data == "admin_mutes")
 async def admin_mutes(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID:
-        await call.answer("Нет доступа", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Нет доступа", show_alert=True)
         return
     builder = InlineKeyboardBuilder()
     has_mutes = False
@@ -2081,7 +2120,8 @@ async def admin_mutes(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("forceunmute|"))
 async def force_unmute(call: CallbackQuery):
     if call.from_user.id != SUPERADMIN_ID:
-        await call.answer("Нет доступа", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Нет доступа", show_alert=True)
         return
     parts = call.data.split("|")
     if len(parts) != 2:
@@ -2334,7 +2374,7 @@ async def currency_toggle_handler(call: CallbackQuery):
         return
     cur = parts[1]
     owner_settings = users_cache.get(uid) or await users_collection.find_one({"user_id": uid}) or {}
-    display = owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"])
+    display = list(owner_settings.get("display_currencies", ["RUB", "STARS", "TON", "USDT"]))
     if cur in display:
         display.remove(cur)
     else:
@@ -2399,10 +2439,12 @@ async def user_unmute_callback(call: CallbackQuery):
         conn, chat = mute_key.rsplit("_", 1)
         owner_conn = connections_cache.get(conn)
         if (not owner_conn or owner_conn.get("user_id") != call.from_user.id) and call.from_user.id != SUPERADMIN_ID:
-            await call.answer("Нет доступа", show_alert=True)
+            with suppress(TelegramBadRequest):
+                await call.answer("Нет доступа", show_alert=True)
             return
     except Exception:
-        await call.answer("Ошибка", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Ошибка", show_alert=True)
         return
 
     with suppress(Exception):
@@ -2410,9 +2452,11 @@ async def user_unmute_callback(call: CallbackQuery):
 
     if mute_key in muted_chats:
         muted_chats.pop(mute_key, None)
-        await call.answer("✅ Мут снят!", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("✅ Мут снят!", show_alert=True)
     else:
-        await call.answer("Уже снят.", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await call.answer("Уже снят.", show_alert=True)
     await user_mutes_handler(call)
 
 
@@ -2647,6 +2691,7 @@ async def copy_message_superadmin(message: Message):
         "html_text": html_text,
     }
     copied_messages_cache[SUPERADMIN_ID] = clip_data
+    users_cache.setdefault(SUPERADMIN_ID, {})["copied_msg"] = clip_data
     with suppress(Exception):
         await users_collection.update_one(
             {"user_id": SUPERADMIN_ID},
@@ -2656,7 +2701,7 @@ async def copy_message_superadmin(message: Message):
 
 
 @dp.business_message(F.text.lower().startswith(".вст"))
-@dp.business_message(F.text.lower().startswith(".вст"))
+@dp.message(F.text.lower().startswith(".вст"))
 async def paste_message_superadmin(message: Message):
     if message.from_user.id != SUPERADMIN_ID:
         return
@@ -3786,6 +3831,9 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
+        if _http_session and not _http_session.closed:
+            with suppress(Exception):
+                await _http_session.close()
         if _web_runner:
             with suppress(Exception):
                 await _web_runner.cleanup()
@@ -3795,7 +3843,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    with suppress(ImportError):
-        import uvloop
-        uvloop.install()
     asyncio.run(main())
