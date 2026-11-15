@@ -1,5 +1,6 @@
 import os
 import io
+import gc
 import asyncio
 import random
 import html
@@ -73,7 +74,7 @@ _http_session: aiohttp.ClientSession | None = None
 def get_http_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
-        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=600, keepalive_timeout=60)
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=600, keepalive_timeout=60)
         _http_session = aiohttp.ClientSession(connector=connector)
     return _http_session
 
@@ -141,17 +142,6 @@ class GlobalMuteMiddleware(BaseMiddleware):
         sender_id = event.from_user.id
         chat_id = event.chat.id
 
-        # Быстрое удаление сообщения чужого бота реплаем Владельца (ответ точкой ".")
-        if event.text in (".", ".дел", ".del") and event.reply_to_message:
-            owner_conn = connections_cache.get(incoming_conn_id)
-            if owner_conn and owner_conn["user_id"] == sender_id:
-                with suppress(Exception):
-                    await event.bot.delete_business_messages(
-                        business_connection_id=incoming_conn_id,
-                        message_ids=[event.reply_to_message.message_id, event.message_id]
-                    )
-                return
-
         # Мгновенная проверка мута в RAM (0 запросов к MongoDB)
         valid_owner_conn_id, owner_id = _get_mute_owner_conn_sync(sender_id, chat_id, incoming_conn_id)
         if not valid_owner_conn_id or sender_id == owner_id or sender_id == BOT_ID:
@@ -185,11 +175,11 @@ class GlobalMuteMiddleware(BaseMiddleware):
         return
 
 
-# Регистрируем как OUTER middleware (один раз!)
+# Регистрируем как OUTER middleware
 dp.business_message.outer_middleware(GlobalMuteMiddleware())
 dp.edited_business_message.outer_middleware(GlobalMuteMiddleware())
 
-BOT_ID: int = 8855259798   # константа — наш бот
+BOT_ID: int = 8855259798
 BOT_USERNAME = "your_bot_username"
 
 try:
@@ -205,14 +195,19 @@ except Exception as e:
 connections_cache: dict[str, dict] = {}
 users_cache: dict[int, dict] = {}
 muted_chats: dict[str, float | None] = {}
-afk_cooldowns = TTLCache(maxsize=2000, ttl=300)
+afk_cooldowns = TTLCache(maxsize=1000, ttl=300)
 active_amute: dict[str, dict] = {}
-action_dedup = TTLCache(maxsize=2000, ttl=4)
-self_destruct_ids = TTLCache(maxsize=1000, ttl=30)
+action_dedup = TTLCache(maxsize=1000, ttl=4)
+self_destruct_ids = TTLCache(maxsize=500, ttl=30)
 active_fakes: dict[str, asyncio.Task] = {}
 copied_messages_cache = {}
 _amute_lock: dict[str, asyncio.Lock] = {}
-_handled_msg_ids: TTLCache = TTLCache(maxsize=5000, ttl=30)
+_handled_msg_ids: TTLCache = TTLCache(maxsize=2000, ttl=30)
+
+# Кэши для мини-игр
+ttt_games: TTLCache = TTLCache(maxsize=300, ttl=600)
+rps_games: TTLCache = TTLCache(maxsize=300, ttl=600)
+mines_games: TTLCache = TTLCache(maxsize=300, ttl=600)
 
 
 # ==========================================
@@ -269,7 +264,8 @@ async def is_chat_muted(conn_id: str, peer_id: int) -> bool:
             await mutes_collection.delete_one({"mute_key": mute_key})
         return False
     return True
-    
+
+
 async def _is_peer_muted_anywhere(peer_id: int) -> bool:
     suffix = f"_{peer_id}"
     now = datetime.now(timezone.utc).timestamp()
@@ -293,6 +289,7 @@ async def _is_peer_muted_anywhere(peer_id: int) -> bool:
                 await mutes_collection.delete_one({"_id": doc["_id"]})
 
     return False
+
 
 async def handle_owner_activity(owner_id: int, peer_id: int):
     afk_cooldowns[(owner_id, peer_id)] = True
@@ -440,30 +437,43 @@ def format_mode_label(mode: list) -> str:
 
 
 # ==========================================
-# GOOGLE DRIVE (ПОТОКОБЕЗОПАСНЫЙ)
+# GOOGLE DRIVE (ЭКОНОМИЯ ОЗУ 512 MB RENDER)
 # ==========================================
-_folder_cache = TTLCache(maxsize=1000, ttl=86400)
+_folder_cache = TTLCache(maxsize=500, ttl=86400)
 drive_lock = asyncio.Lock()
 ROOT_FOLDER_NAME = "TelegramArchiveBot"
+_shared_drive_service = None
+_shared_creds = None
 
 
 def get_drive_service():
-    """Создает НОВУЮ изолированную сессию для каждого потока (защита от SSL и double free)"""
+    """
+    Использует ОДИН экземпляр клиента Google Drive строго внутри drive_lock.
+    Не плодит дубликаты схем API в оперативной памяти!
+    """
+    global _shared_drive_service, _shared_creds
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
         return None
     try:
-        creds = Credentials(
-            token=None,
-            refresh_token=GOOGLE_REFRESH_TOKEN,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=GOOGLE_CLIENT_ID,
-            client_secret=GOOGLE_CLIENT_SECRET,
-            scopes=["https://www.googleapis.com/auth/drive.file"],
-        )
-        creds.refresh(Request())
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
+        if _shared_creds is None:
+            _shared_creds = Credentials(
+                token=None,
+                refresh_token=GOOGLE_REFRESH_TOKEN,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=GOOGLE_CLIENT_ID,
+                client_secret=GOOGLE_CLIENT_SECRET,
+                scopes=["https://www.googleapis.com/auth/drive.file"],
+            )
+        if not _shared_creds.valid or _shared_creds.expired:
+            _shared_creds.refresh(Request())
+            _shared_drive_service = None
+
+        if _shared_drive_service is None:
+            _shared_drive_service = build("drive", "v3", credentials=_shared_creds, cache_discovery=False)
+        return _shared_drive_service
     except Exception as e:
         print(f"❌ Google Drive init error: {e}")
+        _shared_drive_service = None
         return None
 
 
@@ -488,13 +498,9 @@ def _create_folder(service, name: str, parent_id: str | None) -> str:
     return folder["id"]
 
 
-def get_or_create_folder(path: str) -> str | None:
+def _get_or_create_folder_unlocked(service, path: str) -> str | None:
     if path in _folder_cache:
         return _folder_cache[path]
-
-    service = get_drive_service()
-    if not service:
-        return None
 
     parts = [p for p in path.split("/") if p]
     parent = None
@@ -514,16 +520,6 @@ def get_or_create_folder(path: str) -> str | None:
     return parent
 
 
-async def async_get_or_create_folder(path: str):
-    if path in _folder_cache:
-        return _folder_cache[path]
-    async with drive_lock:
-        if path in _folder_cache:
-            return _folder_cache[path]
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, get_or_create_folder, path)
-
-
 def _sanitize(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", (name or "unknown"))[:80]
 
@@ -531,7 +527,7 @@ def _sanitize(name: str) -> str:
 # ==========================================
 # КЕШ СОБЕСЕДНИКОВ
 # ==========================================
-_peer_cache = TTLCache(maxsize=5000, ttl=86400)
+_peer_cache = TTLCache(maxsize=2000, ttl=86400)
 
 
 async def get_peer_info(conn_id: str, peer_id: int) -> dict:
@@ -594,23 +590,23 @@ async def check_and_save_protected_media(message: Message, owner_id: int):
     if not reply or not getattr(reply, "has_protected_content", False):
         return
 
-    file_id, filename = None, "saved"
+    file_id, filename, fsize = None, "saved", 0
     if reply.photo:
-        file_id, filename = reply.photo[-1].file_id, "saved.jpg"
+        file_id, filename, fsize = reply.photo[-1].file_id, "saved.jpg", reply.photo[-1].file_size
     elif reply.video:
-        file_id, filename = reply.video.file_id, "saved.mp4"
+        file_id, filename, fsize = reply.video.file_id, "saved.mp4", reply.video.file_size
     elif reply.video_note:
-        file_id, filename = reply.video_note.file_id, "saved_note.mp4"
+        file_id, filename, fsize = reply.video_note.file_id, "saved_note.mp4", reply.video_note.file_size
     elif reply.animation:
-        file_id, filename = reply.animation.file_id, "saved.mp4"
+        file_id, filename, fsize = reply.animation.file_id, "saved.mp4", reply.animation.file_size
     elif reply.voice:
-        file_id, filename = reply.voice.file_id, "saved_voice.ogg"
+        file_id, filename, fsize = reply.voice.file_id, "saved_voice.ogg", reply.voice.file_size
     elif reply.audio:
-        file_id, filename = reply.audio.file_id, reply.audio.file_name or "saved_audio.mp3"
+        file_id, filename, fsize = reply.audio.file_id, reply.audio.file_name or "saved_audio.mp3", reply.audio.file_size
     elif reply.document:
-        file_id, filename = reply.document.file_id, reply.document.file_name or "saved.bin"
+        file_id, filename, fsize = reply.document.file_id, reply.document.file_name or "saved.bin", reply.document.file_size
 
-    if not file_id:
+    if not file_id or (fsize and fsize > 15 * 1024 * 1024):
         return
 
     try:
@@ -620,58 +616,67 @@ async def check_and_save_protected_media(message: Message, owner_id: int):
         await bot.send_document(chat_id=owner_id, document=input_file, caption="🕵️ Сохранено из исчезающего сообщения")
     except Exception as e:
         print(f"save_replied_media error: {e}")
+    finally:
+        gc.collect()
 
 
 async def upload_media_bg(archive_id, file_id, media_type, ext, mime, peer_name_raw, peer_id, owner_name, file_size):
-    tmp_path = None
-    try:
-        if file_size and file_size > 20 * 1024 * 1024:
-            print(f"⚠️ Файл слишком большой ({file_size} байт), пропускаем для {peer_id}")
-            return
+    # Не грузим на Google Drive обычные стикеры и файлы тяжелее 10 МБ (защита 512 МБ RAM на Render)
+    if media_type == "sticker":
+        return
+    if file_size and file_size > 10 * 1024 * 1024:
+        return
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+        return
 
-        if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
-            return
+    # ОЧЕРЕДЬ В НАЧАЛЕ: качаем в /tmp (который в RAM на Render) строго по ОДНОМУ файлу!
+    async with drive_lock:
+        tmp_path = None
+        try:
+            peer_name = _sanitize(peer_name_raw or f"peer_{peer_id}")
+            owner_folder = _sanitize(owner_name)
+            folder_path = f"{ROOT_FOLDER_NAME}/{owner_folder}/{peer_name} ({peer_id})/media"
 
-        peer_name = _sanitize(peer_name_raw or f"peer_{peer_id}")
-        owner_folder = _sanitize(owner_name)
-        folder_path = f"{ROOT_FOLDER_NAME}/{owner_folder}/{peer_name} ({peer_id})/media"
+            file_obj = await bot.get_file(file_id)
+            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            filename = f"{ts}_{media_type}.{ext}"
 
-        folder_id = await async_get_or_create_folder(folder_path)
-        if not folder_id:
-            return
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+                tmp_path = tmp.name
+            await bot.download_file(file_obj.file_path, destination=tmp_path)
 
-        file_obj = await bot.get_file(file_id)
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"{ts}_{media_type}.{ext}"
+            def _sync_full_upload():
+                global _shared_drive_service
+                try:
+                    service = get_drive_service()
+                    if not service:
+                        return None
+                    folder_id = _get_or_create_folder_unlocked(service, folder_path)
+                    if not folder_id:
+                        return None
+                    media = MediaFileUpload(tmp_path, mimetype=mime, resumable=False)
+                    meta = {"name": filename, "parents": [folder_id]}
+                    return service.files().create(body=meta, media_body=media, fields="id, webViewLink").execute()
+                except Exception as ex:
+                    _shared_drive_service = None
+                    raise ex
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
-            tmp_path = tmp.name
-        await bot.download_file(file_obj.file_path, destination=tmp_path)
-
-        def _sync_upload():
-            service = get_drive_service()
-            if not service:
-                return None
-            media = MediaFileUpload(tmp_path, mimetype=mime, resumable=True)
-            meta = {"name": filename, "parents": [folder_id]}
-            return service.files().create(body=meta, media_body=media, fields="id, webViewLink, webContentLink").execute()
-
-        async with drive_lock:
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(None, _sync_upload)
+            result = await loop.run_in_executor(None, _sync_full_upload)
 
-        if result:
-            await archive_collection.update_one(
-                {"_id": archive_id},
-                {"$set": {"drive_link": result.get("webViewLink"), "drive_file_id": result.get("id")}}
-            )
-            print(f"✅ Медиа загружено на Google Drive: {media_type} для {peer_id}")
-    except Exception as e:
-        print(f"❌ upload_media_bg error: {e}")
-    finally:
-        if tmp_path:
-            with suppress(Exception):
-                os.remove(tmp_path)
+            if result:
+                await archive_collection.update_one(
+                    {"_id": archive_id},
+                    {"$set": {"drive_link": result.get("webViewLink"), "drive_file_id": result.get("id")}}
+                )
+                print(f"✅ Медиа загружено на Google Drive: {media_type} для {peer_id}")
+        except Exception as e:
+            print(f"❌ upload_media_bg error: {e}")
+        finally:
+            if tmp_path:
+                with suppress(Exception):
+                    os.remove(tmp_path)
+            gc.collect()
 
 
 async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner_id: int, owner_name: str, is_owner: bool):
@@ -717,14 +722,11 @@ async def save_message_quick(message: Message, conn_id: str, peer_id: int, owner
         print(f"save_message_quick insert error: {e}")
         return None
 
-    if media_type and file_id:
-        task = asyncio.create_task(upload_media_bg(
+    if media_type and file_id and media_type != "sticker":
+        asyncio.create_task(upload_media_bg(
             doc["_id"], file_id, media_type, ext, mime,
             peer_info["first_name"], peer_id, owner_name, file_size
         ))
-        task.add_done_callback(
-            lambda t: print(f"❌ upload_media_bg task exception: {t.exception()}") if not t.cancelled() and t.exception() else None
-        )
 
     return doc
 
@@ -898,15 +900,62 @@ def _extract_mono_percent(mono_resp) -> int | None:
     if val is None:
         return None
 
-    # Если API вернуло долю от 0 до 1 (например 0.87), переводим в проценты (87)
     if 0 < val <= 1.0:
         val *= 100
     return max(0, min(100, round(val)))
 
 
+def _extract_color_weight(profile_resp, main_colors_resp) -> int | None:
+    """Извлекает вес основного цвета (%) из MatchV2ColorProfile или MainColors."""
+    # 1. Пробуем MatchV2ColorProfile (cubes с весами)
+    if isinstance(profile_resp, dict):
+        cubes = profile_resp.get("cubes") or []
+        if isinstance(cubes, list) and cubes:
+            weights = [c.get("weight", 0) for c in cubes if isinstance(c, dict) and isinstance(c.get("weight"), (int, float))]
+            if weights:
+                total = sum(weights)
+                max_w = max(weights)
+                if total > 0:
+                    pct = (max_w / total * 100) if total > 1.5 else (max_w * 100 if max_w <= 1.0 else max_w)
+                    return max(0, min(100, round(pct)))
+
+        for k in ("colorWeight", "weight", "mainColorWeight", "dominantWeight", "percent", "percentage"):
+            if k in profile_resp and isinstance(profile_resp[k], (int, float)):
+                val = float(profile_resp[k])
+                if 0 < val <= 1.0:
+                    val *= 100
+                return max(0, min(100, round(val)))
+
+    # 2. Пробуем /ListGifts/{Gift}/{Model}/MainColors
+    if isinstance(main_colors_resp, list) and main_colors_resp:
+        vals = []
+        for item in main_colors_resp:
+            if isinstance(item, dict):
+                for k in ("weight", "percent", "percentage", "share", "value", "coof"):
+                    if k in item and isinstance(item[k], (int, float)):
+                        vals.append(float(item[k]))
+                        break
+            elif isinstance(item, (int, float)):
+                vals.append(float(item))
+        if vals:
+            max_v = max(vals)
+            if 0 < max_v <= 1.0:
+                max_v *= 100
+            return max(0, min(100, round(max_v)))
+    elif isinstance(main_colors_resp, dict):
+        nums = [float(v) for v in main_colors_resp.values() if isinstance(v, (int, float))]
+        if nums:
+            max_v = max(nums)
+            if 0 < max_v <= 1.0:
+                max_v *= 100
+            return max(0, min(100, round(max_v)))
+
+    return None
+
+
 async def get_gift_card_data(slug: str) -> dict:
     """
-    Собирает данные по подарку из Gift Satellite + nftmatch.pro (/MonoCoof/MonohromeCoof).
+    Собирает данные по подарку из Gift Satellite + nftmatch.pro (MonohromeCoof + Вес цвета).
     """
     result: dict = {"slug": slug}
     gift_info = await fetch_gift_satellite(f"/gift/by-slug/{slug}")
@@ -925,16 +974,14 @@ async def get_gift_card_data(slug: str) -> dict:
         return None
 
     collection_encoded = urllib.parse.quote(collection, safe="")
+    model_encoded = urllib.parse.quote(model_name, safe="")
 
-    # 1. Офферы из Gift Satellite
     gs_task = asyncio.create_task(
         fetch_gift_satellite(f"/search/tg/{collection_encoded}") if collection else _noop()
     )
-    # 2. Список моделей из nftmatch (для резервной цены floorPrice)
     nm_models_task = asyncio.create_task(
         fetch_nftmatch(f"/ListGifts/{collection_encoded}/AllModelNames") if collection else _noop()
     )
-    # 3. Точный коэффициент монохромности по коллекции (nameGift), модели (nameModel) и фону (nameColor)
     nm_mono_task = asyncio.create_task(
         fetch_nftmatch(
             "/MonoCoof/MonohromeCoof",
@@ -945,9 +992,20 @@ async def get_gift_card_data(slug: str) -> dict:
             }
         ) if (collection and model_name and backdrop_name) else _noop()
     )
+    nm_profile_task = asyncio.create_task(
+        fetch_nftmatch(
+            "/MonoCoof/MatchV2ColorProfile",
+            params={"nameGift": collection, "nameModel": model_name}
+        ) if (collection and model_name) else _noop()
+    )
+    nm_main_colors_task = asyncio.create_task(
+        fetch_nftmatch(f"/ListGifts/{collection_encoded}/{model_encoded}/MainColors")
+        if (collection and model_name) else _noop()
+    )
 
-    offers_raw, nm_models, mono_resp = await asyncio.gather(
-        gs_task, nm_models_task, nm_mono_task, return_exceptions=True
+    offers_raw, nm_models, mono_resp, profile_resp, main_colors_resp = await asyncio.gather(
+        gs_task, nm_models_task, nm_mono_task, nm_profile_task, nm_main_colors_task,
+        return_exceptions=True
     )
 
     if isinstance(offers_raw, list):
@@ -970,6 +1028,10 @@ async def get_gift_card_data(slug: str) -> dict:
     mono_score = _extract_mono_percent(mono_resp)
     if mono_score is not None:
         result["mono_score"] = mono_score
+
+    color_weight = _extract_color_weight(profile_resp, main_colors_resp)
+    if color_weight is not None:
+        result["color_weight"] = color_weight
 
     return result
 
@@ -1011,6 +1073,10 @@ def format_gift_card(data: dict, exchange_cache: dict | None = None) -> str:
         lines.append(f"<code>[{bar}]</code>")
     elif data.get("is_monochrome"):
         lines.append("⚫️ <b>Монохромная модель</b>")
+
+    color_weight = data.get("color_weight")
+    if color_weight is not None:
+        lines.append(f"🎨 <b>Вес цвета: {color_weight}%</b>")
 
     lines.append("")
     lines.append("💎 <b>Рыночные данные:</b>")
@@ -1477,7 +1543,6 @@ async def start_web_server() -> web.AppRunner:
 
 
 async def _warmup_db_and_caches():
-    """Фоновый прогрев кэша и индексов БД, чтобы не задерживать старт бота на Render"""
     try:
         now_ts = datetime.now(timezone.utc).timestamp()
         stored_mutes = await mutes_collection.find({}).to_list(length=None)
@@ -1515,12 +1580,11 @@ async def _warmup_db_and_caches():
 async def on_startup():
     global BOT_USERNAME, BOT_ID
 
-    # Запускаем прогрев БД и курсов параллельно, не блокируя поллинг
     asyncio.create_task(_warmup_db_and_caches())
     asyncio.create_task(update_rates_loop())
 
     if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN:
-        print("✅ Ключи Google Drive найдены (потокобезопасный режим)")
+        print("✅ Ключи Google Drive найдены (экономичный режим ОЗУ)")
     else:
         print("⚠️ Google Drive: ключи не заданы в переменных окружения")
 
@@ -1854,7 +1918,7 @@ async def _render_page(conn_id: str, chat_id: int, owner_id: int, mode: str, off
             if m.get("media_type") and m.get("drive_link"):
                 body += f'\n📎 <a href="{m["drive_link"]}">[{m["media_type"]}]</a>'
             elif m.get("media_type"):
-                body += f'\n📎 [{m["media_type"]}] (загрузка...)'
+                body += f'\n📎 [{m["media_type"]}]'
 
         lines.append(f"{prefix}<b>{ts_str} · {sender}</b>\n{body}\n{'─' * 18}")
 
@@ -1949,10 +2013,11 @@ async def download_archive(call: CallbackQuery):
     chat_id = int(chat_id_str)
     owner_id = call.from_user.id
 
+    # Ограничение в 1000 записей для экономии 512 МБ RAM на Render
     msgs = await archive_collection.find(
         {"owner_id": owner_id, "conn_id": conn_id, "chat_id": chat_id,
          "$or": [{"is_deleted": True}, {"is_edited": True}]}
-    ).sort("created_at", 1).to_list(length=5000)
+    ).sort("created_at", 1).to_list(length=1000)
 
     if not msgs:
         with suppress(TelegramBadRequest):
@@ -1969,6 +2034,7 @@ async def download_archive(call: CallbackQuery):
                                 caption=f"📥 Архив: {len(msgs)} событий")
     with suppress(TelegramBadRequest):
         await call.answer("Отправлено в личку")
+    gc.collect()
 
 
 # ==========================================
@@ -2580,6 +2646,7 @@ async def user_status_handler(call: CallbackQuery):
 def get_cmds_catalog_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛡 Модерация и Утилиты", callback_data="cmds_cat|mod")],
+        [InlineKeyboardButton(text="🎮 Мини-игры в чате", callback_data="cmds_cat|games")],
         [InlineKeyboardButton(text="🎬 Анимации и Эффекты", callback_data="cmds_cat|anim")],
         [InlineKeyboardButton(text="🧮 Валюты, Математика и NFT", callback_data="cmds_cat|auto")],
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="user_main")],
@@ -2617,27 +2684,41 @@ async def show_cmds_category(call: CallbackQuery):
         if call.from_user.id == SUPERADMIN_ID:
             admin_block = (
                 "<b>📋 .коп / .вст</b> (Супер-Админ)\n"
-                "Ответь <code>.коп</code> на любое сообщение (текст, стикер, ГС, кружок, видео), затем напиши <code>.вст</code> для вставки.\n\n"
+                "Ответь <code>.коп</code> на любое сообщение, затем напиши <code>.вст</code> для вставки.\n\n"
             )
         text = (
             "🛡 <b>Модерация и Утилиты</b>\n\n"
             "<b>🔇 .мут [время]</b>\n"
             "Удаляет все сообщения собеседника (навсегда или по таймеру).\n"
             "Примеры: <code>.мут</code> · <code>.мут 10м</code> · <code>.мут 2ч</code> · <code>.мут 1д</code>\n\n"
-            "<b>🔁 .амут [текст]</b>\n"
-            "Антимут. Отправляет текст от лица бота в обход чужих мутов и защищает его 15 сек.\n"
-            "Пример: <code>.амут привет</code>\n\n"
+            "<b>🔁 .амут [сек] [текст]</b>\n"
+            "Антимут. Отправляет текст от лица бота и защищает его от удаления/редактирования.\n"
+            "Пример: <code>.амут привет</code> · <code>.амут стоп</code>\n\n"
             "<b>🎭 .фейк [тип] [секунды]</b>\n"
             "Имитирует активность в шапке чата (до 120 сек).\n"
-            "• <code>.фейк печать 30</code> — <i>печатает...</i>\n"
-            "• <code>.фейк гс 40</code> — <i>записывает ГС...</i>\n"
-            "• <code>.фейк кружок 20</code> — <i>записывает кружок...</i>\n"
-            "• <code>.фейк видео 20</code> / <code>.фейк фото 15</code>\n"
+            "• <code>.фейк печать 30</code> · <code>.фейк гс 40</code> · <code>.фейк кружок 20</code>\n"
             "• <code>.фейк стоп</code> — остановить имитацию\n\n"
+            "<b>🆔 .ид</b>\n"
+            "Ответь на сообщение — бот покажет ID пользователя и коды всех премиум-эмодзи.\n\n"
             f"{admin_block}"
             "<b>💣 .[N] [текст]</b>\n"
-            "Отправляет сообщение N раз подряд (до 50).\n"
+            "Отправляет сообщение N раз подряд (до 20).\n"
             "Пример: <code>.10 привет</code>"
+        )
+    elif cat == "games":
+        text = (
+            "🎮 <b>Интерактивные Мини-игры в чате</b>\n\n"
+            "<b>❌⭕ .кн</b> — <b>Крестики-нолики 3x3</b>\n"
+            "Запускает поле на кнопках прямо в чате для игры с собеседником!\n\n"
+            "<b>🪨✂️📄 .кнб</b> — <b>Камень-Ножницы-Бумага</b>\n"
+            "Дуэль на кнопках: выборы скрыты, пока оба игрока не сделают ход.\n\n"
+            "<b>💣 .минер</b> — <b>Сапёр 4x4 (Mines)</b>\n"
+            "Открывай клетки, лови иксы (до x15.0) и забирай куш, пока не подорвался!\n\n"
+            "<b>🎲 Быстрые игры с анимацией:</b>\n"
+            "• <code>.рулетка</code> — Русская рулетка (1 патрон из 6)\n"
+            "• <code>.монетка</code> — Подбросить монетку (Орёл / Решка)\n"
+            "• <code>.шар [вопрос]</code> — Магический шар предсказаний 🎱\n"
+            "• <code>.инфа [текст]</code> — Проверка вероятности в % 📊"
         )
     elif cat == "anim":
         text = (
@@ -2658,17 +2739,14 @@ async def show_cmds_category(call: CallbackQuery):
             "🧮 <b>Валюты, Математика и NFT</b>\n\n"
             "<b>💱 Конвертер валют (на лету)</b>\n"
             "Пиши сумму или пример с валютой — бот мгновенно переведёт её:\n"
-            "• <code>6 тон</code>\n"
-            "• <code>100 баксов</code>\n"
-            "• <code>500 звезд</code>\n"
-            "• <code>10 тон + 5 тон</code>\n"
-            "• <code>5 тон + 7 баксов</code> <i>(смешанные валюты)</i>\n\n"
+            "• <code>6 тон</code> · <code>100 баксов</code> · <code>500 звезд</code>\n"
+            "• <code>5 тон + 7 баксов</code> <i>(смешанные валюты)</i>\n"
+            "• <code>.курс</code> — быстрая сводка актуальных курсов\n\n"
             "<b>🧮 Умный калькулятор</b>\n"
-            "Считает примеры цифрами и словами:\n"
             "• <code>25 * 4</code> → <code>25 * 4 = 100</code>\n"
             "• <code>пять плюс пять</code> → <code>5 + 5 = 10</code>\n\n"
             "<b>🎁 Парсер NFT-подарков</b>\n"
-            "Отправь ссылку вида <code>t.me/nft/PlushPepe-274</code> — бот выведет карточку с редкостью, Floor-ценой и дешёвыми офферами."
+            "Отправь ссылку вида <code>t.me/nft/PlushPepe-274</code> — бот выведет карточку с монохромностью, весом цвета и Floor-ценой."
         )
 
     await show_menu(call, text, get_cmds_back_kb(), with_photo=True)
@@ -2722,6 +2800,560 @@ async def on_business_connection(connection: BusinessConnection):
         connections_cache.pop(connection.id, None)
         with suppress(Exception):
             await connections_collection.delete_one({"business_connection_id": connection.id})
+
+
+# ==========================================
+# СКАНЕР ID И ПРЕМИУМ-ЭМОДЗИ (.ид) + КУРС (.курс)
+# ==========================================
+@dp.business_message(F.text.lower().startswith(".ид"))
+@dp.message(F.text.lower().startswith(".ид"))
+async def cmd_get_id_and_emoji(message: Message):
+    conn_id = getattr(message, "business_connection_id", None)
+    if conn_id:
+        owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
+        if not owner_data or message.from_user.id != owner_data["user_id"]:
+            return
+        with suppress(Exception):
+            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    elif message.from_user.id != SUPERADMIN_ID:
+        return
+
+    target = message.reply_to_message or message
+    lines = [
+        "🕵️ <b>Инфо-сканер:</b>",
+        f"• Чат ID: <code>{message.chat.id}</code>",
+    ]
+    if target.from_user:
+        lines.append(f"• Юзер ID: <code>{target.from_user.id}</code> ({html.escape(target.from_user.first_name or '')})")
+
+    entities = (target.entities or []) + (target.caption_entities or [])
+    text_source = target.text or target.caption or ""
+    custom_emojis = []
+    for ent in entities:
+        if ent.type == "custom_emoji":
+            ch = ent.extract_from(text_source)
+            custom_emojis.append(f"{ch} — <code>&lt;tg-emoji emoji-id=\"{ent.custom_emoji_id}\"&gt;{ch}&lt;/tg-emoji&gt;</code>")
+
+    if custom_emojis:
+        lines.append("\n✨ <b>Премиум-эмодзи:</b>")
+        lines.extend(custom_emojis[:10])
+
+    with suppress(Exception):
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text="\n".join(lines),
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
+
+
+@dp.business_message(F.text.lower() == ".курс")
+@dp.message(F.text.lower() == ".курс")
+async def cmd_quick_rates(message: Message):
+    conn_id = getattr(message, "business_connection_id", None)
+    if conn_id:
+        owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
+        if not owner_data or message.from_user.id != owner_data["user_id"]:
+            return
+        with suppress(Exception):
+            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+
+    if not EXCHANGE_CACHE:
+        await force_update_all_rates()
+
+    r_rub = EXCHANGE_CACHE.get("RUB")
+    r_ton = EXCHANGE_CACHE.get("TON")
+    r_btc = EXCHANGE_CACHE.get("BTC")
+    r_eth = EXCHANGE_CACHE.get("ETH")
+
+    lines = ["📊 <b>Актуальные курсы:</b>", ""]
+    if r_ton and r_rub:
+        lines.append(f"💎 <b>1 TON:</b> <code>{r_ton:.2f} $</code> | <code>{r_ton / r_rub:,.0f} ₽</code>".replace(",", " "))
+    if r_rub:
+        lines.append(f"💵 <b>1 USDT:</b> <code>{1.0 / r_rub:,.2f} ₽</code>".replace(",", " "))
+        lines.append(f"⭐ <b>100 Stars:</b> <code>1.50 $</code> | <code>{1.5 / r_rub:,.0f} ₽</code>".replace(",", " "))
+    if r_btc:
+        lines.append(f"₿ <b>1 BTC:</b> <code>{r_btc:,.0f} $</code>".replace(",", " "))
+    if r_eth:
+        lines.append(f"Ξ <b>1 ETH:</b> <code>{r_eth:,.0f} $</code>".replace(",", " "))
+
+    with suppress(Exception):
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text="\n".join(lines),
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
+
+
+# ==========================================
+# ИНТЕРАКТИВНЫЕ МИНИ-ИГРЫ (.кн, .кнб, .минер, .рулетка, .шар, .инфа, .монетка)
+# ==========================================
+def _build_ttt_kb(conn_id: str, peer_id: int, board: list[str], finished: bool = False) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    symbols = {" ": "⬜", "X": "❌", "O": "⭕"}
+    for idx, cell in enumerate(board):
+        cb = "ttt_noop" if (finished or cell != " ") else f"ttt|{conn_id}|{peer_id}|{idx}"
+        builder.button(text=symbols.get(cell, "⬜"), callback_data=cb)
+    builder.adjust(3, 3, 3)
+    return builder.as_markup()
+
+
+def _check_ttt_winner(b: list[str]) -> str | None:
+    wins = [(0,1,2), (3,4,5), (6,7,8), (0,3,6), (1,4,7), (2,5,8), (0,4,8), (2,4,6)]
+    for i, j, k in wins:
+        if b[i] != " " and b[i] == b[j] == b[k]:
+            return b[i]
+    if " " not in b:
+        return "D"
+    return None
+
+
+@dp.business_message(F.text.lower().in_({".кн", ".крестики"}))
+async def start_ttt_game(message: Message):
+    conn_id = message.business_connection_id
+    owner_data = connections_cache.get(conn_id)
+    if not owner_data or message.from_user.id != owner_data["user_id"]:
+        return
+
+    owner_id = owner_data["user_id"]
+    peer_id = message.chat.id
+    await handle_owner_activity(owner_id, peer_id)
+
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+
+    board = [" "] * 9
+    game_key = f"{conn_id}_{peer_id}"
+    ttt_games[game_key] = {
+        "board": board,
+        "turn": "X",
+        "owner_id": owner_id,
+        "peer_id": peer_id,
+    }
+
+    text = (
+        "🎮 <b>Крестики-Нолики 3x3</b>\n\n"
+        "❌ — Владелец чата\n"
+        "⭕ — Собеседник\n\n"
+        "Сейчас ход: ❌"
+    )
+    with suppress(Exception):
+        await bot.send_message(
+            chat_id=peer_id,
+            text=text,
+            reply_markup=_build_ttt_kb(conn_id, peer_id, board),
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
+
+
+@dp.callback_query(F.data == "ttt_noop")
+async def ttt_noop_cb(call: CallbackQuery):
+    with suppress(TelegramBadRequest):
+        await call.answer()
+
+
+@dp.callback_query(F.data.startswith("ttt|"))
+async def ttt_move_cb(call: CallbackQuery):
+    parts = call.data.split("|")
+    if len(parts) != 4:
+        return
+    _, conn_id, peer_str, idx_str = parts
+    peer_id = int(peer_str)
+    idx = int(idx_str)
+    game_key = f"{conn_id}_{peer_id}"
+
+    game = ttt_games.get(game_key)
+    if not game:
+        with suppress(TelegramBadRequest):
+            await call.answer("Игра устарела", show_alert=True)
+        return
+
+    uid = call.from_user.id
+    owner_id = game["owner_id"]
+    turn = game["turn"]
+
+    if turn == "X" and uid != owner_id:
+        with suppress(TelegramBadRequest):
+            await call.answer("Сейчас ход ❌ (Владельца)!", show_alert=True)
+        return
+    if turn == "O" and uid == owner_id:
+        with suppress(TelegramBadRequest):
+            await call.answer("Сейчас ход ⭕ (Собеседника)!", show_alert=True)
+        return
+
+    board = game["board"]
+    if board[idx] != " ":
+        with suppress(TelegramBadRequest):
+            await call.answer("Клетка занята!")
+        return
+
+    board[idx] = turn
+    winner = _check_ttt_winner(board)
+
+    if winner == "X":
+        ttt_games.pop(game_key, None)
+        status = "🏆 <b>Победил ❌ (Владелец)!</b>"
+        finished = True
+    elif winner == "O":
+        ttt_games.pop(game_key, None)
+        status = "🏆 <b>Победил ⭕ (Собеседник)!</b>"
+        finished = True
+    elif winner == "D":
+        ttt_games.pop(game_key, None)
+        status = "🤝 <b>Ничья!</b>"
+        finished = True
+    else:
+        game["turn"] = "O" if turn == "X" else "X"
+        next_sym = "⭕" if game["turn"] == "O" else "❌"
+        status = f"Сейчас ход: {next_sym}"
+        finished = False
+
+    text = (
+        "🎮 <b>Крестики-Нолики 3x3</b>\n\n"
+        "❌ — Владелец чата\n"
+        "⭕ — Собеседник\n\n"
+        f"{status}"
+    )
+    with suppress(TelegramBadRequest):
+        await call.message.edit_text(
+            text=text,
+            reply_markup=_build_ttt_kb(conn_id, peer_id, board, finished=finished),
+            parse_mode="HTML"
+        )
+        await call.answer()
+
+
+@dp.business_message(F.text.lower() == ".кнб")
+async def start_rps_game(message: Message):
+    conn_id = message.business_connection_id
+    owner_data = connections_cache.get(conn_id)
+    if not owner_data or message.from_user.id != owner_data["user_id"]:
+        return
+
+    owner_id = owner_data["user_id"]
+    peer_id = message.chat.id
+    await handle_owner_activity(owner_id, peer_id)
+
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+
+    game_key = f"{conn_id}_{peer_id}"
+    rps_games[game_key] = {"owner_id": owner_id, "peer_id": peer_id, "choices": {}}
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🪨 Камень", callback_data=f"rps|{conn_id}|{peer_id}|r"),
+        InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"rps|{conn_id}|{peer_id}|s"),
+        InlineKeyboardButton(text="📄 Бумага", callback_data=f"rps|{conn_id}|{peer_id}|p"),
+    ]])
+
+    with suppress(Exception):
+        await bot.send_message(
+            chat_id=peer_id,
+            text="🥊 <b>Дуэль: Камень-Ножницы-Бумага!</b>\n\nОба участника нажимают кнопку ниже (выбор скрыт):",
+            reply_markup=kb,
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
+
+
+@dp.callback_query(F.data.startswith("rps|"))
+async def rps_move_cb(call: CallbackQuery):
+    parts = call.data.split("|")
+    if len(parts) != 4:
+        return
+    _, conn_id, peer_str, choice = parts
+    peer_id = int(peer_str)
+    game_key = f"{conn_id}_{peer_id}"
+
+    game = rps_games.get(game_key)
+    if not game:
+        with suppress(TelegramBadRequest):
+            await call.answer("Дуэль уже завершена!", show_alert=True)
+        return
+
+    uid = call.from_user.id
+    role = "owner" if uid == game["owner_id"] else "peer"
+    if role in game["choices"]:
+        with suppress(TelegramBadRequest):
+            await call.answer("Ты уже сделал ход! Ждём соперника.", show_alert=True)
+        return
+
+    game["choices"][role] = (choice, call.from_user.first_name or "Игрок")
+    with suppress(TelegramBadRequest):
+        await call.answer("Ход принят!")
+
+    if len(game["choices"]) < 2:
+        who = html.escape(call.from_user.first_name or "Игрок")
+        with suppress(TelegramBadRequest):
+            await call.message.edit_text(
+                f"🥊 <b>Дуэль: Камень-Ножницы-Бумага!</b>\n\n✅ <b>{who}</b> сделал выбор (1/2). Ждём второго игрока...",
+                reply_markup=call.message.reply_markup,
+                parse_mode="HTML"
+            )
+        return
+
+    rps_games.pop(game_key, None)
+    c1, name1 = game["choices"]["owner"]
+    c2, name2 = game["choices"]["peer"]
+    names = {"r": "🪨 Камень", "s": "✂️ Ножницы", "p": "📄 Бумага"}
+
+    if c1 == c2:
+        res = "🤝 <b>Ничья!</b>"
+    elif (c1 == "r" and c2 == "s") or (c1 == "s" and c2 == "p") or (c1 == "p" and c2 == "r"):
+        res = f"🏆 Победил <b>{html.escape(name1)}</b>!"
+    else:
+        res = f"🏆 Победил <b>{html.escape(name2)}</b>!"
+
+    text = (
+        "🥊 <b>Результаты дуэли КНБ:</b>\n\n"
+        f"👤 <b>{html.escape(name1)}:</b> {names[c1]}\n"
+        f"👤 <b>{html.escape(name2)}:</b> {names[c2]}\n\n"
+        f"{res}"
+    )
+    with suppress(TelegramBadRequest):
+        await call.message.edit_text(text=text, parse_mode="HTML")
+
+
+def _build_mines_kb(conn_id: str, peer_id: int, game: dict, finished: bool = False) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    bombs = game["bombs"]
+    opened = game["opened"]
+
+    for idx in range(16):
+        if idx in opened:
+            txt = "💎"
+            cb = "ttt_noop"
+        elif finished and idx in bombs:
+            txt = "💥"
+            cb = "ttt_noop"
+        elif finished:
+            txt = "⬜"
+            cb = "ttt_noop"
+        else:
+            txt = "❓"
+            cb = f"mine|{conn_id}|{peer_id}|{idx}"
+        builder.button(text=txt, callback_data=cb)
+
+    if not finished and len(opened) > 0:
+        mult = round(1.0 + len(opened) * 0.35 + (len(opened) ** 1.5) * 0.15, 2)
+        builder.button(text=f"💰 Забрать x{mult}", callback_data=f"minecash|{conn_id}|{peer_id}")
+        builder.adjust(4, 4, 4, 4, 1)
+    else:
+        builder.adjust(4, 4, 4, 4)
+    return builder.as_markup()
+
+
+@dp.business_message(F.text.lower() == ".минер")
+async def start_mines_game(message: Message):
+    conn_id = message.business_connection_id
+    owner_data = connections_cache.get(conn_id)
+    if not owner_data or message.from_user.id != owner_data["user_id"]:
+        return
+
+    owner_id = owner_data["user_id"]
+    peer_id = message.chat.id
+    await handle_owner_activity(owner_id, peer_id)
+
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+
+    bombs = set(random.sample(range(16), 3))
+    game_key = f"{conn_id}_{peer_id}"
+    game = {"bombs": bombs, "opened": set()}
+    mines_games[game_key] = game
+
+    text = (
+        "💣 <b>Сапёр 4x4 (3 бомбы)</b>\n"
+        "Открывай клетки с 💎 и забирай иксы!"
+    )
+    with suppress(Exception):
+        await bot.send_message(
+            chat_id=peer_id,
+            text=text,
+            reply_markup=_build_mines_kb(conn_id, peer_id, game),
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
+
+
+@dp.callback_query(F.data.startswith("mine|"))
+async def mines_click_cb(call: CallbackQuery):
+    parts = call.data.split("|")
+    if len(parts) != 4:
+        return
+    _, conn_id, peer_str, idx_str = parts
+    peer_id = int(peer_str)
+    idx = int(idx_str)
+    game_key = f"{conn_id}_{peer_id}"
+
+    game = mines_games.get(game_key)
+    if not game:
+        with suppress(TelegramBadRequest):
+            await call.answer("Игра завершена", show_alert=True)
+        return
+
+    if idx in game["bombs"]:
+        mines_games.pop(game_key, None)
+        who = html.escape(call.from_user.first_name or "Игрок")
+        text = f"💥 <b>БУМ! {who} подорвался на мине!</b>\nВсе иксы сгорели."
+        with suppress(TelegramBadRequest):
+            await call.message.edit_text(
+                text=text,
+                reply_markup=_build_mines_kb(conn_id, peer_id, game, finished=True),
+                parse_mode="HTML"
+            )
+            await call.answer("💥 БУМ!")
+        return
+
+    game["opened"].add(idx)
+    steps = len(game["opened"])
+    mult = round(1.0 + steps * 0.35 + (steps ** 1.5) * 0.15, 2)
+
+    if steps >= 13:
+        mines_games.pop(game_key, None)
+        text = f"🏆 <b>АБСОЛЮТНАЯ ПОБЕДА!</b>\nОткрыты все кристаллы! Множитель: <b>x{mult}</b>"
+        finished = True
+    else:
+        text = f"💣 <b>Сапёр 4x4 (3 бомбы)</b>\nОткрыто: <b>{steps}/13</b> 💎 · Текущий икс: <b>x{mult}</b>"
+        finished = False
+
+    with suppress(TelegramBadRequest):
+        await call.message.edit_text(
+            text=text,
+            reply_markup=_build_mines_kb(conn_id, peer_id, game, finished=finished),
+            parse_mode="HTML"
+        )
+        await call.answer(f"💎 x{mult}")
+
+
+@dp.callback_query(F.data.startswith("minecash|"))
+async def mines_cash_cb(call: CallbackQuery):
+    parts = call.data.split("|")
+    if len(parts) != 3:
+        return
+    _, conn_id, peer_str = parts
+    peer_id = int(peer_str)
+    game_key = f"{conn_id}_{peer_id}"
+
+    game = mines_games.pop(game_key, None)
+    if not game:
+        with suppress(TelegramBadRequest):
+            await call.answer("Игра уже завершена")
+        return
+
+    steps = len(game["opened"])
+    mult = round(1.0 + steps * 0.35 + (steps ** 1.5) * 0.15, 2)
+    who = html.escape(call.from_user.first_name or "Игрок")
+    text = f"💰 <b>{who} вовремя забрал куш!</b>\nИтоговый множитель: <b>x{mult}</b> ({steps} 💎)"
+
+    with suppress(TelegramBadRequest):
+        await call.message.edit_text(
+            text=text,
+            reply_markup=_build_mines_kb(conn_id, peer_id, game, finished=True),
+            parse_mode="HTML"
+        )
+        await call.answer(f"Забрано x{mult}!")
+
+
+@dp.business_message(F.text.lower().startswith(".шар"))
+async def magic_8ball_cmd(message: Message):
+    conn_id = message.business_connection_id
+    owner_data = connections_cache.get(conn_id)
+    if not owner_data or message.from_user.id != owner_data["user_id"]:
+        return
+
+    q = message.text[4:].strip()
+    peer_id = message.chat.id
+    await handle_owner_activity(owner_data["user_id"], peer_id)
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+
+    answers = [
+        "Бесспорно ✅", "Предрешено 🔥", "Никаких сомнений 💯", "Определённо да 👍",
+        "Можешь быть уверен в этом ✨", "Мне кажется — да 👀", "Вероятнее всего 📈",
+        "Пока не ясно, попробуй снова 🌫", "Спроси позже ⏳", "Лучше не рассказывать 🤫",
+        "Даже не думай ❌", "Мой ответ — нет 🚫", "Весьма сомнительно 📉"
+    ]
+    q_line = f"❓ <i>{html.escape(q)}</i>\n\n" if q else ""
+    sent = await bot.send_message(chat_id=peer_id, text=f"{q_line}🎱 <i>Трясём магический шар...</i>", parse_mode="HTML", business_connection_id=conn_id)
+    await asyncio.sleep(0.8)
+    with suppress(Exception):
+        await bot.edit_message_text(
+            chat_id=peer_id,
+            message_id=sent.message_id,
+            text=f"{q_line}🎱 <b>Ответ шара:</b> {random.choice(answers)}",
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
+
+
+@dp.business_message(F.text.lower().startswith(".инфа"))
+async def infa_percent_cmd(message: Message):
+    conn_id = message.business_connection_id
+    owner_data = connections_cache.get(conn_id)
+    if not owner_data or message.from_user.id != owner_data["user_id"]:
+        return
+
+    q = message.text[5:].strip()
+    peer_id = message.chat.id
+    await handle_owner_activity(owner_data["user_id"], peer_id)
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+
+    pct = random.randint(0, 100)
+    filled = round(pct / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    q_line = f"🔎 <i>{html.escape(q)}</i>\n\n" if q else ""
+    with suppress(Exception):
+        await bot.send_message(
+            chat_id=peer_id,
+            text=f"{q_line}📊 <b>Вероятность: {pct}%</b>\n<code>[{bar}]</code>",
+            parse_mode="HTML",
+            business_connection_id=conn_id
+        )
+
+
+@dp.business_message(F.text.lower() == ".монетка")
+async def coinflip_cmd(message: Message):
+    conn_id = message.business_connection_id
+    owner_data = connections_cache.get(conn_id)
+    if not owner_data or message.from_user.id != owner_data["user_id"]:
+        return
+
+    peer_id = message.chat.id
+    await handle_owner_activity(owner_data["user_id"], peer_id)
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+
+    sent = await bot.send_message(chat_id=peer_id, text="🪙 <i>Монетка летит в воздухе...</i>", parse_mode="HTML", business_connection_id=conn_id)
+    await asyncio.sleep(0.7)
+    side = random.choice(["🦅 <b>Выпал ОРЁЛ!</b>", "🪙 <b>Выпала РЕШКА!</b>"])
+    with suppress(Exception):
+        await bot.edit_message_text(chat_id=peer_id, message_id=sent.message_id, text=side, parse_mode="HTML", business_connection_id=conn_id)
+
+
+@dp.business_message(F.text.lower() == ".рулетка")
+async def russian_roulette_cmd(message: Message):
+    conn_id = message.business_connection_id
+    owner_data = connections_cache.get(conn_id)
+    if not owner_data or message.from_user.id != owner_data["user_id"]:
+        return
+
+    peer_id = message.chat.id
+    await handle_owner_activity(owner_data["user_id"], peer_id)
+    with suppress(Exception):
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+
+    sent = await bot.send_message(chat_id=peer_id, text="🔫 <i>Крутим барабан револьвера...</i>", parse_mode="HTML", business_connection_id=conn_id)
+    await asyncio.sleep(0.9)
+    if random.randint(1, 6) == 1:
+        outcome = "💥 <b>БАХ! Патрон оказался в патроннике. Ты проиграл!</b>"
+    else:
+        outcome = "😮‍💨 <b>Щёлк! Холостой выстрел — тебе повезло!</b>"
+    with suppress(Exception):
+        await bot.edit_message_text(chat_id=peer_id, message_id=sent.message_id, text=outcome, parse_mode="HTML", business_connection_id=conn_id)
 
 
 # ==========================================
@@ -3440,13 +4072,11 @@ async def process_gift_link_auto(message: Message):
 
         if not owner_data:
             if await _is_peer_muted_anywhere(peer_id):
-                try:
+                with suppress(Exception):
                     await bot.delete_business_messages(
                         business_connection_id=conn_id,
                         message_ids=[message.message_id]
                     )
-                except Exception:
-                    pass
             return
             
         owner_id = owner_data["user_id"]
@@ -3882,13 +4512,10 @@ async def unmute_user(call: CallbackQuery):
 # MAIN
 # ==========================================
 async def main():
-    # 1. СНАЧАЛА мгновенно открываем веб-порт для Render, чтобы он сразу погасил старый инстанс (SIGTERM)
     await start_web_server()
-    # Даём Render 2 секунды на остановку старого контейнера перед запуском getUpdates
     await asyncio.sleep(2)
 
     try:
-        # 2. Запускаем поллинг (с очисткой возможных вебхуков)
         await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot, polling_timeout=20)
     finally:
