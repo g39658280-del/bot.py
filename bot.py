@@ -361,6 +361,16 @@ BS_BET, BS_WIN = 15, 45
 SHIP_SIZES = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
 
 
+
+def _parse_optional_bet(text: str) -> int:
+    """Извлекает ставку из команды вида '.игра 50'. Если ставка не указана — возвращает 0 (без ставки)."""
+    parts = (text or "").strip().split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        val = int(parts[1])
+        return val if val > 0 else 0
+    return 0
+
+
 # ==========================================
 # СИСТЕМА БАЛАНСА И ЕЖЕДНЕВНЫХ БОНУСОВ
 # ==========================================
@@ -1883,8 +1893,9 @@ async def cmd_start(message: Message, state: FSMContext):
             await message.answer(get_connect_text(), reply_markup=get_connect_kb(), parse_mode="HTML")
         return
 
+    bal = await get_user_balance(uid)
     kb = await get_user_main_kb(uid)
-    text = "👋 <b>Твой личный бот-секретарь.</b>\nУправляй настройками ниже:"
+    text = f"👋 <b>Твой личный бот-секретарь.</b>\n💰 Баланс: <b>{bal} монет</b>\n\nУправляй настройками ниже:"
     try:
         await message.answer_photo(photo=MENU_PHOTO, caption=text, reply_markup=kb, parse_mode="HTML")
     except Exception:
@@ -1904,8 +1915,9 @@ async def check_connection_handler(call: CallbackQuery):
         return
     with suppress(TelegramBadRequest):
         await call.answer("✅ Подключено!", show_alert=True)
+    bal = await get_user_balance(call.from_user.id)
     kb = await get_user_main_kb(call.from_user.id)
-    await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
+    await show_menu(call, f"🏠 <b>Главное меню:</b>\n💰 Баланс: <b>{bal} монет</b>", kb, with_photo=True)
 
 
 @dp.callback_query(F.data == "user_main")
@@ -1915,8 +1927,9 @@ async def user_main_handler(call: CallbackQuery, state: FSMContext):
         kb = get_connect_kb()
         await show_menu(call, get_connect_text(), kb, with_photo=True)
         return
+    bal = await get_user_balance(call.from_user.id)
     kb = await get_user_main_kb(call.from_user.id)
-    await show_menu(call, "🏠 <b>Главное меню:</b>", kb, with_photo=True)
+    await show_menu(call, f"🏠 <b>Главное меню:</b>\n💰 Баланс: <b>{bal} монет</b>", kb, with_photo=True)
 
 
 # ==========================================
@@ -2930,17 +2943,18 @@ async def show_cmds_category(call: CallbackQuery):
         text = (
             "🎮 <b>Интерактивные Мини-игры в чате</b>\n\n"
             "<b>💰 .баланс</b> — проверить баланс и забрать ежедневный бонус (+100 монет)\n\n"
-            "<b>🚢 .морскойбой</b> — <b>Морской бой 10x10</b> (ставка 15, выигрыш 45)\n"
-            "Классический бой на 10x10 кнопках с авторасстановкой флота!\n\n"
-            "<b>❌⭕ .кн</b> — <b>Крестики-нолики 3x3</b> (ставка 10, выигрыш 20)\n"
+            "<i>В любую игру можно указать ставку (например, <code>.кн 50</code>) или играть без ставки.</i>\n\n"
+            "<b>🚢 .морскойбой [ставка]</b> — <b>Морской бой 10x10</b> (x3 при победе)\n"
+            "Классический бой 10x10 с авторасстановкой флота!\n\n"
+            "<b>❌⭕ .кн [ставка]</b> — <b>Крестики-нолики 3x3</b> (x2 при победе)\n"
             "Запускает поле на кнопках прямо в чате для игры с собеседником!\n\n"
-            "<b>🪨✂️📄 .кнб</b> — <b>Камень-Ножницы-Бумага</b> (ставка 10, выигрыш 20)\n"
+            "<b>🪨✂️📄 .кнб [ставка]</b> — <b>Камень-Ножницы-Бумага</b> (x2 при победе)\n"
             "Дуэль на кнопках: выборы скрыты, пока оба игрока не сделают ход.\n\n"
-            "<b>💣 .минер</b> — <b>Сапёр 4x4 (Mines)</b> (ставка 10)\n"
+            "<b>💣 .минер [ставка]</b> — <b>Сапёр 4x4 (Mines)</b>\n"
             "Открывай клетки, лови иксы (до x15.0) и забирай куш, пока не подорвался!\n\n"
             "<b>🎲 Быстрые игры с анимацией:</b>\n"
-            "• <code>.рулетка</code> — Русская рулетка (ставка 10, выигрыш 15)\n"
-            "• <code>.монетка</code> — Подбросить монетку (ставка 10, выигрыш 20)\n"
+            "• <code>.рулетка [ставка]</code> — Русская рулетка (x1.5 при удаче)\n"
+            "• <code>.монетка [ставка]</code> — Подбросить монетку (x2 при победе)\n"
             "• <code>.шар [вопрос]</code> — Магический шар предсказаний 🎱\n"
             "• <code>.инфа [текст]</code> — Проверка вероятности в % 📊"
         )
@@ -3180,8 +3194,13 @@ def _generate_battleship_board() -> tuple[list[list[str]], list[set[tuple[int, i
     return grid, ships
 
 
+BS_COLS = ["А", "Б", "В", "Г", "Д", "Е", "Ж", "З", "И", "К"]
+BS_ROW_NUMS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+
 def _format_battleship_text_board(board: list[list[str]], reveal_ships: bool = True) -> str:
-    rows = []
+    header = "⬛" + "".join(f"<b>{c}</b> " for c in BS_COLS).strip()
+    rows = [header]
     for r in range(10):
         row_cells = []
         for c in range(10):
@@ -3194,33 +3213,53 @@ def _format_battleship_text_board(board: list[list[str]], reveal_ships: bool = T
                 row_cells.append("🚢")
             else:
                 row_cells.append("🟦")
-        rows.append("".join(row_cells))
+        rows.append(f"{BS_ROW_NUMS[r]}{''.join(row_cells)}")
     return "\n".join(rows)
 
 
-def _build_battleship_kb(conn_id: str, peer_id: int, target_board: list[list[str]], finished: bool = False) -> InlineKeyboardMarkup:
+def _build_battleship_kb(
+    conn_id: str,
+    peer_id: int,
+    target_board: list[list[str]],
+    selected_row: int | None = None,
+    finished: bool = False,
+) -> InlineKeyboardMarkup | None:
+    if finished:
+        return None
     builder = InlineKeyboardBuilder()
-    for r in range(10):
+    if selected_row is None:
+        # Шаг 1: выбор строки (1-10), по 5 кнопок в ряду (в пределах лимита Telegram 8 кнопок/ряд)
+        for r in range(10):
+            has_open = any(target_board[r][c] not in ("H", "M") for c in range(10))
+            builder.add(_safe_button(
+                text=f"Строка {r + 1}" if has_open else f"✓ {r + 1}",
+                callback_data="bs_noop" if not has_open else f"bsr|{conn_id}|{peer_id}|{r}",
+                style="primary" if has_open else None,
+                disabled=not has_open,
+            ))
+        builder.adjust(5, 5)
+    else:
+        # Шаг 2: выбор столбца (А-К) в выбранной строке
         for c in range(10):
-            cell = target_board[r][c]
+            cell = target_board[selected_row][c]
             if cell == "H":
-                txt = "💥"
+                txt = f"💥{BS_COLS[c]}"
                 cb = "bs_noop"
-                disabled = True
+                dis = True
+                st = "danger"
             elif cell == "M":
-                txt = "⏺"
+                txt = f"⏺{BS_COLS[c]}"
                 cb = "bs_noop"
-                disabled = True
-            elif finished and cell == "S":
-                txt = "🚢"
-                cb = "bs_noop"
-                disabled = True
+                dis = True
+                st = None
             else:
-                txt = "🟦"
-                cb = "bs_noop" if finished else f"bs|{conn_id}|{peer_id}|{r}|{c}"
-                disabled = finished
-            builder.add(_safe_button(text=txt, callback_data=cb, disabled=disabled))
-    builder.adjust(10)
+                txt = f"{BS_COLS[c]}{selected_row + 1}"
+                cb = f"bs|{conn_id}|{peer_id}|{selected_row}|{c}"
+                dis = False
+                st = "success"
+            builder.add(_safe_button(text=txt, callback_data=cb, style=st, disabled=dis))
+        builder.add(_safe_button(text="🔙 Выбрать другую строку", callback_data=f"bsback|{conn_id}|{peer_id}", style="danger"))
+        builder.adjust(5, 5, 1)
     return builder.as_markup()
 
 
@@ -3228,7 +3267,7 @@ def _count_remaining_ships(board: list[list[str]]) -> int:
     return sum(1 for r in range(10) for c in range(10) if board[r][c] == "S")
 
 
-@dp.business_message(F.text.lower().in_({".морскойбой", ".мб"}))
+@dp.business_message(F.text.lower().regexp(r"^\.(морскойбой|мб)(?:\s+\d+)?$"))
 async def start_battleship_game(message: Message):
     conn_id = message.business_connection_id
     owner_data = connections_cache.get(conn_id)
@@ -3237,23 +3276,24 @@ async def start_battleship_game(message: Message):
 
     owner_id = owner_data["user_id"]
     peer_id = message.chat.id
+    bet = _parse_optional_bet(message.text)
     await handle_owner_activity(owner_id, peer_id)
 
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    balance = await get_user_balance(owner_id)
-    if balance < BS_BET:
-        with suppress(Exception):
-            await bot.send_message(
-                chat_id=peer_id,
-                text=f"❌ Недостаточно монет для Морского боя! Нужно: <b>{BS_BET}</b>, у вас: <b>{balance}</b>.",
-                parse_mode="HTML",
-                business_connection_id=conn_id
-            )
-        return
-
-    await update_user_balance(owner_id, -BS_BET)
+    if bet > 0:
+        balance = await get_user_balance(owner_id)
+        if balance < bet:
+            with suppress(Exception):
+                await bot.send_message(
+                    chat_id=peer_id,
+                    text=f"❌ Недостаточно монет для Морского боя! Нужно: <b>{bet}</b>, у вас: <b>{balance}</b>.",
+                    parse_mode="HTML",
+                    business_connection_id=conn_id
+                )
+            return
+        await update_user_balance(owner_id, -bet)
 
     owner_board, owner_ships = _generate_battleship_board()
     peer_board, peer_ships = _generate_battleship_board()
@@ -3263,6 +3303,7 @@ async def start_battleship_game(message: Message):
         "owner_id": owner_id,
         "peer_id": peer_id,
         "turn": owner_id,
+        "bet": bet,
         "owner_board": owner_board,
         "peer_board": peer_board,
         "owner_ships": owner_ships,
@@ -3278,10 +3319,13 @@ async def start_battleship_game(message: Message):
         text=f"🚢 <b>Ваш флот для Морского боя 10x10:</b>\n\n{own_map}",
     )
 
+    board_view = _format_battleship_text_board(peer_board, reveal_ships=False)
+    bet_line = f"Ставка: <b>{bet}</b> монет · Приз: <b>{bet * 3}</b> монет" if bet > 0 else "Режим: <b>без ставки</b>"
     text = (
         "🚢 <b>Морской бой 10x10</b>\n"
-        f"Ставка: <b>{BS_BET}</b> монет · Приз: <b>{BS_WIN}</b> монет\n\n"
-        "Сейчас стреляет: <b>Владелец чата</b> (по полю соперника)"
+        f"{bet_line}\n\n"
+        f"{board_view}\n\n"
+        "Сейчас стреляет: <b>Владелец чата</b> (выбери строку 1–10):"
     )
     await _safe_send_msg(
         chat_id=peer_id,
@@ -3294,6 +3338,78 @@ async def start_battleship_game(message: Message):
 
 @dp.callback_query(F.data == "bs_noop")
 async def bs_noop_cb(call: CallbackQuery):
+    with suppress(TelegramBadRequest):
+        await call.answer()
+
+
+@dp.callback_query(F.data.startswith("bsr|"))
+async def battleship_pick_row_cb(call: CallbackQuery):
+    parts = call.data.split("|")
+    if len(parts) != 4:
+        return
+    _, conn_id, peer_str, r_str = parts
+    peer_id = int(peer_str)
+    r = int(r_str)
+    game_key = f"{conn_id}_{peer_id}"
+
+    game = battleship_games.get(game_key)
+    if not game:
+        with suppress(TelegramBadRequest):
+            await call.answer("Игра устарела или завершена", show_alert=True)
+        return
+    if call.from_user.id != game["turn"]:
+        with suppress(TelegramBadRequest):
+            await call.answer("Сейчас не твой ход!", show_alert=True)
+        return
+
+    is_owner_turn = (call.from_user.id == game["owner_id"])
+    target_board = game["peer_board"] if is_owner_turn else game["owner_board"]
+    turn_label = "Владелец чата" if is_owner_turn else "Собеседник"
+    remaining = _count_remaining_ships(target_board)
+    board_view = _format_battleship_text_board(target_board, reveal_ships=False)
+
+    text = (
+        "🚢 <b>Морской бой 10x10</b>\n\n"
+        f"{board_view}\n\n"
+        f"Ход: <b>{turn_label}</b> · Осталось палуб: <b>{remaining}</b>\n"
+        f"Выбрана <b>строка {r + 1}</b> — выбери столбец (А–К):"
+    )
+    await _safe_edit_msg(call.message, text, _build_battleship_kb(conn_id, peer_id, target_board, selected_row=r))
+    with suppress(TelegramBadRequest):
+        await call.answer()
+
+
+@dp.callback_query(F.data.startswith("bsback|"))
+async def battleship_back_row_cb(call: CallbackQuery):
+    parts = call.data.split("|")
+    if len(parts) != 3:
+        return
+    _, conn_id, peer_str = parts
+    peer_id = int(peer_str)
+    game_key = f"{conn_id}_{peer_id}"
+
+    game = battleship_games.get(game_key)
+    if not game:
+        with suppress(TelegramBadRequest):
+            await call.answer("Игра устарела или завершена", show_alert=True)
+        return
+    if call.from_user.id != game["turn"]:
+        with suppress(TelegramBadRequest):
+            await call.answer("Сейчас не твой ход!", show_alert=True)
+        return
+
+    is_owner_turn = (call.from_user.id == game["owner_id"])
+    target_board = game["peer_board"] if is_owner_turn else game["owner_board"]
+    turn_label = "Владелец чата" if is_owner_turn else "Собеседник"
+    remaining = _count_remaining_ships(target_board)
+    board_view = _format_battleship_text_board(target_board, reveal_ships=False)
+
+    text = (
+        "🚢 <b>Морской бой 10x10</b>\n\n"
+        f"{board_view}\n\n"
+        f"Сейчас стреляет: <b>{turn_label}</b> · Осталось палуб: <b>{remaining}</b>"
+    )
+    await _safe_edit_msg(call.message, text, _build_battleship_kb(conn_id, peer_id, target_board))
     with suppress(TelegramBadRequest):
         await call.answer()
 
@@ -3331,69 +3447,67 @@ async def battleship_move_cb(call: CallbackQuery):
             await call.answer("Сюда уже стреляли!")
         return
 
+    coord = f"{BS_COLS[c]}{r + 1}"
     hit = (cell == "S")
     if hit:
         target_board[r][c] = "H"
         remaining = _count_remaining_ships(target_board)
         if remaining == 0:
             battleship_games.pop(game_key, None)
+            bet = game.get("bet", 0)
             if is_owner_turn:
-                await update_user_balance(owner_id, BS_WIN)
-                winner_label = f"Владелец чата (+{BS_WIN} монет)"
+                if bet > 0:
+                    win_amt = bet * 3
+                    await update_user_balance(owner_id, win_amt)
+                    winner_label = f"Владелец чата (+{win_amt} монет)"
+                else:
+                    winner_label = "Владелец чата"
             else:
                 winner_label = html.escape(call.from_user.first_name or "Собеседник")
+            board_view = _format_battleship_text_board(target_board, reveal_ships=True)
             text = (
                 "🚢 <b>Морской бой 10x10 — ИГРА ОКОНЧЕНА!</b>\n\n"
+                f"{board_view}\n\n"
                 f"🏆 Победил: <b>{winner_label}</b>!"
             )
+            await _safe_edit_msg(call.message, text, None)
             with suppress(TelegramBadRequest):
-                await call.message.edit_text(
-                    text=text,
-                    reply_markup=_build_battleship_kb(conn_id, peer_id, target_board, finished=True),
-                    parse_mode="HTML"
-                )
                 await call.answer("💥 ПОБЕДА! Все корабли потоплены!")
             return
 
-        # При попадании ход остаётся у текущего игрока
         turn_label = "Владелец чата" if is_owner_turn else "Собеседник"
         board_label = "полю соперника" if is_owner_turn else "полю владельца"
+        board_view = _format_battleship_text_board(target_board, reveal_ships=False)
         text = (
             "🚢 <b>Морской бой 10x10</b>\n"
-            "💥 <b>Попадание!</b> Стреляй ещё раз.\n\n"
+            f"💥 <b>Попадание по {coord}!</b> Стреляй ещё раз.\n\n"
+            f"{board_view}\n\n"
             f"Сейчас стреляет: <b>{turn_label}</b> (по {board_label})\n"
             f"Осталось палуб у цели: <b>{remaining}</b>"
         )
+        await _safe_edit_msg(call.message, text, _build_battleship_kb(conn_id, peer_id, target_board))
         with suppress(TelegramBadRequest):
-            await call.message.edit_text(
-                text=text,
-                reply_markup=_build_battleship_kb(conn_id, peer_id, target_board),
-                parse_mode="HTML"
-            )
-            await call.answer("💥 Попадание!")
+            await call.answer(f"💥 Попадание {coord}!")
     else:
         target_board[r][c] = "M"
-        # При промахе ход переходит к сопернику
         game["turn"] = peer_id if is_owner_turn else owner_id
         next_is_owner = (game["turn"] == owner_id)
         next_board = game["peer_board"] if next_is_owner else game["owner_board"]
         turn_label = "Владелец чата" if next_is_owner else "Собеседник"
         board_label = "полю соперника" if next_is_owner else "полю владельца"
         remaining = _count_remaining_ships(next_board)
+        board_view = _format_battleship_text_board(next_board, reveal_ships=False)
 
         text = (
             "🚢 <b>Морской бой 10x10</b>\n"
-            "⏺ <b>Мимо!</b> Ход переходит сопернику.\n\n"
+            f"⏺ <b>Мимо ({coord})!</b> Ход переходит сопернику.\n\n"
+            f"{board_view}\n\n"
             f"Сейчас стреляет: <b>{turn_label}</b> (по {board_label})\n"
             f"Осталось палуб у цели: <b>{remaining}</b>"
         )
+        await _safe_edit_msg(call.message, text, _build_battleship_kb(conn_id, peer_id, next_board))
         with suppress(TelegramBadRequest):
-            await call.message.edit_text(
-                text=text,
-                reply_markup=_build_battleship_kb(conn_id, peer_id, next_board),
-                parse_mode="HTML"
-            )
-            await call.answer("⏺ Мимо!")
+            await call.answer(f"⏺ Мимо ({coord})")
 
 
 def _build_ttt_kb(conn_id: str, peer_id: int, board: list[str], finished: bool = False) -> InlineKeyboardMarkup:
@@ -3418,7 +3532,7 @@ def _check_ttt_winner(b: list[str]) -> str | None:
     return None
 
 
-@dp.business_message(F.text.lower().in_({".кн", ".крестики"}))
+@dp.business_message(F.text.lower().regexp(r"^\.(кн|крестики)(?:\s+\d+)?$"))
 async def start_ttt_game(message: Message):
     conn_id = message.business_connection_id
     owner_data = connections_cache.get(conn_id)
@@ -3427,23 +3541,24 @@ async def start_ttt_game(message: Message):
 
     owner_id = owner_data["user_id"]
     peer_id = message.chat.id
+    bet = _parse_optional_bet(message.text)
     await handle_owner_activity(owner_id, peer_id)
 
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    balance = await get_user_balance(owner_id)
-    if balance < TTT_BET:
-        with suppress(Exception):
-            await bot.send_message(
-                chat_id=peer_id,
-                text=f"❌ Недостаточно монет для Крестиков-Ноликов! Нужно: <b>{TTT_BET}</b>, у вас: <b>{balance}</b>.",
-                parse_mode="HTML",
-                business_connection_id=conn_id
-            )
-        return
-
-    await update_user_balance(owner_id, -TTT_BET)
+    if bet > 0:
+        balance = await get_user_balance(owner_id)
+        if balance < bet:
+            with suppress(Exception):
+                await bot.send_message(
+                    chat_id=peer_id,
+                    text=f"❌ Недостаточно монет для Крестиков-Ноликов! Нужно: <b>{bet}</b>, у вас: <b>{balance}</b>.",
+                    parse_mode="HTML",
+                    business_connection_id=conn_id
+                )
+            return
+        await update_user_balance(owner_id, -bet)
 
     board = [" "] * 9
     game_key = f"{conn_id}_{peer_id}"
@@ -3452,11 +3567,13 @@ async def start_ttt_game(message: Message):
         "turn": "X",
         "owner_id": owner_id,
         "peer_id": peer_id,
+        "bet": bet,
     }
 
+    bet_line = f"Ставка: <b>{bet}</b> монет · Приз: <b>{bet * 2}</b> монет" if bet > 0 else "Режим: <b>без ставки</b>"
     text = (
         "🎮 <b>Крестики-Нолики 3x3</b>\n"
-        f"Ставка: <b>{TTT_BET}</b> монет · Приз: <b>{TTT_WIN}</b> монет\n\n"
+        f"{bet_line}\n\n"
         "❌ — Владелец чата\n"
         "⭕ — Собеседник\n\n"
         "Сейчас ход: ❌"
@@ -3514,10 +3631,15 @@ async def ttt_move_cb(call: CallbackQuery):
     board[idx] = turn
     winner = _check_ttt_winner(board)
 
+    bet = game.get("bet", 0)
     if winner == "X":
         ttt_games.pop(game_key, None)
-        await update_user_balance(owner_id, TTT_WIN)
-        status = f"🏆 <b>Победил ❌ (Владелец)! (+{TTT_WIN} монет)</b>"
+        if bet > 0:
+            win_amt = bet * 2
+            await update_user_balance(owner_id, win_amt)
+            status = f"🏆 <b>Победил ❌ (Владелец)! (+{win_amt} монет)</b>"
+        else:
+            status = "🏆 <b>Победил ❌ (Владелец)!</b>"
         finished = True
     elif winner == "O":
         ttt_games.pop(game_key, None)
@@ -3525,8 +3647,11 @@ async def ttt_move_cb(call: CallbackQuery):
         finished = True
     elif winner == "D":
         ttt_games.pop(game_key, None)
-        await update_user_balance(owner_id, TTT_BET)
-        status = f"🤝 <b>Ничья!</b> (ставка {TTT_BET} монет возвращена)"
+        if bet > 0:
+            await update_user_balance(owner_id, bet)
+            status = f"🤝 <b>Ничья!</b> (ставка {bet} монет возвращена)"
+        else:
+            status = "🤝 <b>Ничья!</b>"
         finished = True
     else:
         game["turn"] = "O" if turn == "X" else "X"
@@ -3545,7 +3670,7 @@ async def ttt_move_cb(call: CallbackQuery):
         await call.answer()
 
 
-@dp.business_message(F.text.lower() == ".кнб")
+@dp.business_message(F.text.lower().regexp(r"^\.кнб(?:\s+\d+)?$"))
 async def start_rps_game(message: Message):
     conn_id = message.business_connection_id
     owner_data = connections_cache.get(conn_id)
@@ -3554,26 +3679,27 @@ async def start_rps_game(message: Message):
 
     owner_id = owner_data["user_id"]
     peer_id = message.chat.id
+    bet = _parse_optional_bet(message.text)
     await handle_owner_activity(owner_id, peer_id)
 
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    balance = await get_user_balance(owner_id)
-    if balance < RPS_BET:
-        with suppress(Exception):
-            await bot.send_message(
-                chat_id=peer_id,
-                text=f"❌ Недостаточно монет для КНБ! Нужно: <b>{RPS_BET}</b>, у вас: <b>{balance}</b>.",
-                parse_mode="HTML",
-                business_connection_id=conn_id
-            )
-        return
-
-    await update_user_balance(owner_id, -RPS_BET)
+    if bet > 0:
+        balance = await get_user_balance(owner_id)
+        if balance < bet:
+            with suppress(Exception):
+                await bot.send_message(
+                    chat_id=peer_id,
+                    text=f"❌ Недостаточно монет для КНБ! Нужно: <b>{bet}</b>, у вас: <b>{balance}</b>.",
+                    parse_mode="HTML",
+                    business_connection_id=conn_id
+                )
+            return
+        await update_user_balance(owner_id, -bet)
 
     game_key = f"{conn_id}_{peer_id}"
-    rps_games[game_key] = {"owner_id": owner_id, "peer_id": peer_id, "choices": {}}
+    rps_games[game_key] = {"owner_id": owner_id, "peer_id": peer_id, "choices": {}, "bet": bet}
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         _safe_button(text="🪨 Камень", callback_data=f"rps|{conn_id}|{peer_id}|r", style="primary"),
@@ -3581,9 +3707,10 @@ async def start_rps_game(message: Message):
         _safe_button(text="📄 Бумага", callback_data=f"rps|{conn_id}|{peer_id}|p", style="success"),
     ]])
 
+    bet_line = f"Ставка: <b>{bet}</b> монет · Приз: <b>{bet * 2}</b> монет" if bet > 0 else "Режим: <b>без ставки</b>"
     await _safe_send_msg(
         chat_id=peer_id,
-        text=f"🥊 <b>Дуэль: Камень-Ножницы-Бумага!</b>\nСтавка: <b>{RPS_BET}</b> монет · Приз: <b>{RPS_WIN}</b> монет\n\nОба участника нажимают кнопку ниже (выбор скрыт):",
+        text=f"🥊 <b>Дуэль: Камень-Ножницы-Бумага!</b>\n{bet_line}\n\nОба участника нажимают кнопку ниже (выбор скрыт):",
         reply_markup=kb,
         parse_mode="HTML",
         business_connection_id=conn_id,
@@ -3631,12 +3758,20 @@ async def rps_move_cb(call: CallbackQuery):
     c2, name2 = game["choices"]["peer"]
     names = {"r": "🪨 Камень", "s": "✂️ Ножницы", "p": "📄 Бумага"}
 
+    bet = game.get("bet", 0)
     if c1 == c2:
-        await update_user_balance(game["owner_id"], RPS_BET)
-        res = f"🤝 <b>Ничья!</b> (ставка {RPS_BET} монет возвращена)"
+        if bet > 0:
+            await update_user_balance(game["owner_id"], bet)
+            res = f"🤝 <b>Ничья!</b> (ставка {bet} монет возвращена)"
+        else:
+            res = "🤝 <b>Ничья!</b>"
     elif (c1 == "r" and c2 == "s") or (c1 == "s" and c2 == "p") or (c1 == "p" and c2 == "r"):
-        await update_user_balance(game["owner_id"], RPS_WIN)
-        res = f"🏆 Победил <b>{html.escape(name1)}</b>! (+{RPS_WIN} монет)"
+        if bet > 0:
+            win_amt = bet * 2
+            await update_user_balance(game["owner_id"], win_amt)
+            res = f"🏆 Победил <b>{html.escape(name1)}</b>! (+{win_amt} монет)"
+        else:
+            res = f"🏆 Победил <b>{html.escape(name1)}</b>!"
     else:
         res = f"🏆 Победил <b>{html.escape(name2)}</b>!"
 
@@ -3681,7 +3816,7 @@ def _build_mines_kb(conn_id: str, peer_id: int, game: dict, finished: bool = Fal
     return builder.as_markup()
 
 
-@dp.business_message(F.text.lower() == ".минер")
+@dp.business_message(F.text.lower().regexp(r"^\.минер(?:\s+\d+)?$"))
 async def start_mines_game(message: Message):
     conn_id = message.business_connection_id
     owner_data = connections_cache.get(conn_id)
@@ -3690,32 +3825,34 @@ async def start_mines_game(message: Message):
 
     owner_id = owner_data["user_id"]
     peer_id = message.chat.id
+    bet = _parse_optional_bet(message.text)
     await handle_owner_activity(owner_id, peer_id)
 
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    balance = await get_user_balance(owner_id)
-    if balance < MINES_BET:
-        with suppress(Exception):
-            await bot.send_message(
-                chat_id=peer_id,
-                text=f"❌ Недостаточно монет для Сапёра! Нужно: <b>{MINES_BET}</b>, у вас: <b>{balance}</b>.",
-                parse_mode="HTML",
-                business_connection_id=conn_id
-            )
-        return
-
-    await update_user_balance(owner_id, -MINES_BET)
+    if bet > 0:
+        balance = await get_user_balance(owner_id)
+        if balance < bet:
+            with suppress(Exception):
+                await bot.send_message(
+                    chat_id=peer_id,
+                    text=f"❌ Недостаточно монет для Сапёра! Нужно: <b>{bet}</b>, у вас: <b>{balance}</b>.",
+                    parse_mode="HTML",
+                    business_connection_id=conn_id
+                )
+            return
+        await update_user_balance(owner_id, -bet)
 
     bombs = set(random.sample(range(16), 3))
     game_key = f"{conn_id}_{peer_id}"
-    game = {"bombs": bombs, "opened": set(), "owner_id": owner_id, "bet": MINES_BET}
+    game = {"bombs": bombs, "opened": set(), "owner_id": owner_id, "bet": bet}
     mines_games[game_key] = game
 
+    bet_line = f"Ставка: <b>{bet}</b> монет" if bet > 0 else "Режим: <b>без ставки</b>"
     text = (
         "💣 <b>Сапёр 4x4 (3 бомбы)</b>\n"
-        f"Ставка: <b>{MINES_BET}</b> монет\n"
+        f"{bet_line}\n"
         "Открывай клетки с 💎 и забирай иксы!"
     )
     await _safe_send_msg(
@@ -3762,9 +3899,14 @@ async def mines_click_cb(call: CallbackQuery):
 
     if steps >= 13:
         mines_games.pop(game_key, None)
-        win_amount = int(round(game.get("bet", MINES_BET) * mult))
-        await update_user_balance(game["owner_id"], win_amount)
-        text = f"🏆 <b>АБСОЛЮТНАЯ ПОБЕДА!</b>\nОткрыты все кристаллы! Множитель: <b>x{mult}</b> (+{win_amount} монет)"
+        bet = game.get("bet", 0)
+        if bet > 0:
+            win_amount = int(round(bet * mult))
+            await update_user_balance(game["owner_id"], win_amount)
+            win_txt = f" (+{win_amount} монет)"
+        else:
+            win_txt = ""
+        text = f"🏆 <b>АБСОЛЮТНАЯ ПОБЕДА!</b>\nОткрыты все кристаллы! Множитель: <b>x{mult}</b>{win_txt}"
         finished = True
     else:
         text = f"💣 <b>Сапёр 4x4 (3 бомбы)</b>\nОткрыто: <b>{steps}/13</b> 💎 · Текущий икс: <b>x{mult}</b>"
@@ -3796,11 +3938,18 @@ async def mines_cash_cb(call: CallbackQuery):
 
     steps = len(game["opened"])
     mult = round(1.0 + steps * 0.35 + (steps ** 1.5) * 0.15, 2)
-    win_amount = int(round(game.get("bet", MINES_BET) * mult))
-    await update_user_balance(game["owner_id"], win_amount)
+    bet = game.get("bet", 0)
+    if bet > 0:
+        win_amount = int(round(bet * mult))
+        await update_user_balance(game["owner_id"], win_amount)
+        win_txt = f" · +{win_amount} монет"
+        ans_txt = f"Забрано +{win_amount} монет!"
+    else:
+        win_txt = ""
+        ans_txt = f"Забрано x{mult}!"
 
     who = html.escape(call.from_user.first_name or "Игрок")
-    text = f"💰 <b>{who} вовремя забрал куш!</b>\nИтоговый множитель: <b>x{mult}</b> ({steps} 💎 · +{win_amount} монет)"
+    text = f"💰 <b>{who} вовремя забрал куш!</b>\nИтоговый множитель: <b>x{mult}</b> ({steps} 💎{win_txt})"
 
     with suppress(TelegramBadRequest):
         await call.message.edit_text(
@@ -3808,7 +3957,7 @@ async def mines_cash_cb(call: CallbackQuery):
             reply_markup=_build_mines_kb(conn_id, peer_id, game, finished=True),
             parse_mode="HTML"
         )
-        await call.answer(f"Забрано +{win_amount} монет!")
+        await call.answer(ans_txt)
 
 
 @dp.business_message(F.text.lower().startswith(".шар"))
@@ -3869,7 +4018,7 @@ async def infa_percent_cmd(message: Message):
         )
 
 
-@dp.business_message(F.text.lower() == ".монетка")
+@dp.business_message(F.text.lower().regexp(r"^\.монетка(?:\s+\d+)?$"))
 async def coinflip_cmd(message: Message):
     conn_id = message.business_connection_id
     owner_data = connections_cache.get(conn_id)
@@ -3878,35 +4027,40 @@ async def coinflip_cmd(message: Message):
 
     owner_id = owner_data["user_id"]
     peer_id = message.chat.id
+    bet = _parse_optional_bet(message.text)
     await handle_owner_activity(owner_id, peer_id)
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    balance = await get_user_balance(owner_id)
-    if balance < COIN_BET:
-        with suppress(Exception):
-            await bot.send_message(
-                chat_id=peer_id,
-                text=f"❌ Недостаточно монет для Монетки! Нужно: <b>{COIN_BET}</b>, у вас: <b>{balance}</b>.",
-                parse_mode="HTML",
-                business_connection_id=conn_id
-            )
-        return
-
-    await update_user_balance(owner_id, -COIN_BET)
+    if bet > 0:
+        balance = await get_user_balance(owner_id)
+        if balance < bet:
+            with suppress(Exception):
+                await bot.send_message(
+                    chat_id=peer_id,
+                    text=f"❌ Недостаточно монет для Монетки! Нужно: <b>{bet}</b>, у вас: <b>{balance}</b>.",
+                    parse_mode="HTML",
+                    business_connection_id=conn_id
+                )
+            return
+        await update_user_balance(owner_id, -bet)
 
     sent = await bot.send_message(chat_id=peer_id, text="🪙 <i>Монетка летит в воздухе...</i>", parse_mode="HTML", business_connection_id=conn_id)
     await asyncio.sleep(0.7)
     if random.choice([True, False]):
-        await update_user_balance(owner_id, COIN_WIN)
-        side = f"🦅 <b>Выпал ОРЁЛ!</b> (+{COIN_WIN} монет)"
+        if bet > 0:
+            win_amt = bet * 2
+            await update_user_balance(owner_id, win_amt)
+            side = f"🦅 <b>Выпал ОРЁЛ!</b> (+{win_amt} монет)"
+        else:
+            side = "🦅 <b>Выпал ОРЁЛ!</b>"
     else:
-        side = f"🪙 <b>Выпала РЕШКА!</b> (-{COIN_BET} монет)"
+        side = f"🪙 <b>Выпала РЕШКА!</b> (-{bet} монет)" if bet > 0 else "🪙 <b>Выпала РЕШКА!</b>"
     with suppress(Exception):
         await bot.edit_message_text(chat_id=peer_id, message_id=sent.message_id, text=side, parse_mode="HTML", business_connection_id=conn_id)
 
 
-@dp.business_message(F.text.lower() == ".рулетка")
+@dp.business_message(F.text.lower().regexp(r"^\.рулетка(?:\s+\d+)?$"))
 async def russian_roulette_cmd(message: Message):
     conn_id = message.business_connection_id
     owner_data = connections_cache.get(conn_id)
@@ -3915,30 +4069,35 @@ async def russian_roulette_cmd(message: Message):
 
     owner_id = owner_data["user_id"]
     peer_id = message.chat.id
+    bet = _parse_optional_bet(message.text)
     await handle_owner_activity(owner_id, peer_id)
     with suppress(Exception):
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
 
-    balance = await get_user_balance(owner_id)
-    if balance < ROULETTE_BET:
-        with suppress(Exception):
-            await bot.send_message(
-                chat_id=peer_id,
-                text=f"❌ Недостаточно монет для Рулетки! Нужно: <b>{ROULETTE_BET}</b>, у вас: <b>{balance}</b>.",
-                parse_mode="HTML",
-                business_connection_id=conn_id
-            )
-        return
-
-    await update_user_balance(owner_id, -ROULETTE_BET)
+    if bet > 0:
+        balance = await get_user_balance(owner_id)
+        if balance < bet:
+            with suppress(Exception):
+                await bot.send_message(
+                    chat_id=peer_id,
+                    text=f"❌ Недостаточно монет для Рулетки! Нужно: <b>{bet}</b>, у вас: <b>{balance}</b>.",
+                    parse_mode="HTML",
+                    business_connection_id=conn_id
+                )
+            return
+        await update_user_balance(owner_id, -bet)
 
     sent = await bot.send_message(chat_id=peer_id, text="🔫 <i>Крутим барабан револьвера...</i>", parse_mode="HTML", business_connection_id=conn_id)
     await asyncio.sleep(0.9)
     if random.randint(1, 6) == 1:
-        outcome = f"💥 <b>БАХ! Патрон оказался в патроннике. Ты проиграл!</b> (-{ROULETTE_BET} монет)"
+        outcome = f"💥 <b>БАХ! Патрон оказался в патроннике. Ты проиграл!</b> (-{bet} монет)" if bet > 0 else "💥 <b>БАХ! Патрон оказался в патроннике. Ты проиграл!</b>"
     else:
-        await update_user_balance(owner_id, ROULETTE_WIN)
-        outcome = f"😮💨 <b>Щёлк! Холостой выстрел — тебе повезло!</b> (+{ROULETTE_WIN} монет)"
+        if bet > 0:
+            win_amt = max(bet + 1, int(round(bet * 1.5)))
+            await update_user_balance(owner_id, win_amt)
+            outcome = f"😮💨 <b>Щёлк! Холостой выстрел — тебе повезло!</b> (+{win_amt} монет)"
+        else:
+            outcome = "😮💨 <b>Щёлк! Холостой выстрел — тебе повезло!</b>"
     with suppress(Exception):
         await bot.edit_message_text(chat_id=peer_id, message_id=sent.message_id, text=outcome, parse_mode="HTML", business_connection_id=conn_id)
 
