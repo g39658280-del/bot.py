@@ -79,6 +79,147 @@ def get_http_session() -> aiohttp.ClientSession:
     return _http_session
 
 
+
+def _safe_button(
+    text: str,
+    callback_data: str | None = None,
+    url: str | None = None,
+    style: str | None = None,
+    disabled: bool = False,
+) -> InlineKeyboardButton:
+    """Создаёт InlineKeyboardButton с поддержкой style и disabled (Bot API 10.3+) и безопасным фолбэком."""
+    kwargs: dict = {"text": text}
+    if callback_data is not None:
+        kwargs["callback_data"] = callback_data
+    if url is not None:
+        kwargs["url"] = url
+    if style in ("primary", "success", "danger"):
+        kwargs["style"] = style
+    if disabled:
+        kwargs["disabled"] = True
+    try:
+        return InlineKeyboardButton(**kwargs)
+    except Exception:
+        kwargs.pop("style", None)
+        kwargs.pop("disabled", None)
+        return InlineKeyboardButton(**kwargs)
+
+
+def _strip_kb_extras(kb: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup | None:
+    """Убирает style и disabled из клавиатуры, если Telegram API/клиент их отклонил."""
+    if kb is None:
+        return None
+    new_rows = []
+    for row in kb.inline_keyboard:
+        new_row = []
+        for btn in row:
+            b_kwargs = {"text": btn.text}
+            if getattr(btn, "callback_data", None) is not None:
+                b_kwargs["callback_data"] = btn.callback_data
+            if getattr(btn, "url", None) is not None:
+                b_kwargs["url"] = btn.url
+            new_row.append(InlineKeyboardButton(**b_kwargs))
+        new_rows.append(new_row)
+    return InlineKeyboardMarkup(inline_keyboard=new_rows)
+
+
+async def _safe_send_msg(
+    chat_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str = "HTML",
+    business_connection_id: str | None = None,
+    disable_web_page_preview: bool = False,
+):
+    """Отправляет сообщение с логированием ошибок и фолбэком без style/disabled при TelegramBadRequest."""
+    kwargs: dict = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": disable_web_page_preview,
+    }
+    if reply_markup is not None:
+        kwargs["reply_markup"] = reply_markup
+    if business_connection_id is not None:
+        kwargs["business_connection_id"] = business_connection_id
+
+    try:
+        return await bot.send_message(**kwargs)
+    except TelegramBadRequest as e:
+        print(f"⚠️ send_message TelegramBadRequest: {e}")
+        if reply_markup is not None:
+            kwargs["reply_markup"] = _strip_kb_extras(reply_markup)
+            try:
+                return await bot.send_message(**kwargs)
+            except Exception as e2:
+                print(f"❌ send_message fallback error: {e2}")
+    except Exception as e:
+        print(f"❌ send_message error: {e}")
+    return None
+
+
+async def _safe_edit_msg(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str = "HTML",
+):
+    """Редактирует сообщение с фолбэком без style/disabled при TelegramBadRequest."""
+    try:
+        return await message.edit_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except TelegramBadRequest as e:
+        if "not modified" in str(e).lower():
+            return None
+        print(f"⚠️ edit_text TelegramBadRequest: {e}")
+        if reply_markup is not None:
+            try:
+                return await message.edit_text(
+                    text=text,
+                    reply_markup=_strip_kb_extras(reply_markup),
+                    parse_mode=parse_mode
+                )
+            except Exception as e2:
+                print(f"❌ edit_text fallback error: {e2}")
+    except Exception as e:
+        print(f"❌ edit_text error: {e}")
+    return None
+
+
+async def _send_ephemeral_or_dm(
+    chat_id: int,
+    owner_id: int,
+    text: str,
+    callback_query_id: str | None = None,
+):
+    """
+    В групповом чате пытается отправить эфемерное сообщение (Bot API 10.2/10.3),
+    видимое только owner_id. В личном бизнес-чате (chat_id > 0) отправляет в ЛС владельцу.
+    """
+    if chat_id < 0:
+        eph_params: dict = {"receiver_user_id": owner_id}
+        if callback_query_id:
+            eph_params["callback_query_id"] = callback_query_id
+        try:
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                ephemeral_message_parameters=eph_params,
+            )
+        except Exception as e:
+            print(f"⚠️ ephemeral send fallback to DM: {e}")
+
+    with suppress(Exception):
+        return await bot.send_message(
+            chat_id=owner_id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    return None
+
+
 async def _sniper_delete_followup(bot_instance: Bot, owner_conn_id: str, msg_id: int):
     """
     Добивает сообщения (M+1, M+2, M+3), которые сторонний бизнес-бот отправляет
@@ -1699,23 +1840,23 @@ async def get_user_main_kb(user_id: int):
         format_mode = []
 
     if is_afk:
-        afk_btn = InlineKeyboardButton(text="🟢 Автоответчик — ВКЛЮЧЕН", callback_data="afk_menu")
+        afk_btn = _safe_button(text="🟢 Автоответчик — ВКЛЮЧЕН", callback_data="afk_menu", style="success")
     else:
-        afk_btn = InlineKeyboardButton(text="🔴 Автоответчик — ВЫКЛЮЧЕН", callback_data="afk_menu")
+        afk_btn = _safe_button(text="🔴 Автоответчик — ВЫКЛЮЧЕН", callback_data="afk_menu", style="danger")
 
     fmt_label = format_mode_label(format_mode)
 
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📖 Доступные команды", callback_data="user_cmds")],
+        [_safe_button(text="📖 Доступные команды", callback_data="user_cmds", style="primary")],
         [
-            InlineKeyboardButton(text="🔇 Управление мутами", callback_data="user_mutes"),
-            InlineKeyboardButton(text="🗑 Удалённые и изменения", callback_data="deleted_menu"),
+            _safe_button(text="🔇 Управление мутами", callback_data="user_mutes"),
+            _safe_button(text="🗑 Удалённые и изменения", callback_data="deleted_menu"),
         ],
         [
-            InlineKeyboardButton(text="👤 Мой статус", callback_data="user_status"),
-            InlineKeyboardButton(text="💱 Валюты", callback_data="currency_settings"),
+            _safe_button(text="👤 Мой статус", callback_data="user_status"),
+            _safe_button(text="💱 Валюты", callback_data="currency_settings"),
         ],
-        [InlineKeyboardButton(text=f"✍️ Форматирование: {fmt_label}", callback_data="format_menu")],
+        [_safe_button(text=f"✍️ Форматирование: {fmt_label}", callback_data="format_menu")],
         [afk_btn],
     ])
 
@@ -2363,9 +2504,9 @@ async def afk_menu_handler(call: CallbackQuery):
     is_afk = user_data.get("is_afk", False)
 
     if is_afk:
-        toggle_btn = InlineKeyboardButton(text="🟢 Выключить автоответчик", callback_data="toggle_afk")
+        toggle_btn = _safe_button(text="🟢 Выключить автоответчик", callback_data="toggle_afk", style="danger")
     else:
-        toggle_btn = InlineKeyboardButton(text="🔴 Включить автоответчик", callback_data="toggle_afk")
+        toggle_btn = _safe_button(text="🔴 Включить автоответчик", callback_data="toggle_afk", style="success")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [toggle_btn],
@@ -3078,7 +3219,7 @@ def _build_battleship_kb(conn_id: str, peer_id: int, target_board: list[list[str
                 txt = "🟦"
                 cb = "bs_noop" if finished else f"bs|{conn_id}|{peer_id}|{r}|{c}"
                 disabled = finished
-            builder.add(InlineKeyboardButton(text=txt, callback_data=cb, disabled=disabled))
+            builder.add(_safe_button(text=txt, callback_data=cb, disabled=disabled))
     builder.adjust(10)
     return builder.as_markup()
 
@@ -3129,28 +3270,26 @@ async def start_battleship_game(message: Message):
     }
     battleship_games[game_key] = game
 
-    # Отправляем владельцу расстановку его собственного флота в личные сообщения
-    with suppress(Exception):
-        own_map = _format_battleship_text_board(owner_board, reveal_ships=True)
-        await bot.send_message(
-            chat_id=owner_id,
-            text=f"🚢 <b>Ваш флот для Морского боя 10x10:</b>\n\n{own_map}",
-            parse_mode="HTML"
-        )
+    # В группе отправляем эфемерный радар (видит только владелец), в ЛС-бизнесе — в личку владельцу
+    own_map = _format_battleship_text_board(owner_board, reveal_ships=True)
+    await _send_ephemeral_or_dm(
+        chat_id=peer_id,
+        owner_id=owner_id,
+        text=f"🚢 <b>Ваш флот для Морского боя 10x10:</b>\n\n{own_map}",
+    )
 
     text = (
         "🚢 <b>Морской бой 10x10</b>\n"
         f"Ставка: <b>{BS_BET}</b> монет · Приз: <b>{BS_WIN}</b> монет\n\n"
         "Сейчас стреляет: <b>Владелец чата</b> (по полю соперника)"
     )
-    with suppress(Exception):
-        await bot.send_message(
-            chat_id=peer_id,
-            text=text,
-            reply_markup=_build_battleship_kb(conn_id, peer_id, peer_board),
-            parse_mode="HTML",
-            business_connection_id=conn_id
-        )
+    await _safe_send_msg(
+        chat_id=peer_id,
+        text=text,
+        reply_markup=_build_battleship_kb(conn_id, peer_id, peer_board),
+        parse_mode="HTML",
+        business_connection_id=conn_id,
+    )
 
 
 @dp.callback_query(F.data == "bs_noop")
@@ -3263,7 +3402,8 @@ def _build_ttt_kb(conn_id: str, peer_id: int, board: list[str], finished: bool =
     for idx, cell in enumerate(board):
         is_disabled = (finished or cell != " ")
         cb = "ttt_noop" if is_disabled else f"ttt|{conn_id}|{peer_id}|{idx}"
-        builder.add(InlineKeyboardButton(text=symbols.get(cell, "⬜"), callback_data=cb, disabled=is_disabled))
+        btn_style = "primary" if cell == "X" else ("danger" if cell == "O" else None)
+        builder.add(_safe_button(text=symbols.get(cell, "⬜"), callback_data=cb, style=btn_style, disabled=is_disabled))
     builder.adjust(3, 3, 3)
     return builder.as_markup()
 
@@ -3321,14 +3461,13 @@ async def start_ttt_game(message: Message):
         "⭕ — Собеседник\n\n"
         "Сейчас ход: ❌"
     )
-    with suppress(Exception):
-        await bot.send_message(
-            chat_id=peer_id,
-            text=text,
-            reply_markup=_build_ttt_kb(conn_id, peer_id, board),
-            parse_mode="HTML",
-            business_connection_id=conn_id
-        )
+    await _safe_send_msg(
+        chat_id=peer_id,
+        text=text,
+        reply_markup=_build_ttt_kb(conn_id, peer_id, board),
+        parse_mode="HTML",
+        business_connection_id=conn_id,
+    )
 
 
 @dp.callback_query(F.data == "ttt_noop")
@@ -3401,12 +3540,8 @@ async def ttt_move_cb(call: CallbackQuery):
         "⭕ — Собеседник\n\n"
         f"{status}"
     )
+    await _safe_edit_msg(call.message, text, _build_ttt_kb(conn_id, peer_id, board, finished=finished))
     with suppress(TelegramBadRequest):
-        await call.message.edit_text(
-            text=text,
-            reply_markup=_build_ttt_kb(conn_id, peer_id, board, finished=finished),
-            parse_mode="HTML"
-        )
         await call.answer()
 
 
@@ -3441,19 +3576,18 @@ async def start_rps_game(message: Message):
     rps_games[game_key] = {"owner_id": owner_id, "peer_id": peer_id, "choices": {}}
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🪨 Камень", callback_data=f"rps|{conn_id}|{peer_id}|r"),
-        InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"rps|{conn_id}|{peer_id}|s"),
-        InlineKeyboardButton(text="📄 Бумага", callback_data=f"rps|{conn_id}|{peer_id}|p"),
+        _safe_button(text="🪨 Камень", callback_data=f"rps|{conn_id}|{peer_id}|r", style="primary"),
+        _safe_button(text="✂️ Ножницы", callback_data=f"rps|{conn_id}|{peer_id}|s", style="danger"),
+        _safe_button(text="📄 Бумага", callback_data=f"rps|{conn_id}|{peer_id}|p", style="success"),
     ]])
 
-    with suppress(Exception):
-        await bot.send_message(
-            chat_id=peer_id,
-            text=f"🥊 <b>Дуэль: Камень-Ножницы-Бумага!</b>\nСтавка: <b>{RPS_BET}</b> монет · Приз: <b>{RPS_WIN}</b> монет\n\nОба участника нажимают кнопку ниже (выбор скрыт):",
-            reply_markup=kb,
-            parse_mode="HTML",
-            business_connection_id=conn_id
-        )
+    await _safe_send_msg(
+        chat_id=peer_id,
+        text=f"🥊 <b>Дуэль: Камень-Ножницы-Бумага!</b>\nСтавка: <b>{RPS_BET}</b> монет · Приз: <b>{RPS_WIN}</b> монет\n\nОба участника нажимают кнопку ниже (выбор скрыт):",
+        reply_markup=kb,
+        parse_mode="HTML",
+        business_connection_id=conn_id,
+    )
 
 
 @dp.callback_query(F.data.startswith("rps|"))
@@ -3535,11 +3669,12 @@ def _build_mines_kb(conn_id: str, peer_id: int, game: dict, finished: bool = Fal
         else:
             txt = "❓"
             cb = f"mine|{conn_id}|{peer_id}|{idx}"
-        builder.add(InlineKeyboardButton(text=txt, callback_data=cb, disabled=is_disabled))
+        btn_style = "success" if idx in opened else ("danger" if (finished and idx in bombs) else None)
+        builder.add(_safe_button(text=txt, callback_data=cb, style=btn_style, disabled=is_disabled))
 
     if not finished and len(opened) > 0:
         mult = round(1.0 + len(opened) * 0.35 + (len(opened) ** 1.5) * 0.15, 2)
-        builder.add(InlineKeyboardButton(text=f"💰 Забрать x{mult}", callback_data=f"minecash|{conn_id}|{peer_id}"))
+        builder.add(_safe_button(text=f"💰 Забрать x{mult}", callback_data=f"minecash|{conn_id}|{peer_id}", style="success"))
         builder.adjust(4, 4, 4, 4, 1)
     else:
         builder.adjust(4, 4, 4, 4)
@@ -3583,14 +3718,13 @@ async def start_mines_game(message: Message):
         f"Ставка: <b>{MINES_BET}</b> монет\n"
         "Открывай клетки с 💎 и забирай иксы!"
     )
-    with suppress(Exception):
-        await bot.send_message(
-            chat_id=peer_id,
-            text=text,
-            reply_markup=_build_mines_kb(conn_id, peer_id, game),
-            parse_mode="HTML",
-            business_connection_id=conn_id
-        )
+    await _safe_send_msg(
+        chat_id=peer_id,
+        text=text,
+        reply_markup=_build_mines_kb(conn_id, peer_id, game),
+        parse_mode="HTML",
+        business_connection_id=conn_id,
+    )
 
 
 @dp.callback_query(F.data.startswith("mine|"))
@@ -3938,7 +4072,7 @@ async def mute_user(message: Message):
         )
 
     muted_chats[mute_key] = until_ts
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Размутить", callback_data=f"unmute|{conn_id}|{peer_id}")]])
+    markup = InlineKeyboardMarkup(inline_keyboard=[[_safe_button(text="Размутить", callback_data=f"unmute|{conn_id}|{peer_id}", style="danger")]])
     with suppress(Exception):
         await bot.send_message(
             chat_id=peer_id,
@@ -4566,13 +4700,11 @@ async def process_gift_link_auto(message: Message):
 
     data = await get_gift_card_data(slug)
     result_text = format_gift_card(data)
-    with suppress(Exception):
-        await bot.send_message(
-            chat_id=owner_id,
-            text=result_text,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
+    await _send_ephemeral_or_dm(
+        chat_id=message.chat.id,
+        owner_id=owner_id,
+        text=result_text,
+    )
 
 
 # ==========================================
