@@ -7,3 +7,5 @@ google-auth
 google-auth-oauthlib
 cachetools>=5.3.0
 uvloop
+opencv-python-headless
+Pillow
