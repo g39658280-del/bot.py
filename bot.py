@@ -28,6 +28,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from simpleeval import simple_eval
 from cachetools import TTLCache
+try:
+    from PIL import Image, ImageSequence
+except ImportError:
+    Image = None
+    ImageSequence = None
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -62,6 +67,8 @@ NFTMATCH_BASE = "https://nftmatch.pro/api"
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 MENU_PHOTO = "https://files.catbox.moe/bph5iz.webp"
 CAPTION_LIMIT = 1024
@@ -3037,6 +3044,12 @@ async def show_cmds_category(call: CallbackQuery):
             "<b>🆔 .ид</b>\n"
             "Ответь на сообщение — бот покажет ID пользователя и коды всех премиум-эмодзи.\n\n"
             f"{admin_block}"
+            "<b>🎙 .текст / .гс</b>\n"
+            "Ответь на голосовое или кружок — бот расшифрует речь в текст (тихо в ЛС).\n\n"
+            "<b>🌐 .пер [язык] [текст]</b>\n"
+            "Переводит текст или сообщение по ответу (RU ⇄ EN и др.).\n\n"
+            "<b>⌨️ .р [текст] / .раскладка</b>\n"
+            "Меняет раскладку (<code>ghbdtn</code> → <code>привет</code>), работает и по ответу на твоё сообщение.\n\n"
             "<b>💣 .[N] [текст]</b>\n"
             "Отправляет сообщение N раз подряд (до 20).\n"
             "Пример: <code>.10 привет</code>"
@@ -3072,7 +3085,9 @@ async def show_cmds_category(call: CallbackQuery):
             "<b>⌨️ Классическая печать:</b>\n"
             "• <code>.п1 [текст]</code> — плавная печать по буквам\n"
             "• <code>.п2 [текст]</code> — печать с мигающим курсором ▌\n"
-            "• <code>.п3 [текст]</code> — сборка из случайных символов"
+            "• <code>.п3 [текст]</code> — сборка из случайных символов\n\n"
+            "<b>⣿ Брайль-анимация из GIF/фото:</b>\n"
+            "• <code>.брайль [ширина]</code> — ответь на гифку, фото или стикер (по умолчанию ширина 24)"
         )
     else:
         text = (
@@ -3140,6 +3155,238 @@ async def on_business_connection(connection: BusinessConnection):
         connections_cache.pop(connection.id, None)
         with suppress(Exception):
             await connections_collection.delete_one({"business_connection_id": connection.id})
+
+
+
+# ==========================================
+# РАСКЛАДКА (.р), ПЕРЕВОД (.пер) И РАСШИФРОВКА ГС (.текст)
+# ==========================================
+_EN_CHARS = "`qwertyuiop[]asdfghjkl;'zxcvbnm,.~QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>@#$^&"
+_RU_CHARS = "ёйцукенгшщзхъфывапролджэячсмитьбюЁЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ\"№;:?"
+_EN_TO_RU = str.maketrans(_EN_CHARS, _RU_CHARS)
+_RU_TO_EN = str.maketrans(_RU_CHARS, _EN_CHARS)
+
+
+def _switch_keyboard_layout(text: str) -> str:
+    en_count = sum(1 for ch in text if "a" <= ch.lower() <= "z" or ch in "[]{}';:\"<>`~")
+    ru_count = sum(1 for ch in text if "а" <= ch.lower() <= "я" or ch in "ёЁ№")
+    if en_count >= ru_count:
+        return text.translate(_EN_TO_RU)
+    return text.translate(_RU_TO_EN)
+
+
+async def _translate_text(text: str, target_lang: str | None = None) -> str | None:
+    if not target_lang:
+        ru_count = sum(1 for ch in text if "а" <= ch.lower() <= "я" or ch in "ёЁ")
+        en_count = sum(1 for ch in text if "a" <= ch.lower() <= "z")
+        target_lang = "en" if ru_count > en_count else "ru"
+
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": "auto",
+        "tl": target_lang,
+        "dt": "t",
+        "q": text,
+    }
+    session = get_http_session()
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                if isinstance(data, list) and data and isinstance(data[0], list):
+                    return "".join(part[0] for part in data[0] if part and part[0])
+    except Exception as e:
+        print(f"translate error: {e}")
+    return None
+
+
+async def _transcribe_audio_bytes(audio_bytes: bytes, filename: str) -> tuple[str | None, str | None]:
+    """Отправляет аудио в Groq Whisper или OpenAI Whisper. Возвращает (текст, ошибка)."""
+    if GROQ_API_KEY:
+        api_url = "https://api.groq.com/openai/v1/audio/transcriptions"
+        api_key = GROQ_API_KEY
+        model_name = "whisper-large-v3-turbo"
+    elif OPENAI_API_KEY:
+        api_url = "https://api.openai.com/v1/audio/transcriptions"
+        api_key = OPENAI_API_KEY
+        model_name = "whisper-1"
+    else:
+        return None, "Не задан GROQ_API_KEY или OPENAI_API_KEY в переменных окружения."
+
+    form = aiohttp.FormData()
+    form.add_field("file", audio_bytes, filename=filename, content_type="application/octet-stream")
+    form.add_field("model", model_name)
+
+    session = get_http_session()
+    try:
+        async with session.post(
+            api_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            data=form,
+            timeout=aiohttp.ClientTimeout(total=45),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return (data.get("text") or "").strip(), None
+            err_txt = await resp.text()
+            return None, f"API {resp.status}: {err_txt[:150]}"
+    except Exception as e:
+        return None, str(e)
+
+
+@dp.business_message(F.text.lower().regexp(r"^\.(р|раскладка|fix)(?:\s+.*)?$"))
+@dp.message(F.text.lower().regexp(r"^\.(р|раскладка|fix)(?:\s+.*)?$"))
+async def cmd_fix_layout(message: Message):
+    conn_id = getattr(message, "business_connection_id", None)
+    if conn_id:
+        owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
+        if not owner_data or message.from_user.id != owner_data["user_id"]:
+            return
+        owner_id = owner_data["user_id"]
+        await handle_owner_activity(owner_id, message.chat.id)
+        with suppress(Exception):
+            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    else:
+        owner_id = message.from_user.id
+        with suppress(Exception):
+            await message.delete()
+
+    parts = message.text.split(maxsplit=1)
+    inline_text = parts[1].strip() if len(parts) > 1 else ""
+
+    if inline_text:
+        fixed = _switch_keyboard_layout(inline_text)
+        with suppress(Exception):
+            await bot.send_message(chat_id=message.chat.id, text=fixed, business_connection_id=conn_id)
+        return
+
+    reply = message.reply_to_message
+    if not reply or not (reply.text or reply.caption):
+        return
+
+    src = reply.text or reply.caption
+    fixed = _switch_keyboard_layout(src)
+    if conn_id and reply.from_user and reply.from_user.id == owner_id:
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=reply.message_id,
+                text=fixed,
+                business_connection_id=conn_id,
+            )
+            return
+
+    with suppress(Exception):
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text=fixed,
+            reply_to_message_id=reply.message_id,
+            business_connection_id=conn_id,
+        )
+
+
+@dp.business_message(F.text.lower().regexp(r"^\.(пер|перевод|tr)(?:\s+.*)?$"))
+@dp.message(F.text.lower().regexp(r"^\.(пер|перевод|tr)(?:\s+.*)?$"))
+async def cmd_translate(message: Message):
+    conn_id = getattr(message, "business_connection_id", None)
+    if conn_id:
+        owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
+        if not owner_data or message.from_user.id != owner_data["user_id"]:
+            return
+        await handle_owner_activity(owner_data["user_id"], message.chat.id)
+        with suppress(Exception):
+            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    else:
+        with suppress(Exception):
+            await message.delete()
+
+    parts = message.text.split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    target_lang = None
+    text_to_translate = ""
+
+    if arg:
+        sub = arg.split(maxsplit=1)
+        if sub[0].lower() in ("ru", "en", "uk", "de", "fr", "es", "zh", "ja", "tr", "pl", "it"):
+            target_lang = sub[0].lower()
+            text_to_translate = sub[1].strip() if len(sub) > 1 else ""
+        else:
+            text_to_translate = arg
+
+    if not text_to_translate and message.reply_to_message:
+        text_to_translate = message.reply_to_message.text or message.reply_to_message.caption or ""
+
+    if not text_to_translate:
+        return
+
+    translated = await _translate_text(text_to_translate, target_lang=target_lang)
+    if not translated:
+        return
+
+    with suppress(Exception):
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text=f"🌐 {html.escape(translated)}",
+            parse_mode="HTML",
+            reply_to_message_id=message.reply_to_message.message_id if message.reply_to_message else None,
+            business_connection_id=conn_id,
+        )
+
+
+@dp.business_message(F.text.lower().in_({".текст", ".гс", ".расшифруй"}))
+@dp.message(F.text.lower().in_({".текст", ".гс", ".расшифруй"}))
+async def cmd_transcribe_voice(message: Message):
+    conn_id = getattr(message, "business_connection_id", None)
+    if conn_id:
+        owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
+        if not owner_data or message.from_user.id != owner_data["user_id"]:
+            return
+        owner_id = owner_data["user_id"]
+        with suppress(Exception):
+            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    else:
+        owner_id = message.from_user.id
+        with suppress(Exception):
+            await message.delete()
+
+    reply = message.reply_to_message
+    if not reply:
+        return
+
+    file_id, filename, fsize = None, "voice.ogg", 0
+    if reply.voice:
+        file_id, filename, fsize = reply.voice.file_id, "voice.ogg", reply.voice.file_size or 0
+    elif reply.video_note:
+        file_id, filename, fsize = reply.video_note.file_id, "video_note.mp4", reply.video_note.file_size or 0
+    elif reply.audio:
+        file_id, filename, fsize = reply.audio.file_id, reply.audio.file_name or "audio.mp3", reply.audio.file_size or 0
+    elif reply.video:
+        file_id, filename, fsize = reply.video.file_id, "video.mp4", reply.video.file_size or 0
+
+    if not file_id:
+        return
+    if fsize > 20 * 1024 * 1024:
+        await _send_ephemeral_or_dm(message.chat.id, owner_id, "⚠️ Файл больше 20 МБ, расшифровка пропущена.")
+        return
+
+    try:
+        file_obj = await bot.get_file(file_id)
+        buf = await bot.download_file(file_obj.file_path)
+        audio_bytes = buf.read()
+    except Exception as e:
+        await _send_ephemeral_or_dm(message.chat.id, owner_id, f"❌ Не удалось скачать аудио: {html.escape(str(e))}")
+        return
+
+    transcript, err = await _transcribe_audio_bytes(audio_bytes, filename)
+    gc.collect()
+
+    if err:
+        await _send_ephemeral_or_dm(message.chat.id, owner_id, f"⚠️ Расшифровка недоступна: {html.escape(err)}")
+        return
+
+    out_text = f"🎙 <b>Расшифровка:</b>\n{html.escape(transcript or '[пусто]')}"
+    await _send_ephemeral_or_dm(message.chat.id, owner_id, out_text)
 
 
 # ==========================================
@@ -4926,6 +5173,151 @@ async def anim_ticker(message: Message):
             parse_mode="HTML",
             business_connection_id=conn_id
         )
+
+
+
+# ==========================================
+# ДЕТАЛИЗИРОВАННАЯ БРАЙЛЬ-АНИМАЦИЯ (.брайль)
+# ==========================================
+_BRAILLE_BITS = (
+    (0x01, 0x08),
+    (0x02, 0x10),
+    (0x04, 0x20),
+    (0x40, 0x80),
+)
+
+
+def _pil_frame_to_braille(frame: "Image.Image", width_chars: int = 24) -> str:
+    gray = frame.convert("L")
+    w_px = max(8, width_chars * 2)
+    aspect = gray.height / max(1, gray.width)
+    # Ограничиваем высоту, чтобы сетка не переносилась и влезала в экран телефона
+    h_chars = max(4, min(18, round((w_px * aspect) / 4)))
+    h_px = h_chars * 4
+
+    resized = gray.resize((w_px, h_px), Image.Resampling.LANCZOS)
+    bw = resized.convert("1")  # Дизеринг Флойда-Стейнберга
+    pixels = bw.load()
+
+    lines = []
+    for cy in range(h_chars):
+        row_chars = []
+        y0 = cy * 4
+        for cx in range(width_chars):
+            x0 = cx * 2
+            code = 0x2800
+            for dy in range(4):
+                for dx in range(2):
+                    if pixels[x0 + dx, y0 + dy] == 0:
+                        code |= _BRAILLE_BITS[dy][dx]
+            # Заменяем пустой символ Брайля (U+2800) на обычный U+2800 или точку, чтобы Telegram не схлопывал пробелы
+            row_chars.append(chr(code))
+        lines.append("".join(row_chars))
+    return "\n".join(lines)
+
+
+def _media_bytes_to_braille_frames(raw_bytes: bytes, width_chars: int = 24, max_frames: int = 8) -> list[str]:
+    frames_out: list[str] = []
+    with Image.open(io.BytesIO(raw_bytes)) as img:
+        all_frames = [f.copy() for f in ImageSequence.Iterator(img)]
+        if not all_frames:
+            return []
+        if len(all_frames) > max_frames:
+            step = len(all_frames) / max_frames
+            picked = [all_frames[int(i * step)] for i in range(max_frames)]
+        else:
+            picked = all_frames
+        for fr in picked:
+            frames_out.append(_pil_frame_to_braille(fr, width_chars=width_chars))
+    return frames_out
+
+
+@dp.business_message(F.text.lower().regexp(r"^\.(брайль|аним)(?:\s+\d+)?$"))
+@dp.message(F.text.lower().regexp(r"^\.(брайль|аним)(?:\s+\d+)?$"))
+async def cmd_braille_anim(message: Message):
+    conn_id = getattr(message, "business_connection_id", None)
+    if conn_id:
+        owner_data = connections_cache.get(conn_id) or await connections_collection.find_one({"business_connection_id": conn_id})
+        if not owner_data or message.from_user.id != owner_data["user_id"]:
+            return
+        await handle_owner_activity(owner_data["user_id"], message.chat.id)
+        with suppress(Exception):
+            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+    else:
+        with suppress(Exception):
+            await message.delete()
+
+    if Image is None:
+        with suppress(Exception):
+            await bot.send_message(
+                chat_id=message.chat.id,
+                text="⚠️ Для команды <code>.брайль</code> нужно добавить <code>Pillow</code> в requirements.txt.",
+                parse_mode="HTML",
+                business_connection_id=conn_id,
+            )
+        return
+
+    reply = message.reply_to_message
+    if not reply:
+        return
+
+    parts = message.text.strip().split()
+    width_chars = 24
+    if len(parts) >= 2 and parts[1].isdigit():
+        width_chars = max(12, min(30, int(parts[1])))
+
+    file_id = None
+    fsize = 0
+    if reply.animation:
+        file_id, fsize = reply.animation.file_id, reply.animation.file_size or 0
+    elif reply.photo:
+        file_id, fsize = reply.photo[-1].file_id, reply.photo[-1].file_size or 0
+    elif reply.sticker and not reply.sticker.is_video and not reply.sticker.is_animated:
+        file_id, fsize = reply.sticker.file_id, reply.sticker.file_size or 0
+    elif reply.document and (reply.document.mime_type or "").startswith(("image/", "video/gif")):
+        file_id, fsize = reply.document.file_id, reply.document.file_size or 0
+
+    if not file_id or fsize > 8 * 1024 * 1024:
+        return
+
+    try:
+        file_obj = await bot.get_file(file_id)
+        buf = await bot.download_file(file_obj.file_path)
+        raw_bytes = buf.read()
+        loop = asyncio.get_running_loop()
+        frames = await loop.run_in_executor(None, _media_bytes_to_braille_frames, raw_bytes, width_chars, 8)
+    except Exception as e:
+        print(f"braille error: {e}")
+        return
+    finally:
+        gc.collect()
+
+    if not frames:
+        return
+
+    sent = await _safe_send_msg(
+        chat_id=message.chat.id,
+        text=f"<pre>{html.escape(frames[0])}</pre>",
+        parse_mode="HTML",
+        business_connection_id=conn_id,
+    )
+    if not sent or len(frames) == 1:
+        return
+
+    # Проигрываем 2 цикла анимации
+    for cycle in range(2):
+        for idx, fr in enumerate(frames):
+            if cycle == 0 and idx == 0:
+                continue
+            await asyncio.sleep(0.35)
+            with suppress(Exception):
+                await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=sent.message_id,
+                    text=f"<pre>{html.escape(fr)}</pre>",
+                    parse_mode="HTML",
+                    business_connection_id=conn_id,
+                )
 
 
 # ==========================================
