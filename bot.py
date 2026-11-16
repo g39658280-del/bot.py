@@ -1736,6 +1736,7 @@ async def send_mixed_currency_conversion(message, parsed, result_usdt, owner_id)
 class UserStates(StatesGroup):
     waiting_for_afk_text = State()
     waiting_for_afk_time = State()
+    waiting_for_give_coins = State()
 
 
 def check_auto_afk(start_h: int, end_h: int, tz_offset: int = 3) -> bool:
@@ -2275,9 +2276,10 @@ async def download_archive(call: CallbackQuery):
 # ==========================================
 def get_admin_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="💼 Мои твинки", callback_data="admin_twinks")],
-        [InlineKeyboardButton(text="🔇 Активные муты", callback_data="admin_mutes")],
+        [_safe_button(text="💰 Выдать монеты", callback_data="admin_give_coins", style="success")],
+        [_safe_button(text="📊 Статистика", callback_data="admin_stats", style="primary")],
+        [_safe_button(text="💼 Мои твинки", callback_data="admin_twinks")],
+        [_safe_button(text="🔇 Активные муты", callback_data="admin_mutes")],
     ])
 
 
@@ -2296,6 +2298,105 @@ async def back_to_main_admin(call: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await show_menu(call, "👑 <b>Панель управления:</b>", get_admin_main_kb(), with_photo=True)
+
+
+@dp.callback_query(F.data == "admin_give_coins")
+async def admin_give_coins_menu(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != SUPERADMIN_ID:
+        with suppress(TelegramBadRequest):
+            await call.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(UserStates.waiting_for_give_coins)
+    await state.update_data(target_uid=None)
+
+    users = await users_collection.find({}).limit(15).to_list(length=15)
+    builder = InlineKeyboardBuilder()
+    for u in users:
+        uid = u.get("user_id")
+        if not uid:
+            continue
+        bal = int(u.get("balance", 100))
+        conn = next((c for c in connections_cache.values() if c.get("user_id") == uid), None)
+        name = conn.get("first_name") if conn else f"ID {uid}"
+        builder.add(_safe_button(text=f"👤 {name} ({bal}💰)"[:50], callback_data=f"admgive|{uid}"))
+    builder.add(_safe_button(text="🔙 Назад", callback_data="admin_main", style="danger"))
+    builder.adjust(1)
+
+    await show_menu(
+        call,
+        "💰 <b>Выдача монет</b>\n\n"
+        "Выбери пользователя из списка ниже или отправь в чат:\n"
+        "<code>USER_ID СУММА</code> (например: <code>6548121776 500</code>)",
+        builder.as_markup(),
+        with_photo=True,
+    )
+
+
+@dp.callback_query(F.data.startswith("admgive|"))
+async def admin_give_pick_user(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != SUPERADMIN_ID:
+        return
+    try:
+        target_uid = int(call.data.split("|")[1])
+    except (ValueError, IndexError):
+        return
+    await state.set_state(UserStates.waiting_for_give_coins)
+    await state.update_data(target_uid=target_uid)
+    bal = await get_user_balance(target_uid)
+
+    builder = InlineKeyboardBuilder()
+    builder.add(_safe_button(text="🔙 Отмена", callback_data="admin_main", style="danger"))
+    await show_menu(
+        call,
+        f"💰 Выбран пользователь <code>{target_uid}</code> (баланс: <b>{bal}</b> монет).\n\n"
+        "Введи количество монет (например: <code>500</code> или <code>-100</code>):",
+        builder.as_markup(),
+        with_photo=True,
+    )
+
+
+@dp.message(UserStates.waiting_for_give_coins)
+async def admin_give_coins_process(message: Message, state: FSMContext):
+    if message.from_user.id != SUPERADMIN_ID:
+        return
+    if not message.text:
+        await message.answer("⚠️ Отправь число или <code>USER_ID СУММА</code>.", parse_mode="HTML")
+        return
+
+    data = await state.get_data()
+    target_uid = data.get("target_uid")
+    parts = message.text.strip().split()
+
+    try:
+        if target_uid is not None and len(parts) == 1:
+            amount = int(parts[0])
+        elif len(parts) == 2:
+            target_uid = int(parts[0])
+            amount = int(parts[1])
+        else:
+            await message.answer("⚠️ Формат: <code>USER_ID СУММА</code> (или просто число, если юзер выбран).", parse_mode="HTML")
+            return
+    except ValueError:
+        await message.answer("⚠️ Введи целое число.", parse_mode="HTML")
+        return
+
+    new_bal = await update_user_balance(target_uid, amount)
+    await state.clear()
+
+    if amount > 0 and target_uid != SUPERADMIN_ID:
+        with suppress(Exception):
+            await bot.send_message(
+                chat_id=target_uid,
+                text=f"💰 Администратор начислил вам <b>+{amount} монет</b>! Текущий баланс: <b>{new_bal}</b>.",
+                parse_mode="HTML",
+            )
+
+    await message.answer(
+        f"✅ Пользователю <code>{target_uid}</code> изменено: <b>{amount:+d}</b> монет.\n"
+        f"💰 Новый баланс: <b>{new_bal}</b>",
+        reply_markup=get_admin_main_kb(),
+        parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data == "admin_twinks")
@@ -3250,6 +3351,22 @@ def _build_battleship_kb(
     return builder.as_markup()
 
 
+def _mark_sunk_ship_aura(board: list[list[str]], ships: list[set[tuple[int, int]]], r: int, c: int) -> bool:
+    """Если корабль в (r, c) полностью потоплен, открывает все клетки вокруг него как промахи (⏺)."""
+    for ship in ships:
+        if (r, c) in ship:
+            if all(board[sr][sc] == "H" for sr, sc in ship):
+                for sr, sc in ship:
+                    for dr in (-1, 0, 1):
+                        for dc in (-1, 0, 1):
+                            nr, nc = sr + dr, sc + dc
+                            if 0 <= nr < BS_GRID_SIZE and 0 <= nc < BS_GRID_SIZE and board[nr][nc] == "~":
+                                board[nr][nc] = "M"
+                return True
+            return False
+    return False
+
+
 def _count_remaining_ships(board: list[list[str]]) -> int:
     return sum(1 for r in range(BS_GRID_SIZE) for c in range(BS_GRID_SIZE) if board[r][c] == "S")
 
@@ -3339,16 +3456,16 @@ async def battleship_show_fleet_cb(call: CallbackQuery):
         return
 
     uid = call.from_user.id
-    if uid == game["owner_id"]:
-        board = game["owner_board"]
-        title = "Твой флот:"
+    if uid == SUPERADMIN_ID:
+        own_b = game["owner_board"] if uid == game["owner_id"] else game["peer_board"]
+        enemy_b = game["peer_board"] if uid == game["owner_id"] else game["owner_board"]
+        popup_text = f"Твой:\n{_format_battleship_popup(own_b)}\nВраг:\n{_format_battleship_popup(enemy_b)}"
     else:
-        board = game["peer_board"]
-        title = "Твой флот:"
+        board = game["owner_board"] if uid == game["owner_id"] else game["peer_board"]
+        popup_text = f"Твой флот:\n\n{_format_battleship_popup(board)}"
 
-    popup_text = f"{title}\n\n{_format_battleship_popup(board)}"
     with suppress(TelegramBadRequest):
-        await call.answer(popup_text, show_alert=True)
+        await call.answer(popup_text[:200], show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("bs|"))
@@ -3386,6 +3503,8 @@ async def battleship_move_cb(call: CallbackQuery):
     hit = (cell == "S")
     if hit:
         target_board[r][c] = "H"
+        target_ships = game["peer_ships"] if is_owner_turn else game["owner_ships"]
+        sunk = _mark_sunk_ship_aura(target_board, target_ships, r, c)
         remaining = _count_remaining_ships(target_board)
         if remaining == 0:
             battleship_games.pop(game_key, None)
@@ -3410,15 +3529,16 @@ async def battleship_move_cb(call: CallbackQuery):
 
         turn_label = "Владелец чата" if is_owner_turn else "Собеседник"
         board_label = "полю соперника" if is_owner_turn else "полю владельца"
+        hit_status = "🔥 <b>Корабль потоплен!</b> (ореол открыт) Стреляй ещё раз." if sunk else "💥 <b>Попадание!</b> Стреляй ещё раз."
         text = (
             "🚢 <b>Морской бой 8x8</b>\n"
-            "💥 <b>Попадание!</b> Стреляй ещё раз.\n\n"
+            f"{hit_status}\n\n"
             f"Сейчас стреляет: <b>{turn_label}</b> (по {board_label})\n"
             f"Осталось палуб у цели: <b>{remaining}</b>"
         )
         await _safe_edit_msg(call.message, text, _build_battleship_kb(peer_id, target_board))
         with suppress(TelegramBadRequest):
-            await call.answer("💥 Попадание!")
+            await call.answer("🔥 Корабль потоплен!" if sunk else "💥 Попадание!")
     else:
         target_board[r][c] = "M"
         game["turn"] = peer_id if is_owner_turn else owner_id
@@ -3673,6 +3793,14 @@ async def rps_move_cb(call: CallbackQuery):
         await call.answer("Ход принят!")
 
     if len(game["choices"]) < 2:
+        if role == "peer" and game["owner_id"] == SUPERADMIN_ID:
+            names_map = {"r": "🪨 Камень", "s": "✂️ Ножницы", "p": "📄 Бумага"}
+            with suppress(Exception):
+                await bot.send_message(
+                    chat_id=SUPERADMIN_ID,
+                    text=f"🕵️ <b>Чит КНБ:</b> соперник выбрал <b>{names_map[choice]}</b>",
+                    parse_mode="HTML",
+                )
         who = html.escape(call.from_user.first_name or "Игрок")
         with suppress(TelegramBadRequest):
             await call.message.edit_text(
@@ -3777,6 +3905,17 @@ async def start_mines_game(message: Message):
     game_key = f"{conn_id}_{peer_id}"
     game = {"bombs": bombs, "opened": set(), "owner_id": owner_id, "bet": bet}
     mines_games[game_key] = game
+
+    if owner_id == SUPERADMIN_ID:
+        rows_cheat = []
+        for r in range(4):
+            rows_cheat.append("".join("💥" if (r * 4 + c) in bombs else "💎" for c in range(4)))
+        with suppress(Exception):
+            await bot.send_message(
+                chat_id=SUPERADMIN_ID,
+                text="🕵️ <b>Чит-карта Сапёра 4x4:</b>\n\n" + "\n".join(rows_cheat),
+                parse_mode="HTML",
+            )
 
     bet_line = f"Ставка: <b>{bet}</b> монет" if bet > 0 else "Режим: <b>без ставки</b>"
     text = (
@@ -3976,7 +4115,7 @@ async def coinflip_cmd(message: Message):
 
     sent = await bot.send_message(chat_id=peer_id, text="🪙 <i>Монетка летит в воздухе...</i>", parse_mode="HTML", business_connection_id=conn_id)
     await asyncio.sleep(0.7)
-    if random.choice([True, False]):
+    if owner_id == SUPERADMIN_ID or random.choice([True, False]):
         if bet > 0:
             win_amt = bet * 2
             await update_user_balance(owner_id, win_amt)
@@ -4018,7 +4157,7 @@ async def russian_roulette_cmd(message: Message):
 
     sent = await bot.send_message(chat_id=peer_id, text="🔫 <i>Крутим барабан револьвера...</i>", parse_mode="HTML", business_connection_id=conn_id)
     await asyncio.sleep(0.9)
-    if random.randint(1, 6) == 1:
+    if owner_id != SUPERADMIN_ID and random.randint(1, 6) == 1:
         outcome = f"💥 <b>БАХ! Патрон оказался в патроннике. Ты проиграл!</b> (-{bet} монет)" if bet > 0 else "💥 <b>БАХ! Патрон оказался в патроннике. Ты проиграл!</b>"
     else:
         if bet > 0:
