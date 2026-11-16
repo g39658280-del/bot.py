@@ -33,6 +33,10 @@ try:
 except ImportError:
     Image = None
     ImageSequence = None
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -5216,20 +5220,58 @@ def _pil_frame_to_braille(frame: "Image.Image", width_chars: int = 24) -> str:
     return "\n".join(lines)
 
 
-def _media_bytes_to_braille_frames(raw_bytes: bytes, width_chars: int = 24, max_frames: int = 8) -> list[str]:
+def _media_bytes_to_braille_frames(
+    raw_bytes: bytes,
+    width_chars: int = 24,
+    max_frames: int = 8,
+    is_mp4: bool = False,
+) -> tuple[list[str], str | None]:
     frames_out: list[str] = []
-    with Image.open(io.BytesIO(raw_bytes)) as img:
-        all_frames = [f.copy() for f in ImageSequence.Iterator(img)]
-        if not all_frames:
-            return []
-        if len(all_frames) > max_frames:
-            step = len(all_frames) / max_frames
-            picked = [all_frames[int(i * step)] for i in range(max_frames)]
-        else:
-            picked = all_frames
-        for fr in picked:
-            frames_out.append(_pil_frame_to_braille(fr, width_chars=width_chars))
-    return frames_out
+    if not is_mp4:
+        try:
+            with Image.open(io.BytesIO(raw_bytes)) as img:
+                all_frames = [f.copy() for f in ImageSequence.Iterator(img)]
+                if not all_frames:
+                    return [], "Пустой файл."
+                if len(all_frames) > max_frames:
+                    step = len(all_frames) / max_frames
+                    picked = [all_frames[int(i * step)] for i in range(max_frames)]
+                else:
+                    picked = all_frames
+                for fr in picked:
+                    frames_out.append(_pil_frame_to_braille(fr, width_chars=width_chars))
+                return frames_out, None
+        except Exception:
+            is_mp4 = True
+
+    if cv2 is None:
+        return [], "Telegram хранит GIF как MP4-видео — добавь <code>opencv-python-headless</code> в requirements.txt (или отправь .gif файлом без сжатия)."
+
+    tmp_mp4 = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(raw_bytes)
+            tmp_mp4 = tmp.name
+        cap = cv2.VideoCapture(tmp_mp4)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 0:
+            cap.release()
+            return [], "Не удалось прочитать кадры видео."
+        indices = [int(i * total / max_frames) for i in range(min(max_frames, total))]
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
+                continue
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
+            frames_out.append(_pil_frame_to_braille(pil_img, width_chars=width_chars))
+        cap.release()
+        return frames_out, None
+    finally:
+        if tmp_mp4:
+            with suppress(Exception):
+                os.remove(tmp_mp4)
 
 
 @dp.business_message(F.text.lower().regexp(r"^\.(брайль|аним)(?:\s+\d+)?$"))
@@ -5280,17 +5322,23 @@ async def cmd_braille_anim(message: Message):
     if not file_id or fsize > 8 * 1024 * 1024:
         return
 
+    is_mp4 = bool(reply.animation or (reply.document and (reply.document.mime_type or "") == "video/mp4"))
     try:
         file_obj = await bot.get_file(file_id)
         buf = await bot.download_file(file_obj.file_path)
         raw_bytes = buf.read()
         loop = asyncio.get_running_loop()
-        frames = await loop.run_in_executor(None, _media_bytes_to_braille_frames, raw_bytes, width_chars, 8)
+        frames, err_msg = await loop.run_in_executor(None, _media_bytes_to_braille_frames, raw_bytes, width_chars, 8, is_mp4)
     except Exception as e:
         print(f"braille error: {e}")
         return
     finally:
         gc.collect()
+
+    if err_msg:
+        with suppress(Exception):
+            await bot.send_message(chat_id=message.chat.id, text=f"⚠️ {err_msg}", parse_mode="HTML", business_connection_id=conn_id)
+        return
 
     if not frames:
         return
