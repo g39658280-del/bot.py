@@ -3404,6 +3404,18 @@ async def start_battleship_game(message: Message):
                     business_connection_id=conn_id
                 )
             return
+        if peer_id > 0:
+            peer_balance = await get_user_balance(peer_id)
+            if peer_balance < bet:
+                with suppress(Exception):
+                    await bot.send_message(
+                        chat_id=peer_id,
+                        text=f"❌ У собеседника недостаточно монет для ставки <b>{bet}</b>! (Баланс: <b>{peer_balance}</b>)",
+                        parse_mode="HTML",
+                        business_connection_id=conn_id
+                    )
+                return
+            await update_user_balance(peer_id, -bet)
         await update_user_balance(owner_id, -bet)
 
     owner_board, owner_ships = _generate_battleship_board()
@@ -3517,7 +3529,13 @@ async def battleship_move_cb(call: CallbackQuery):
                 else:
                     winner_label = "Владелец чата"
             else:
-                winner_label = html.escape(call.from_user.first_name or "Собеседник")
+                peer_name = html.escape(call.from_user.first_name or "Собеседник")
+                if bet > 0:
+                    win_amt = bet * 3
+                    await update_user_balance(call.from_user.id, win_amt)
+                    winner_label = f"{peer_name} (+{win_amt} монет)"
+                else:
+                    winner_label = peer_name
             text = (
                 "🚢 <b>Морской бой 8x8 — ИГРА ОКОНЧЕНА!</b>\n\n"
                 f"🏆 Победил: <b>{winner_label}</b>!"
@@ -3607,6 +3625,18 @@ async def start_ttt_game(message: Message):
                     business_connection_id=conn_id
                 )
             return
+        if peer_id > 0:
+            peer_balance = await get_user_balance(peer_id)
+            if peer_balance < bet:
+                with suppress(Exception):
+                    await bot.send_message(
+                        chat_id=peer_id,
+                        text=f"❌ У собеседника недостаточно монет для ставки <b>{bet}</b>! (Баланс: <b>{peer_balance}</b>)",
+                        parse_mode="HTML",
+                        business_connection_id=conn_id
+                    )
+                return
+            await update_user_balance(peer_id, -bet)
         await update_user_balance(owner_id, -bet)
 
     board = [" "] * 9
@@ -3692,13 +3722,20 @@ async def ttt_move_cb(call: CallbackQuery):
         finished = True
     elif winner == "O":
         ttt_games.pop(game_key, None)
-        status = "🏆 <b>Победил ⭕ (Собеседник)!</b>"
+        if bet > 0:
+            win_amt = bet * 2
+            await update_user_balance(call.from_user.id, win_amt)
+            status = f"🏆 <b>Победил ⭕ (Собеседник)! (+{win_amt} монет)</b>"
+        else:
+            status = "🏆 <b>Победил ⭕ (Собеседник)!</b>"
         finished = True
     elif winner == "D":
         ttt_games.pop(game_key, None)
         if bet > 0:
             await update_user_balance(owner_id, bet)
-            status = f"🤝 <b>Ничья!</b> (ставка {bet} монет возвращена)"
+            if peer_id > 0:
+                await update_user_balance(peer_id, bet)
+            status = f"🤝 <b>Ничья!</b> (ставка {bet} монет возвращена обоим)"
         else:
             status = "🤝 <b>Ничья!</b>"
         finished = True
@@ -3745,6 +3782,18 @@ async def start_rps_game(message: Message):
                     business_connection_id=conn_id
                 )
             return
+        if peer_id > 0:
+            peer_balance = await get_user_balance(peer_id)
+            if peer_balance < bet:
+                with suppress(Exception):
+                    await bot.send_message(
+                        chat_id=peer_id,
+                        text=f"❌ У собеседника недостаточно монет для ставки <b>{bet}</b>! (Баланс: <b>{peer_balance}</b>)",
+                        parse_mode="HTML",
+                        business_connection_id=conn_id
+                    )
+                return
+            await update_user_balance(peer_id, -bet)
         await update_user_balance(owner_id, -bet)
 
     game_key = f"{conn_id}_{peer_id}"
@@ -3789,6 +3838,8 @@ async def rps_move_cb(call: CallbackQuery):
         return
 
     game["choices"][role] = (choice, call.from_user.first_name or "Игрок")
+    if role == "peer":
+        game["peer_uid"] = uid
     with suppress(TelegramBadRequest):
         await call.answer("Ход принят!")
 
@@ -3816,10 +3867,13 @@ async def rps_move_cb(call: CallbackQuery):
     names = {"r": "🪨 Камень", "s": "✂️ Ножницы", "p": "📄 Бумага"}
 
     bet = game.get("bet", 0)
+    peer_uid = game.get("peer_uid") or game["peer_id"]
     if c1 == c2:
         if bet > 0:
             await update_user_balance(game["owner_id"], bet)
-            res = f"🤝 <b>Ничья!</b> (ставка {bet} монет возвращена)"
+            if peer_uid > 0:
+                await update_user_balance(peer_uid, bet)
+            res = f"🤝 <b>Ничья!</b> (ставка {bet} монет возвращена обоим)"
         else:
             res = "🤝 <b>Ничья!</b>"
     elif (c1 == "r" and c2 == "s") or (c1 == "s" and c2 == "p") or (c1 == "p" and c2 == "r"):
@@ -3830,7 +3884,12 @@ async def rps_move_cb(call: CallbackQuery):
         else:
             res = f"🏆 Победил <b>{html.escape(name1)}</b>!"
     else:
-        res = f"🏆 Победил <b>{html.escape(name2)}</b>!"
+        if bet > 0 and peer_uid > 0:
+            win_amt = bet * 2
+            await update_user_balance(peer_uid, win_amt)
+            res = f"🏆 Победил <b>{html.escape(name2)}</b>! (+{win_amt} монет)"
+        else:
+            res = f"🏆 Победил <b>{html.escape(name2)}</b>!"
 
     text = (
         "🥊 <b>Результаты дуэли КНБ:</b>\n\n"
