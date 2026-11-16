@@ -358,7 +358,8 @@ MINES_BET = 10
 ROULETTE_BET, ROULETTE_WIN = 10, 15
 COIN_BET, COIN_WIN = 10, 20
 BS_BET, BS_WIN = 15, 45
-SHIP_SIZES = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
+BS_GRID_SIZE = 8
+SHIP_SIZES = [3, 3, 2, 2, 2, 1, 1, 1]
 
 
 
@@ -2944,8 +2945,8 @@ async def show_cmds_category(call: CallbackQuery):
             "🎮 <b>Интерактивные Мини-игры в чате</b>\n\n"
             "<b>💰 .баланс</b> — проверить баланс и забрать ежедневный бонус (+100 монет)\n\n"
             "<i>В любую игру можно указать ставку (например, <code>.кн 50</code>) или играть без ставки.</i>\n\n"
-            "<b>🚢 .морскойбой [ставка]</b> — <b>Морской бой 10x10</b> (x3 при победе)\n"
-            "Классический бой 10x10 с авторасстановкой флота!\n\n"
+            "<b>🚢 .морскойбой [ставка]</b> — <b>Морской бой 8x8</b> (x3 при победе)\n"
+            "Классический бой 8x8 прямо по кнопкам 🟦 + кнопка «Мои корабли»!\n\n"
             "<b>❌⭕ .кн [ставка]</b> — <b>Крестики-нолики 3x3</b> (x2 при победе)\n"
             "Запускает поле на кнопках прямо в чате для игры с собеседником!\n\n"
             "<b>🪨✂️📄 .кнб [ставка]</b> — <b>Камень-Ножницы-Бумага</b> (x2 при победе)\n"
@@ -3152,7 +3153,8 @@ async def cmd_balance(message: Message):
 # ИНТЕРАКТИВНЫЕ МИНИ-ИГРЫ (.морскойбой, .кн, .кнб, .минер, .рулетка, .шар, .инфа, .монетка)
 # ==========================================
 def _generate_battleship_board() -> tuple[list[list[str]], list[set[tuple[int, int]]]]:
-    grid = [["~" for _ in range(10)] for _ in range(10)]
+    n = BS_GRID_SIZE
+    grid = [["~" for _ in range(n)] for _ in range(n)]
     ships: list[set[tuple[int, int]]] = []
 
     for size in SHIP_SIZES:
@@ -3160,12 +3162,12 @@ def _generate_battleship_board() -> tuple[list[list[str]], list[set[tuple[int, i
         for _ in range(500):
             horizontal = random.choice([True, False])
             if horizontal:
-                r = random.randint(0, 9)
-                c = random.randint(0, 10 - size)
+                r = random.randint(0, n - 1)
+                c = random.randint(0, n - size)
                 coords = [(r, c + i) for i in range(size)]
             else:
-                r = random.randint(0, 10 - size)
-                c = random.randint(0, 9)
+                r = random.randint(0, n - size)
+                c = random.randint(0, n - 1)
                 coords = [(r + i, c) for i in range(size)]
 
             can_place = True
@@ -3173,7 +3175,7 @@ def _generate_battleship_board() -> tuple[list[list[str]], list[set[tuple[int, i
                 for dr in (-1, 0, 1):
                     for dc in (-1, 0, 1):
                         nr, nc = cr + dr, cc + dc
-                        if 0 <= nr < 10 and 0 <= nc < 10 and grid[nr][nc] != "~":
+                        if 0 <= nr < n and 0 <= nc < n and grid[nr][nc] != "~":
                             can_place = False
                             break
                     if not can_place:
@@ -3194,77 +3196,69 @@ def _generate_battleship_board() -> tuple[list[list[str]], list[set[tuple[int, i
     return grid, ships
 
 
-BS_COLS = ["А", "Б", "В", "Г", "Д", "Е", "Ж", "З", "И", "К"]
-BS_ROW_NUMS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-
-
-def _format_battleship_text_board(board: list[list[str]], reveal_ships: bool = True) -> str:
-    header = "⬛" + "".join(f"<b>{c}</b> " for c in BS_COLS).strip()
-    rows = [header]
-    for r in range(10):
+def _format_battleship_popup(board: list[list[str]]) -> str:
+    """Компактная ровная сетка 8x8 из одних эмодзи для всплывающего окна show_alert=True."""
+    rows = []
+    for r in range(BS_GRID_SIZE):
         row_cells = []
-        for c in range(10):
+        for c in range(BS_GRID_SIZE):
             cell = board[r][c]
             if cell == "H":
                 row_cells.append("💥")
             elif cell == "M":
                 row_cells.append("⏺")
-            elif cell == "S" and reveal_ships:
+            elif cell == "S":
                 row_cells.append("🚢")
             else:
                 row_cells.append("🟦")
-        rows.append(f"{BS_ROW_NUMS[r]}{''.join(row_cells)}")
+        rows.append("".join(row_cells))
     return "\n".join(rows)
 
 
 def _build_battleship_kb(
-    conn_id: str,
     peer_id: int,
     target_board: list[list[str]],
-    selected_row: int | None = None,
     finished: bool = False,
-) -> InlineKeyboardMarkup | None:
-    if finished:
-        return None
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    if selected_row is None:
-        # Шаг 1: выбор строки (1-10), по 5 кнопок в ряду (в пределах лимита Telegram 8 кнопок/ряд)
-        for r in range(10):
-            has_open = any(target_board[r][c] not in ("H", "M") for c in range(10))
-            builder.add(_safe_button(
-                text=f"Строка {r + 1}" if has_open else f"✓ {r + 1}",
-                callback_data="bs_noop" if not has_open else f"bsr|{conn_id}|{peer_id}|{r}",
-                style="primary" if has_open else None,
-                disabled=not has_open,
-            ))
-        builder.adjust(5, 5)
-    else:
-        # Шаг 2: выбор столбца (А-К) в выбранной строке
-        for c in range(10):
-            cell = target_board[selected_row][c]
+    for r in range(BS_GRID_SIZE):
+        for c in range(BS_GRID_SIZE):
+            cell = target_board[r][c]
             if cell == "H":
-                txt = f"💥{BS_COLS[c]}"
+                txt = "💥"
                 cb = "bs_noop"
                 dis = True
-                st = "danger"
             elif cell == "M":
-                txt = f"⏺{BS_COLS[c]}"
+                txt = "⏺"
                 cb = "bs_noop"
                 dis = True
-                st = None
+            elif finished and cell == "S":
+                txt = "🚢"
+                cb = "bs_noop"
+                dis = True
             else:
-                txt = f"{BS_COLS[c]}{selected_row + 1}"
-                cb = f"bs|{conn_id}|{peer_id}|{selected_row}|{c}"
-                dis = False
-                st = "success"
-            builder.add(_safe_button(text=txt, callback_data=cb, style=st, disabled=dis))
-        builder.add(_safe_button(text="🔙 Выбрать другую строку", callback_data=f"bsback|{conn_id}|{peer_id}", style="danger"))
-        builder.adjust(5, 5, 1)
+                txt = "🟦"
+                cb = "bs_noop" if finished else f"bs|{peer_id}|{r}|{c}"
+                dis = finished
+            builder.add(_safe_button(text=txt, callback_data=cb, disabled=dis))
+
+    if not finished:
+        builder.add(_safe_button(text="🚢 Мои корабли", callback_data=f"bsfleet|{peer_id}", style="primary"))
+        builder.adjust(8, 8, 8, 8, 8, 8, 8, 8, 1)
+    else:
+        builder.adjust(8, 8, 8, 8, 8, 8, 8, 8)
     return builder.as_markup()
 
 
 def _count_remaining_ships(board: list[list[str]]) -> int:
-    return sum(1 for r in range(10) for c in range(10) if board[r][c] == "S")
+    return sum(1 for r in range(BS_GRID_SIZE) for c in range(BS_GRID_SIZE) if board[r][c] == "S")
+
+
+def _find_battleship_game(peer_id: int) -> tuple[str | None, dict | None]:
+    for k, g in list(battleship_games.items()):
+        if g.get("peer_id") == peer_id:
+            return k, g
+    return None, None
 
 
 @dp.business_message(F.text.lower().regexp(r"^\.(морскойбой|мб)(?:\s+\d+)?$"))
@@ -3311,26 +3305,16 @@ async def start_battleship_game(message: Message):
     }
     battleship_games[game_key] = game
 
-    # В группе отправляем эфемерный радар (видит только владелец), в ЛС-бизнесе — в личку владельцу
-    own_map = _format_battleship_text_board(owner_board, reveal_ships=True)
-    await _send_ephemeral_or_dm(
-        chat_id=peer_id,
-        owner_id=owner_id,
-        text=f"🚢 <b>Ваш флот для Морского боя 10x10:</b>\n\n{own_map}",
-    )
-
-    board_view = _format_battleship_text_board(peer_board, reveal_ships=False)
     bet_line = f"Ставка: <b>{bet}</b> монет · Приз: <b>{bet * 3}</b> монет" if bet > 0 else "Режим: <b>без ставки</b>"
     text = (
-        "🚢 <b>Морской бой 10x10</b>\n"
+        "🚢 <b>Морской бой 8x8</b>\n"
         f"{bet_line}\n\n"
-        f"{board_view}\n\n"
-        "Сейчас стреляет: <b>Владелец чата</b> (выбери строку 1–10):"
+        "Сейчас стреляет: <b>Владелец чата</b> (жми на клетку 🟦)"
     )
     await _safe_send_msg(
         chat_id=peer_id,
         text=text,
-        reply_markup=_build_battleship_kb(conn_id, peer_id, peer_board),
+        reply_markup=_build_battleship_kb(peer_id, peer_board),
         parse_mode="HTML",
         business_connection_id=conn_id,
     )
@@ -3342,91 +3326,43 @@ async def bs_noop_cb(call: CallbackQuery):
         await call.answer()
 
 
-@dp.callback_query(F.data.startswith("bsr|"))
-async def battleship_pick_row_cb(call: CallbackQuery):
+@dp.callback_query(F.data.startswith("bsfleet|"))
+async def battleship_show_fleet_cb(call: CallbackQuery):
     parts = call.data.split("|")
-    if len(parts) != 4:
+    if len(parts) != 2:
         return
-    _, conn_id, peer_str, r_str = parts
-    peer_id = int(peer_str)
-    r = int(r_str)
-    game_key = f"{conn_id}_{peer_id}"
-
-    game = battleship_games.get(game_key)
+    peer_id = int(parts[1])
+    _, game = _find_battleship_game(peer_id)
     if not game:
         with suppress(TelegramBadRequest):
-            await call.answer("Игра устарела или завершена", show_alert=True)
-        return
-    if call.from_user.id != game["turn"]:
-        with suppress(TelegramBadRequest):
-            await call.answer("Сейчас не твой ход!", show_alert=True)
+            await call.answer("Игра завершена", show_alert=True)
         return
 
-    is_owner_turn = (call.from_user.id == game["owner_id"])
-    target_board = game["peer_board"] if is_owner_turn else game["owner_board"]
-    turn_label = "Владелец чата" if is_owner_turn else "Собеседник"
-    remaining = _count_remaining_ships(target_board)
-    board_view = _format_battleship_text_board(target_board, reveal_ships=False)
+    uid = call.from_user.id
+    if uid == game["owner_id"]:
+        board = game["owner_board"]
+        title = "Твой флот:"
+    else:
+        board = game["peer_board"]
+        title = "Твой флот:"
 
-    text = (
-        "🚢 <b>Морской бой 10x10</b>\n\n"
-        f"{board_view}\n\n"
-        f"Ход: <b>{turn_label}</b> · Осталось палуб: <b>{remaining}</b>\n"
-        f"Выбрана <b>строка {r + 1}</b> — выбери столбец (А–К):"
-    )
-    await _safe_edit_msg(call.message, text, _build_battleship_kb(conn_id, peer_id, target_board, selected_row=r))
+    popup_text = f"{title}\n\n{_format_battleship_popup(board)}"
     with suppress(TelegramBadRequest):
-        await call.answer()
-
-
-@dp.callback_query(F.data.startswith("bsback|"))
-async def battleship_back_row_cb(call: CallbackQuery):
-    parts = call.data.split("|")
-    if len(parts) != 3:
-        return
-    _, conn_id, peer_str = parts
-    peer_id = int(peer_str)
-    game_key = f"{conn_id}_{peer_id}"
-
-    game = battleship_games.get(game_key)
-    if not game:
-        with suppress(TelegramBadRequest):
-            await call.answer("Игра устарела или завершена", show_alert=True)
-        return
-    if call.from_user.id != game["turn"]:
-        with suppress(TelegramBadRequest):
-            await call.answer("Сейчас не твой ход!", show_alert=True)
-        return
-
-    is_owner_turn = (call.from_user.id == game["owner_id"])
-    target_board = game["peer_board"] if is_owner_turn else game["owner_board"]
-    turn_label = "Владелец чата" if is_owner_turn else "Собеседник"
-    remaining = _count_remaining_ships(target_board)
-    board_view = _format_battleship_text_board(target_board, reveal_ships=False)
-
-    text = (
-        "🚢 <b>Морской бой 10x10</b>\n\n"
-        f"{board_view}\n\n"
-        f"Сейчас стреляет: <b>{turn_label}</b> · Осталось палуб: <b>{remaining}</b>"
-    )
-    await _safe_edit_msg(call.message, text, _build_battleship_kb(conn_id, peer_id, target_board))
-    with suppress(TelegramBadRequest):
-        await call.answer()
+        await call.answer(popup_text, show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("bs|"))
 async def battleship_move_cb(call: CallbackQuery):
     parts = call.data.split("|")
-    if len(parts) != 5:
+    if len(parts) != 4:
         return
-    _, conn_id, peer_str, r_str, c_str = parts
+    _, peer_str, r_str, c_str = parts
     peer_id = int(peer_str)
     r = int(r_str)
     c = int(c_str)
-    game_key = f"{conn_id}_{peer_id}"
 
-    game = battleship_games.get(game_key)
-    if not game:
+    game_key, game = _find_battleship_game(peer_id)
+    if not game or not game_key:
         with suppress(TelegramBadRequest):
             await call.answer("Игра устарела или завершена", show_alert=True)
         return
@@ -3447,7 +3383,6 @@ async def battleship_move_cb(call: CallbackQuery):
             await call.answer("Сюда уже стреляли!")
         return
 
-    coord = f"{BS_COLS[c]}{r + 1}"
     hit = (cell == "S")
     if hit:
         target_board[r][c] = "H"
@@ -3464,30 +3399,26 @@ async def battleship_move_cb(call: CallbackQuery):
                     winner_label = "Владелец чата"
             else:
                 winner_label = html.escape(call.from_user.first_name or "Собеседник")
-            board_view = _format_battleship_text_board(target_board, reveal_ships=True)
             text = (
-                "🚢 <b>Морской бой 10x10 — ИГРА ОКОНЧЕНА!</b>\n\n"
-                f"{board_view}\n\n"
+                "🚢 <b>Морской бой 8x8 — ИГРА ОКОНЧЕНА!</b>\n\n"
                 f"🏆 Победил: <b>{winner_label}</b>!"
             )
-            await _safe_edit_msg(call.message, text, None)
+            await _safe_edit_msg(call.message, text, _build_battleship_kb(peer_id, target_board, finished=True))
             with suppress(TelegramBadRequest):
                 await call.answer("💥 ПОБЕДА! Все корабли потоплены!")
             return
 
         turn_label = "Владелец чата" if is_owner_turn else "Собеседник"
         board_label = "полю соперника" if is_owner_turn else "полю владельца"
-        board_view = _format_battleship_text_board(target_board, reveal_ships=False)
         text = (
-            "🚢 <b>Морской бой 10x10</b>\n"
-            f"💥 <b>Попадание по {coord}!</b> Стреляй ещё раз.\n\n"
-            f"{board_view}\n\n"
+            "🚢 <b>Морской бой 8x8</b>\n"
+            "💥 <b>Попадание!</b> Стреляй ещё раз.\n\n"
             f"Сейчас стреляет: <b>{turn_label}</b> (по {board_label})\n"
             f"Осталось палуб у цели: <b>{remaining}</b>"
         )
-        await _safe_edit_msg(call.message, text, _build_battleship_kb(conn_id, peer_id, target_board))
+        await _safe_edit_msg(call.message, text, _build_battleship_kb(peer_id, target_board))
         with suppress(TelegramBadRequest):
-            await call.answer(f"💥 Попадание {coord}!")
+            await call.answer("💥 Попадание!")
     else:
         target_board[r][c] = "M"
         game["turn"] = peer_id if is_owner_turn else owner_id
@@ -3496,18 +3427,16 @@ async def battleship_move_cb(call: CallbackQuery):
         turn_label = "Владелец чата" if next_is_owner else "Собеседник"
         board_label = "полю соперника" if next_is_owner else "полю владельца"
         remaining = _count_remaining_ships(next_board)
-        board_view = _format_battleship_text_board(next_board, reveal_ships=False)
 
         text = (
-            "🚢 <b>Морской бой 10x10</b>\n"
-            f"⏺ <b>Мимо ({coord})!</b> Ход переходит сопернику.\n\n"
-            f"{board_view}\n\n"
+            "🚢 <b>Морской бой 8x8</b>\n"
+            "⏺ <b>Мимо!</b> Ход переходит сопернику.\n\n"
             f"Сейчас стреляет: <b>{turn_label}</b> (по {board_label})\n"
             f"Осталось палуб у цели: <b>{remaining}</b>"
         )
-        await _safe_edit_msg(call.message, text, _build_battleship_kb(conn_id, peer_id, next_board))
+        await _safe_edit_msg(call.message, text, _build_battleship_kb(peer_id, next_board))
         with suppress(TelegramBadRequest):
-            await call.answer(f"⏺ Мимо ({coord})")
+            await call.answer("⏺ Мимо!")
 
 
 def _build_ttt_kb(conn_id: str, peer_id: int, board: list[str], finished: bool = False) -> InlineKeyboardMarkup:
