@@ -3061,6 +3061,8 @@ async def show_cmds_category(call: CallbackQuery):
     elif cat == "games":
         text = (
             "🎮 <b>Интерактивные Мини-игры в чате</b>\n\n"
+            "<b>🟦 .гд [ставка]</b> — <b>Geometry Dash</b> (интерактивный виджет в чате, x3 при прохождении)\n"
+            "<b>🔫 .дум [ставка]</b> — <b>DOOM 2.5D</b> (рейкастер с врагами и HUD прямо в чате, x3 при зачистке)\n\n"
             "<b>💰 .баланс</b> — проверить баланс и забрать ежедневный бонус (+100 монет)\n\n"
             "<i>В любую игру можно указать ставку (например, <code>.кн 50</code>) или играть без ставки.</i>\n\n"
             "<b>🚢 .морскойбой [ставка]</b> — <b>Морской бой 8x8</b> (x3 при победе)\n"
@@ -5539,7 +5541,20 @@ async def auto_math_and_currency(message: Message):
             await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
     with suppress(Exception):
         await bot.send_message(chat_id=peer_id, text=f"{formatted} = {result}", business_connection_id=conn_id)
+        
+from widget_games import register_widget_games
 
+register_widget_games(
+    dp,
+    bot,
+    connections_cache=connections_cache,
+    connections_collection=connections_collection,
+    handle_owner_activity=handle_owner_activity,
+    get_user_balance=get_user_balance,
+    update_user_balance=update_user_balance,
+    parse_optional_bet=_parse_optional_bet,
+    safe_send_msg=_safe_send_msg,
+)
 
 # ==========================================
 # ГЛАВНЫЙ ОБРАБОТЧИК — С ФОРМАТИРОВАНИЕМ
