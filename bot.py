@@ -1772,6 +1772,8 @@ async def start_web_server() -> web.AppRunner:
     global _web_runner
     app = web.Application()
     app.router.add_get("/", dummy_handler)
+    from widget_games import attach_game_web_routes
+    attach_game_web_routes(app, bot, update_user_balance)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
