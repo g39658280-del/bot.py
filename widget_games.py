@@ -1,6 +1,7 @@
-import re
 import html
 import zlib
+import inspect
+import aiohttp
 from contextlib import suppress
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
@@ -31,7 +32,7 @@ canvas{display:block;width:100%;height:220px}
 <script>
 const C=document.getElementById('c'),g=C.getContext('2d');
 const W=340,H=220,FY=178,SZ=22,PX=64,GOAL=3150;
-// Типы объектов: 0=шип, 1=блок(можно стоять сверху), 2=джамп-пад, 3=орб в воздухе, 4=перевёрнутый шип
+// Типы объектов: 0=шип, 1=блок(можно стоять сверху), 2=джамп-пад, 3=орб в воздухе
 const LVL=[
 [280,0,0],[440,0,0],[462,0,0],
 [620,1,0],[644,1,0],[668,1,0],[668,0,24],
@@ -71,7 +72,6 @@ function die(){
 
 function loop(){
   let pct=Math.min(100,Math.floor(cam/GOAL*100));
-  // Динамическая палитра по прогрессу
   let hue=(215+pct*1.4)%360;
   let bg=g.createLinearGradient(0,0,0,H);
   bg.addColorStop(0,`hsl(${hue},55%,12%)`);
@@ -81,7 +81,6 @@ function loop(){
   g.save();
   if(shake>0){g.translate((Math.random()-.5)*shake,(Math.random()-.5)*shake);shake*=.85}
 
-  // Параллакс сетка и колонны
   g.strokeStyle='rgba(255,255,255,0.06)';g.lineWidth=1;
   let gx=-(cam*.3)%40;
   for(let i=gx;i<W;i+=40){g.beginPath();g.moveTo(i,0);g.lineTo(i,FY);g.stroke()}
@@ -92,7 +91,6 @@ function loop(){
     g.fillRect(bx,45+(i%3)*22,42,FY-45);
   }
 
-  // Пол с неоновой линией
   g.fillStyle=`hsl(${hue},60%,10%)`;g.fillRect(0,FY,W,H-FY);
   g.strokeStyle=`hsl(${hue},90%,60%)`;g.lineWidth=2;
   g.beginPath();g.moveTo(0,FY);g.lineTo(W,FY);g.stroke();
@@ -108,30 +106,25 @@ function loop(){
     y+=vy;onG=0;
     if(y>=FY-SZ){y=FY-SZ;vy=0;onG=1}
 
-    // Проверка объектов
     for(let idx=0;idx<LVL.length;idx++){
       let [ox,t,oh]=LVL[idx];
       let sx=ox-cam+PX,by=FY-24-oh;
       if(sx<-40||sx>W+40)continue;
       if(t===1){
-        // Блок: посадка сверху или смерть сбоку
         if(sx<PX+SZ-3 && sx+24>PX+3){
           if(prevY+SZ<=by+10 && vy>=0 && y+SZ>=by){
             y=by-SZ;vy=0;onG=1;
           }else if(y+SZ>by+4 && y<by+20){die()}
         }
       }else if(t===0){
-        // Шип (с честным уменьшенным хитбоксом)
         let sy=FY-oh;
         if(sx+5<PX+SZ-3 && sx+17>PX+3 && y+SZ>sy-16 && y<sy){die()}
       }else if(t===2){
-        // Джамп-пад
         let sy=FY-oh;
         if(sx<PX+SZ && sx+24>PX && y+SZ>=sy-8 && y+SZ<=sy+6){
           vy=-11.2;onG=0;burst(sx+12,sy-4,'#facc15',8);
         }
       }else if(t===3){
-        // Джамп-орб (нажатие в воздухе)
         let cy=FY-oh-12;
         if(tap && !usedOrbs.has(idx) && Math.hypot(sx+12-(PX+SZ/2),cy-(y+SZ/2))<28){
           vy=-9.2;onG=0;usedOrbs.add(idx);burst(sx+12,cy,'#fde047',10);
@@ -150,7 +143,6 @@ function loop(){
   }
   tap=0;
 
-  // Отрисовка уровня
   for(let [ox,t,oh] of LVL){
     let sx=ox-cam+PX,by=FY-24-oh;
     if(sx<-32||sx>W+32)continue;
@@ -175,20 +167,17 @@ function loop(){
     }
   }
 
-  // Финишный портал
   let fxP=GOAL-cam+PX;
   if(fxP>-20 && fxP<W+40){
     g.strokeStyle='#4ade80';g.lineWidth=4;
     g.beginPath();g.ellipse(fxP+12,FY-48,10,44,0,0,6.283);g.stroke();
   }
 
-  // Шлейф игрока
   for(let p of trail){
     p.x-=4.1;p.a*=.88;
     g.fillStyle=`rgba(56,189,248,${p.a})`;g.fillRect(p.x-3,p.y-3,6,6);
   }
 
-  // Куб игрока
   if(!dead){
     g.save();g.translate(PX+SZ/2,y+SZ/2);g.rotate(rot*Math.PI/180);
     g.fillStyle='#facc15';g.fillRect(-SZ/2,-SZ/2,SZ,SZ);
@@ -198,7 +187,6 @@ function loop(){
     g.restore();
   }
 
-  // Частицы
   for(let i=parts.length-1;i>=0;i--){
     let p=parts[i];p.x+=p.vx;p.y+=p.vy;p.vy+=.18;p.l--;
     g.fillStyle=p.c;g.globalAlpha=Math.max(0,p.l/30);
@@ -207,7 +195,6 @@ function loop(){
   }
   g.globalAlpha=1;g.restore();
 
-  // HUD
   g.fillStyle='rgba(0,0,0,0.45)';g.fillRect(80,10,180,8);
   g.fillStyle='#4ade80';g.fillRect(80,10,1.8*pct,8);
   g.strokeStyle='rgba(255,255,255,0.4)';g.strokeRect(80,10,180,8);
@@ -253,10 +240,9 @@ button:active{background:#52525b}
 </div>
 <script>
 const C=document.getElementById('v'),g=C.getContext('2d');
-const W=160,H=82,HUD=18; // 82px 3D-экран + 18px классический DOOM HUD
+const W=160,H=82,HUD=18;
 const img=g.createImageData(W,H),buf=img.data;
 
-// Карта 12x12: 1=кирпич, 2=техно-панель, 3=адский камень, 4=кислотный камень
 const MAP=[
 "111122221111",
 "100000000001",
@@ -271,24 +257,23 @@ const MAP=[
 ];
 const MW=12,MH=10;
 
-// Генерация 4 процедурных 16x16 текстур
 const TEX=[];
 for(let t=1;t<=4;t++){
   let arr=new Uint8Array(16*16*3);
   for(let y=0;y<16;y++)for(let x=0;x<16;x++){
     let i=(y*16+x)*3,r=90,gr=90,b=90;
-    if(t===1){ // Каменный кирпич
+    if(t===1){
       let m=(y%4===0)||((x+(y>>2)*4)%8===0);
       let n=((x*37+y*17)&15)-8;
       r=gr=b=m?42:118+n;
-    }else if(t===2){ // Техно-металл с синими вставками
+    }else if(t===2){
       let rim=(x===0||x===15||y===0||y===15);
       let panel=(x>3&&x<12&&y>3&&y<12);
       r=rim?45:panel?60:85;gr=rim?50:panel?110:92;b=rim?65:panel?175:110;
-    }else if(t===3){ // Адский красный камень
+    }else if(t===3){
       let m=(y%4===0)||((x+(y>>2)*3)%6===0);
       r=m?55:155+((x*13+y*7)&15);gr=m?18:38;b=m?18:34;
-    }else{ // Зелёная кислота / слизь
+    }else{
       let stripe=((x+y)&3)===0;
       r=stripe?40:55;gr=stripe?155:115;b=45;
     }
@@ -299,7 +284,6 @@ for(let t=1;t<=4;t++){
 
 let px=1.5,py=1.5,pa=0.2,hp=100,ammo=24,kills=0,gunBob=0,recoil=0,dmgFlash=0,won=0,dead=0,tick=0;
 let keys={};
-// Спрайты: t='imp'|'caco'|'med'|'amo'
 let ents=[];
 function initGame(){
   px=1.5;py=1.5;pa=0.2;hp=100;ammo=24;kills=0;recoil=0;dmgFlash=0;won=0;dead=0;
@@ -338,7 +322,6 @@ document.getElementById('fire').onpointerdown=()=>{
   if(dead||won){initGame();return}
   if(recoil>0||ammo<=0)return;
   ammo--;recoil=9;
-  // Ищем ближайшего врага в прицеле
   let best=null,bestD=99;
   for(let e of ents){
     if(e.hp<=0||(e.t!=='imp'&&e.t!=='caco'))continue;
@@ -370,7 +353,6 @@ function loop(){
       if(!wallAt(px,ny+Math.sign(ny-py)*0.22))py=ny;
       gunBob+=0.28;
     }
-    // ИИ врагов и подбор предметов
     for(let e of ents){
       if(e.hp<=0)continue;
       let dx=px-e.x,dy=py-e.y,d=Math.hypot(dx,dy);
@@ -398,7 +380,6 @@ function loop(){
   if(recoil>0)recoil--;
   if(dmgFlash>0)dmgFlash--;
 
-  // Потолок и пол с дистанционным градиентом
   for(let y=0;y<H;y++){
     let isF=y>=H/2;
     let d=isF?(y-H/2)/(H/2):(H/2-y)/(H/2);
@@ -408,7 +389,6 @@ function loop(){
     }
   }
 
-  // DDA Raycasting с текстурами
   let dirX=Math.cos(pa),dirY=Math.sin(pa),plX=-dirY*0.66,plY=dirX*0.66;
   let zbuf=new Float32Array(W);
   for(let x=0;x<W;x++){
@@ -437,7 +417,6 @@ function loop(){
   }
   g.putImageData(img,0,0);
 
-  // Сортировка и отрисовка спрайтов (враги и предметы)
   let list=ents.filter(e=>e.hp>0).map(e=>({e,d:Math.hypot(e.x-px,e.y-py)})).sort((a,b)=>b.d-a.d);
   for(let {e,d} of list){
     let dx=e.x-px,dy=e.y-py,inv=1/(plX*dirY-dirX*plY);
@@ -465,7 +444,6 @@ function loop(){
     }
   }
 
-  // Дробовик с покачиванием, отдачей и вспышкой
   let bx=W/2+Math.cos(gunBob)*3,by=H-24+Math.abs(Math.sin(gunBob))*3+recoil*1.8;
   if(recoil>5){
     g.fillStyle='#fef08a';g.beginPath();g.arc(bx,by-4,11,0,6.283);g.fill();
@@ -473,20 +451,16 @@ function loop(){
   }
   g.fillStyle='#3f3f46';g.fillRect(bx-7,by,5,24);g.fillRect(bx+2,by,5,24);
   g.fillStyle='#71717a';g.fillRect(bx-8,by+12,16,14);
-  // Прицел
   g.fillStyle='rgba(255,255,255,0.6)';g.fillRect(W/2-3,H/2,7,1);g.fillRect(W/2,H/2-3,1,7);
 
-  // Миникарта в правом верхнем углу
   for(let my=0;my<MH;my++)for(let mx=0;mx<MW;mx++){
     g.fillStyle=MAP[my][mx]!=='0'?'rgba(255,255,255,0.35)':'rgba(0,0,0,0.4)';
     g.fillRect(W-MW*3-3+mx*3,3+my*3,3,3);
   }
   g.fillStyle='#4ade80';g.fillRect(W-MW*3-3+px*3-1,3+py*3-1,2,2);
 
-  // Красная вспышка при уроне
   if(dmgFlash>0){g.fillStyle='rgba(220,38,38,0.38)';g.fillRect(0,0,W,H)}
 
-  // Классический DOOM HUD внизу (18px)
   g.fillStyle='#3f3f46';g.fillRect(0,H,W,HUD);
   g.strokeStyle='#71717a';g.strokeRect(0.5,H+0.5,W-1,HUD-1);
   g.fillStyle='#ef4444';g.font='700 8px monospace';
@@ -495,7 +469,6 @@ function loop(){
   g.fillText(String(ammo).padStart(2,'0'),8,H+16);
   g.fillText(`${hp}%`,38,H+16);
   g.fillText(`${kills}/${TOTAL}`,116,H+16);
-  // Лицо Думгая в центре HUD
   g.fillStyle='#d4a373';g.fillRect(72,H+2,16,14);
   g.fillStyle='#3f2e21';g.fillRect(72,H+2,16,4);
   let look=(tick>>5)%3-1;
@@ -517,8 +490,24 @@ loop();
 
 
 # ==========================================
-# ОТПРАВКА ВИДЖЕТА И РЕГИСТРАЦИЯ ХЭНДЛЕРОВ
+# ОТПРАВКА ВИДЖЕТА (aiogram + прямой HTTP фолбэк + диагностика)
 # ==========================================
+async def _send_widget_raw_http(bot: Bot, payload: dict) -> tuple[int | None, str | None]:
+    """Прямой вызов Telegram Bot API sendWidget, если версия aiogram ещё не знает этот метод."""
+    url = f"https://api.telegram.org/bot{bot.token}/sendWidget"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json(content_type=None)
+                if data.get("ok"):
+                    msg_id = data.get("result", {}).get("message_id")
+                    return msg_id, None
+                desc = data.get("description") or f"HTTP {resp.status}"
+                return None, desc
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
 async def _safe_send_widget(
     bot: Bot,
     safe_send_msg,
@@ -528,21 +517,27 @@ async def _safe_send_widget(
     width: int,
     height: int,
     business_connection_id: str | None = None,
-):
+    owner_id: int | None = None,
+) -> int | None:
+    """Возвращает message_id отправленного виджета или None (с выводом точной причины в чат/ЛС)."""
     packed_len = len(zlib.compress(widget_html.encode("utf-8"), 9))
-    if packed_len > 4096:
-        print(f"❌ Widget exceeds 4096B zlib limit: {packed_len}B")
-        return None
+    print(f"📦 Widget packed size: {packed_len}B (raw: {len(widget_html.encode('utf-8'))}B)")
 
-    if not hasattr(bot, "send_widget"):
-        await safe_send_msg(
+    async def _report(err_text: str):
+        sent = await safe_send_msg(
             chat_id=chat_id,
-            text="⚠️ Обнови <code>aiogram&gt;=3.33.0</code> в requirements.txt для поддержки Telegram Widgets.",
+            text=err_text,
             business_connection_id=business_connection_id,
         )
+        if not sent and owner_id:
+            with suppress(Exception):
+                await bot.send_message(chat_id=owner_id, text=err_text, parse_mode="HTML")
+
+    if packed_len > 4096:
+        await _report(f"❌ Виджет превышает лимит 4096 байт после zlib: <b>{packed_len} Б</b>.")
         return None
 
-    kwargs: dict = {
+    payload: dict = {
         "chat_id": chat_id,
         "html": widget_html,
         "caption": caption,
@@ -551,20 +546,31 @@ async def _safe_send_widget(
         "allow_queries": True,
     }
     if business_connection_id:
-        kwargs["business_connection_id"] = business_connection_id
+        payload["business_connection_id"] = business_connection_id
 
-    try:
-        return await bot.send_widget(**kwargs)
-    except TelegramBadRequest as e:
-        print(f"⚠️ send_widget TelegramBadRequest: {e}")
-        await safe_send_msg(
-            chat_id=chat_id,
-            text=f"⚠️ Виджеты пока не активированы Telegram для этого чата (<code>{html.escape(str(e))}</code>).",
-            business_connection_id=business_connection_id,
-        )
-    except Exception as e:
-        print(f"❌ send_widget error: {e}")
-    return None
+    if hasattr(bot, "send_widget"):
+        try:
+            sent = await bot.send_widget(**payload)
+            return getattr(sent, "message_id", None)
+        except TypeError as e:
+            sig = str(inspect.signature(bot.send_widget))
+            print(f"⚠️ send_widget TypeError: {e} | sig={sig} -> trying raw HTTP")
+        except TelegramBadRequest as e:
+            print(f"⚠️ send_widget TelegramBadRequest: {e}")
+            await _report(f"⚠️ Telegram отклонил виджет: <code>{html.escape(str(e))}</code>")
+            return None
+        except Exception as e:
+            print(f"❌ send_widget error ({type(e).__name__}): {e}")
+            await _report(f"❌ Ошибка виджета (<code>{type(e).__name__}</code>): <code>{html.escape(str(e))}</code>")
+            return None
+
+    # Фолбэк: прямой запрос к Telegram Bot API
+    msg_id, err = await _send_widget_raw_http(bot, payload)
+    if err:
+        print(f"⚠️ sendWidget HTTP error: {err}")
+        await _report(f"⚠️ Telegram API <code>sendWidget</code>: <code>{html.escape(err)}</code>")
+        return None
+    return msg_id
 
 
 def register_widget_games(
@@ -621,7 +627,7 @@ def register_widget_games(
             caption = f"🔫 DOOM 2.5D{bet_note}"
             width, height = 340, 240
 
-        sent = await _safe_send_widget(
+        sent_msg_id = await _safe_send_widget(
             bot=bot,
             safe_send_msg=safe_send_msg,
             chat_id=message.chat.id,
@@ -630,14 +636,18 @@ def register_widget_games(
             width=width,
             height=height,
             business_connection_id=conn_id,
+            owner_id=owner_id,
         )
-        if sent:
-            widget_games[f"{message.chat.id}_{sent.message_id}"] = {
+        if sent_msg_id:
+            widget_games[f"{message.chat.id}_{sent_msg_id}"] = {
                 "owner_id": owner_id,
                 "bet": bet,
                 "rewarded": False,
                 "conn_id": conn_id,
             }
+        elif bet > 0:
+            # Возвращаем ставку, если виджет не удалось отправить
+            await update_user_balance(owner_id, bet)
 
     @dp.business_message(F.text.lower().regexp(r"^\.(гд|геометридеш|gd)(?:\s+\d+)?$"))
     @dp.message(F.text.lower().regexp(r"^\.(гд|геометридеш|gd)(?:\s+\d+)?$"))
